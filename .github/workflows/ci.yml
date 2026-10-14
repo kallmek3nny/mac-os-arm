@@ -28,6 +28,11 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: install Dynarmic host prerequisite
+        run: |
+          sudo timeout 120s apt-get update
+          sudo timeout 120s apt-get install -y libboost-dev
+        timeout-minutes: 4
       - name: configure pinned Dynarmic A64 backend
         run: timeout 300s cmake -S . -B build-jit -DCMAKE_BUILD_TYPE=Release -DMACOSARM_ENABLE_DYNARMIC=ON
         timeout-minutes: 6
