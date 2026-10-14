@@ -22,3 +22,18 @@ jobs:
       - name: test
         run: ctest --test-dir build --output-on-failure --timeout 30
         timeout-minutes: 3
+
+  dynarmic-jit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: configure pinned Dynarmic A64 backend
+        run: timeout 300s cmake -S . -B build-jit -DCMAKE_BUILD_TYPE=Release -DMACOSARM_ENABLE_DYNARMIC=ON
+        timeout-minutes: 6
+      - name: build JIT backend
+        run: timeout 420s cmake --build build-jit --config Release --parallel 2
+        timeout-minutes: 8
+      - name: test real ARM64 JIT execution
+        run: timeout 120s ctest --test-dir build-jit --output-on-failure --timeout 30 -R 'dynarmic-arm64-jit|execution-contract'
+        timeout-minutes: 3
