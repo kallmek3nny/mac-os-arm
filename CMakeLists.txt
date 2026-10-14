@@ -9,6 +9,7 @@ add_library(macosarm_macho
     src/macho.cpp
     src/address_space.cpp
     src/image_loader.cpp
+    src/execution.cpp
 )
 target_include_directories(macosarm_macho PUBLIC include)
 target_compile_options(macosarm_macho PRIVATE
@@ -52,4 +53,12 @@ if(BUILD_TESTING)
         $<$<CXX_COMPILER_ID:MSVC>:/W4;/WX>
     )
     add_test(NAME parse-load-integration COMMAND test_parse_load_integration)
+
+    add_executable(test_execution tests/test_execution.cpp)
+    target_link_libraries(test_execution PRIVATE macosarm_macho)
+    target_compile_options(test_execution PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>
+        $<$<CXX_COMPILER_ID:MSVC>:/W4;/WX>
+    )
+    add_test(NAME execution-contract COMMAND test_execution)
 endif()

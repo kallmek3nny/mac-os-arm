@@ -91,23 +91,21 @@ VmResult GuestAddressSpace::read(std::uint64_t address, std::span<std::byte> out
     if (!has_protection(mapping->protection, Protection::read)) {
         return {VmError::protection};
     }
+    return copy_out(address, out);
+}
 
-    std::size_t copied = 0;
-    while (copied < out.size()) {
-        const std::uint64_t current = address + copied;
-        const std::uint64_t current_page = page_base(current);
-        const std::size_t page_offset = static_cast<std::size_t>(current - current_page);
-        const std::size_t chunk = std::min<std::size_t>(kPageSize - page_offset, out.size() - copied);
-
-        const auto page = pages_.find(current_page);
-        if (page == pages_.end()) {
-            std::fill_n(out.data() + copied, chunk, std::byte{0});
-        } else {
-            std::copy_n(page->second->data() + page_offset, chunk, out.data() + copied);
-        }
-        copied += chunk;
+VmResult GuestAddressSpace::fetch_code(std::uint64_t address, std::span<std::byte> out) const {
+    if (out.empty()) {
+        return {};
     }
-    return {};
+    const Mapping* mapping = find_mapping(address, out.size());
+    if (mapping == nullptr) {
+        return {VmError::unmapped};
+    }
+    if (!has_protection(mapping->protection, Protection::execute)) {
+        return {VmError::protection};
+    }
+    return copy_out(address, out);
 }
 
 VmResult GuestAddressSpace::write(std::uint64_t address, std::span<const std::byte> bytes) {
@@ -160,6 +158,25 @@ Mapping* GuestAddressSpace::find_exact_mapping(std::uint64_t base, std::uint64_t
         return nullptr;
     }
     return &it->second;
+}
+
+VmResult GuestAddressSpace::copy_out(std::uint64_t address, std::span<std::byte> out) const {
+    std::size_t copied = 0;
+    while (copied < out.size()) {
+        const std::uint64_t current = address + copied;
+        const std::uint64_t current_page = page_base(current);
+        const std::size_t page_offset = static_cast<std::size_t>(current - current_page);
+        const std::size_t chunk = std::min<std::size_t>(kPageSize - page_offset, out.size() - copied);
+
+        const auto page = pages_.find(current_page);
+        if (page == pages_.end()) {
+            std::fill_n(out.data() + copied, chunk, std::byte{0});
+        } else {
+            std::copy_n(page->second->data() + page_offset, chunk, out.data() + copied);
+        }
+        copied += chunk;
+    }
+    return {};
 }
 
 VmResult GuestAddressSpace::copy_into(std::uint64_t address, std::span<const std::byte> bytes) {

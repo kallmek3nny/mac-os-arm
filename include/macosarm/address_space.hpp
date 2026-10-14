@@ -67,6 +67,8 @@ public:
     [[nodiscard]] VmResult load_bytes(std::uint64_t address, std::span<const std::byte> bytes);
 
     [[nodiscard]] VmResult read(std::uint64_t address, std::span<std::byte> out) const;
+    // Instruction fetch requires execute permission, not ordinary read permission.
+    [[nodiscard]] VmResult fetch_code(std::uint64_t address, std::span<std::byte> out) const;
     [[nodiscard]] VmResult write(std::uint64_t address, std::span<const std::byte> bytes);
 
     [[nodiscard]] std::vector<Mapping> mappings() const;
@@ -77,6 +79,7 @@ private:
 
     [[nodiscard]] const Mapping* find_mapping(std::uint64_t address, std::uint64_t size) const;
     [[nodiscard]] Mapping* find_exact_mapping(std::uint64_t base, std::uint64_t size);
+    [[nodiscard]] VmResult copy_out(std::uint64_t address, std::span<std::byte> out) const;
     [[nodiscard]] VmResult copy_into(std::uint64_t address, std::span<const std::byte> bytes);
     [[nodiscard]] Page& page_for_write(std::uint64_t page_base);
 
