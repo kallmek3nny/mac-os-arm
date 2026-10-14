@@ -1,0 +1,24 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        timeout-minutes: 2
+      - name: build
+        run: cmake --build build --config Release --parallel 2
+        timeout-minutes: 3
+      - name: test
+        run: ctest --test-dir build --output-on-failure --timeout 30
+        timeout-minutes: 3
