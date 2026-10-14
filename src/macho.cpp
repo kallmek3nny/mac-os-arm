@@ -164,9 +164,6 @@ ParseResult parse(std::span<const std::byte> bytes) {
             segment.initial_protection = initial_protection;
 
             constexpr std::uint64_t kSection64Size = 80;
-            if (section_count > (std::numeric_limits<std::uint64_t>::max() - kSegment64Size) / kSection64Size) {
-                return fail(ErrorCode::malformed_segment, "LC_SEGMENT_64 section count overflows size calculation");
-            }
             const std::uint64_t required_size = kSegment64Size + static_cast<std::uint64_t>(section_count) * kSection64Size;
             if (required_size > command_size) {
                 return fail(ErrorCode::malformed_segment, "LC_SEGMENT_64 section table exceeds command size");
