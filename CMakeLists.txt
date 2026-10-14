@@ -8,6 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_library(macosarm_macho
     src/macho.cpp
     src/address_space.cpp
+    src/image_loader.cpp
 )
 target_include_directories(macosarm_macho PUBLIC include)
 target_compile_options(macosarm_macho PRIVATE
@@ -35,4 +36,12 @@ if(BUILD_TESTING)
         $<$<CXX_COMPILER_ID:MSVC>:/W4;/WX>
     )
     add_test(NAME guest-address-space COMMAND test_address_space)
+
+    add_executable(test_image_loader tests/test_image_loader.cpp)
+    target_link_libraries(test_image_loader PRIVATE macosarm_macho)
+    target_compile_options(test_image_loader PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>
+        $<$<CXX_COMPILER_ID:MSVC>:/W4;/WX>
+    )
+    add_test(NAME image-loader COMMAND test_image_loader)
 endif()
