@@ -1,6 +1,7 @@
 #include "macosarm/dyld_paths.hpp"
 
 #include <algorithm>
+#include <utility>
 
 namespace macosarm::dyld {
 namespace {
