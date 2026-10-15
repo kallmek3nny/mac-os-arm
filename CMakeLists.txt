@@ -12,6 +12,7 @@ add_library(macosarm_macho
     src/dyld_paths.cpp
     src/dyld_dependencies.cpp
     src/dyld_exports.cpp
+    src/dyld_graph.cpp
     src/execution.cpp
     src/darwin_syscall.cpp
     src/mach_trap.cpp
@@ -105,6 +106,14 @@ if(BUILD_TESTING)
         $<$<CXX_COMPILER_ID:MSVC>:/W4;/WX>
     )
     add_test(NAME dyld-exports-trie COMMAND test_dyld_exports)
+
+    add_executable(test_dyld_graph tests/test_dyld_graph.cpp)
+    target_link_libraries(test_dyld_graph PRIVATE macosarm_macho)
+    target_compile_options(test_dyld_graph PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>
+        $<$<CXX_COMPILER_ID:MSVC>:/W4;/WX>
+    )
+    add_test(NAME dyld-loaded-image-graph COMMAND test_dyld_graph)
 
     add_executable(test_parse_load_integration tests/test_parse_load_integration.cpp)
     target_link_libraries(test_parse_load_integration PRIVATE macosarm_macho)
