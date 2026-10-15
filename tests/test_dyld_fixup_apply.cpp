@@ -271,17 +271,17 @@ int main() {
         Fixture fixture;
         auto fixups = metadata(ChainedPointerFormat::arm64e_userland);
         fixups.segments[0].pages[0].offsets.push_back(0x58);
-        const std::uint64_t raw = rebase64(0x1234);
+        const std::uint64_t raw = std::uint64_t{1} << 63;
         load_u64(fixture.address_space, Fixture::kRootBase + 0x58, raw);
 
         const auto result = macosarm::dyld::apply_chained_fixups(
             fixture.graph, 0, fixups, fixture.address_space);
         expect(
-            result.error == ChainedFixupsApplyError::unsupported_pointer_format,
-            "arm64e format rejected instead of faking PAC");
+            result.error == ChainedFixupsApplyError::authenticated_pointer_unsupported,
+            "authenticated arm64e pointer rejected instead of faking PAC");
         expect(
             read_u64(fixture.address_space, Fixture::kRootBase + 0x58) == raw,
-            "unsupported arm64e leaves memory untouched");
+            "authenticated arm64e rejection leaves memory untouched");
     }
 
     {
