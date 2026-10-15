@@ -1,9 +1,11 @@
 #pragma once
 
+#include "macosarm/dyld_symbols.hpp"
 #include "macosarm/macho.hpp"
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <string>
 #include <string_view>
@@ -23,6 +25,7 @@ constexpr std::uint16_t kChainedPtrStartLast = 0x8000;
 constexpr std::size_t kMaxChainedImports = 1U << 20;
 constexpr std::size_t kMaxChainedSegments = 4096;
 constexpr std::size_t kMaxChainedSymbolLength = 4096;
+constexpr std::size_t kMaxChainedFixups = 1U << 20;
 
 enum class ChainedPointerFormat : std::uint16_t {
     arm64e = 1,
@@ -109,6 +112,58 @@ struct ChainedFixupsResult {
     }
 };
 
+struct ChainedFixupsApplyConfig {
+    std::size_t max_fixups{kMaxChainedFixups};
+    SymbolResolutionConfig symbol_resolution{};
+};
+
+enum class ChainedFixupsApplyError {
+    none,
+    bad_image_index,
+    metadata_segment_count_exceeds_image,
+    invalid_page_size,
+    unsupported_pointer_format,
+    segment_offset_overflow,
+    segment_offset_mismatch,
+    page_count_exceeds_segment,
+    page_address_overflow,
+    multiple_page_starts_unsupported,
+    chain_start_out_of_page,
+    chain_start_out_of_segment,
+    read_failure,
+    write_failure,
+    pointer_reserved_bits,
+    bind_ordinal_out_of_range,
+    library_ordinal_out_of_range,
+    dependency_unavailable,
+    unsupported_special_ordinal,
+    symbol_not_found,
+    symbol_resolution_failure,
+    addend_overflow,
+    chain_next_out_of_page,
+    chain_next_out_of_segment,
+    fixup_limit,
+    rollback_failure,
+};
+
+struct ChainedFixupsApplyResult {
+    static constexpr std::size_t kNoIndex = std::numeric_limits<std::size_t>::max();
+
+    ChainedFixupsApplyError error{ChainedFixupsApplyError::none};
+    VmError vm_error{VmError::none};
+    SymbolResolutionError symbol_error{SymbolResolutionError::none};
+    std::size_t segment_index{kNoIndex};
+    std::size_t page_index{kNoIndex};
+    std::size_t import_index{kNoIndex};
+    std::uint64_t address{};
+    std::size_t fixups_processed{};
+    bool rolled_back{};
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return error == ChainedFixupsApplyError::none;
+    }
+};
+
 // Parse an LC_DYLD_CHAINED_FIXUPS payload without mutating guest memory.
 // `image_segments` is used only for structural validation of seg_count and
 // 32-bit-vs-64-bit pointer formats; phase 19 does not walk or apply chains.
@@ -122,7 +177,19 @@ struct ChainedFixupsResult {
     const macho::Image& image,
     std::span<const std::byte> file_bytes);
 
+// Apply the generic 64-bit chained pointer formats transactionally. ARM64e/PAC
+// formats are deliberately rejected until their authentication policy exists.
+// All writes must land in the selected image's Mach-O segments and also pass
+// GuestAddressSpace write-protection checks. Any failure rolls back prior writes.
+[[nodiscard]] ChainedFixupsApplyResult apply_chained_fixups(
+    const LoadedImageGraph& graph,
+    std::size_t image_index,
+    const ChainedFixupsMetadata& metadata,
+    GuestAddressSpace& address_space,
+    const ChainedFixupsApplyConfig& config = {});
+
 [[nodiscard]] std::string_view chained_pointer_format_name(ChainedPointerFormat format) noexcept;
 [[nodiscard]] std::string_view chained_fixups_error_name(ChainedFixupsError error) noexcept;
+[[nodiscard]] std::string_view chained_fixups_apply_error_name(ChainedFixupsApplyError error) noexcept;
 
 } // namespace macosarm::dyld
