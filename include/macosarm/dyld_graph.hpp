@@ -2,6 +2,7 @@
 
 #include "macosarm/dyld_dependencies.hpp"
 #include "macosarm/dyld_exports.hpp"
+#include "macosarm/dyld_fixup_payload.hpp"
 #include "macosarm/image_loader.hpp"
 #include "macosarm/macho_initializers.hpp"
 
@@ -49,6 +50,7 @@ struct GraphImage {
     macho::InitializerMetadata initializers;
     LoadedImage mapping;
     std::vector<ExportSymbol> exports;
+    std::vector<std::byte> chained_fixups_payload;
     std::vector<GraphDependency> dependencies;
     bool owns_mapping{};
 };
@@ -62,6 +64,8 @@ struct DependencyGraphConfig {
     std::size_t max_images{256};
     // Maximum number of newly loaded dependency edges from the root.
     std::size_t max_depth{128};
+    // Bounds retained LC_DYLD_CHAINED_FIXUPS bytes per image.
+    std::size_t max_chained_fixup_payload_bytes{kDefaultMaxChainedFixupPayloadBytes};
 };
 
 enum class DependencyGraphError {
@@ -73,6 +77,7 @@ enum class DependencyGraphError {
     dependency_not_found,
     parse_failure,
     initializer_metadata_failure,
+    fixups_payload_failure,
     exports_failure,
     load_failure,
 };
@@ -89,6 +94,7 @@ struct DependencyGraphResult {
     PathResolutionError path_error{PathResolutionError::none};
     macho::ErrorCode parse_error{macho::ErrorCode::none};
     macho::InitializerMetadataError initializer_error{macho::InitializerMetadataError::none};
+    ChainedFixupPayloadError fixups_payload_error{ChainedFixupPayloadError::none};
     ExportTrieError exports_error{ExportTrieError::none};
     LoadError load_error{LoadError::none};
     VmError vm_error{VmError::none};
@@ -101,9 +107,10 @@ struct DependencyGraphResult {
 // Builds the dependency graph for an already parsed/root-mapped image. The root
 // is recorded at index zero but is never mapped or unmapped by this function.
 // Every dependency image newly accepted by the lookup callback is parsed,
-// initializer-scanned, export-decoded, and mapped into the same guest address
-// space. A failure rolls back every mapping created by this graph build while
-// preserving all pre-existing mappings owned by the caller.
+// initializer-scanned, chained-fixup-payload retained, export-decoded, and
+// mapped into the same guest address space. A failure rolls back every mapping
+// created by this graph build while preserving all pre-existing mappings owned
+// by the caller.
 [[nodiscard]] DependencyGraphResult load_dependency_graph(
     const macho::Image& root_image,
     std::span<const std::byte> root_file_bytes,
