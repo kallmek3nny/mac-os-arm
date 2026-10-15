@@ -30,6 +30,10 @@ struct InitializerExecutionConfig {
     // without mapping an artificial trampoline into the guest.
     std::uint64_t return_sentinel{0x0000fffffffffff0ULL};
     InitializerCallContext context{};
+    // Optional caller-owned Mach namespace. Supplying this keeps reply ports,
+    // message queues, and Mach VM allocator state continuous across bootstrap
+    // and later translated execution. Null preserves the legacy private context.
+    MachContext* mach_context{};
 };
 
 enum class InitializerExecutionError {
@@ -132,7 +136,9 @@ public:
           address_space_(address_space),
           backend_(backend),
           host_(host),
-          config_(config) {
+          config_(config),
+          mach_context_(
+              config.mach_context != nullptr ? *config.mach_context : owned_mach_context_) {
         result_.initialized_images.assign(graph.images.size(), false);
     }
 
@@ -351,7 +357,8 @@ private:
     ExecutionBackend& backend_;
     DarwinHostServices& host_;
     const InitializerExecutionConfig& config_;
-    MachContext mach_context_;
+    MachContext owned_mach_context_;
+    MachContext& mach_context_;
     InitializerExecutionResult result_;
 };
 
