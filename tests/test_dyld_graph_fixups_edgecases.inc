@@ -65,8 +65,8 @@ int dyld_graph_fixups_edgecases_main() {
         GraphwideFixture fixture;
         fixture.graph.images.resize(1);
         fixture.graph.images[0].dependencies.clear();
-        fixture.graph.images[0].chained_fixups_payload = graphwide_payload(
-            static_cast<ChainedPointerFormat>(0xffffU));
+        fixture.graph.images[0].chained_fixups_payload =
+            graphwide_payload(ChainedPointerFormat::generic64_kernel_cache);
         constexpr std::uint64_t raw = 0x1020304050607080ULL;
         expect(graphwide_store_u64(
                    fixture.address_space,
