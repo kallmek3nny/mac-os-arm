@@ -46,6 +46,17 @@ public:
             root_initializer_metadata = std::move(root_initializers.metadata);
         }
 
+        ChainedFixupPayloadResult root_fixups = copy_image_chained_fixup_payload(
+            root_image_,
+            root_file_bytes_,
+            config_.max_chained_fixup_payload_bytes);
+        if (!root_fixups) {
+            result_.error = DependencyGraphError::fixups_payload_failure;
+            result_.failed_image_index = 0;
+            result_.fixups_payload_error = root_fixups.error;
+            return std::move(result_);
+        }
+
         ExportTrieResult root_exports = parse_image_exports(root_image_, root_file_bytes_);
         if (!root_exports) {
             result_.error = DependencyGraphError::exports_failure;
@@ -60,6 +71,7 @@ public:
         root.initializers = std::move(root_initializer_metadata);
         root.mapping = root_mapping_;
         root.exports = std::move(root_exports.symbols);
+        root.chained_fixups_payload = std::move(root_fixups.payload);
         root.owns_mapping = false;
         result_.graph.images.push_back(std::move(root));
         path_to_index_.emplace(result_.graph.images.front().path, 0);
@@ -210,6 +222,18 @@ private:
                     dependency_index);
             }
 
+            ChainedFixupPayloadResult fixups = copy_image_chained_fixup_payload(
+                parsed.image,
+                candidate_bytes,
+                config_.max_chained_fixup_payload_bytes);
+            if (!fixups) {
+                result_.fixups_payload_error = fixups.error;
+                return fail(
+                    DependencyGraphError::fixups_payload_failure,
+                    image_index,
+                    dependency_index);
+            }
+
             ExportTrieResult exports = parse_image_exports(parsed.image, candidate_bytes);
             if (!exports) {
                 result_.exports_error = exports.error;
@@ -229,6 +253,7 @@ private:
             child.initializers = std::move(initializers.metadata);
             child.mapping = loaded.image;
             child.exports = std::move(exports.symbols);
+            child.chained_fixups_payload = std::move(fixups.payload);
             child.owns_mapping = true;
 
             target_index = result_.graph.images.size();
@@ -301,6 +326,7 @@ std::string_view dependency_graph_error_name(DependencyGraphError error) noexcep
     case DependencyGraphError::dependency_not_found: return "dependency_not_found";
     case DependencyGraphError::parse_failure: return "parse_failure";
     case DependencyGraphError::initializer_metadata_failure: return "initializer_metadata_failure";
+    case DependencyGraphError::fixups_payload_failure: return "fixups_payload_failure";
     case DependencyGraphError::exports_failure: return "exports_failure";
     case DependencyGraphError::load_failure: return "load_failure";
     }

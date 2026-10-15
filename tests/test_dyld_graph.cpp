@@ -3,6 +3,7 @@
 #undef main
 
 #include "test_dyld_graph_initializers.inc"
+#include "test_dyld_graph_fixup_payload.inc"
 #include "test_dyld_initializer_plan.inc"
 #include "test_dyld_initializer_execution.inc"
 #include "test_dyld_image_initialization.inc"
@@ -12,6 +13,7 @@
 int main() {
     const int legacy_result = legacy_dyld_graph_main();
     const int metadata_result = dyld_graph_initializers_main();
+    const int fixup_payload_result = dyld_graph_fixup_payload_main();
     const int plan_result = dyld_initializer_plan_main();
     const int execution_result = dyld_initializer_execution_main();
     const int integration_result = dyld_image_initialization_main();
@@ -19,6 +21,7 @@ int main() {
     const int startup_context_result = process_startup_initializer_context_main();
     return legacy_result == EXIT_SUCCESS &&
                    metadata_result == EXIT_SUCCESS &&
+                   fixup_payload_result == EXIT_SUCCESS &&
                    plan_result == EXIT_SUCCESS &&
                    execution_result == EXIT_SUCCESS &&
                    integration_result == EXIT_SUCCESS &&
