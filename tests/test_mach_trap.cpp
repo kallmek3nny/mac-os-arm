@@ -212,11 +212,12 @@ int main() {
     expect(result.error == macosarm::MachTrapDispatchError::unsupported_trap,
            "mach_vm_map remains explicitly unsupported until object semantics exist");
 
-    set_trap(state, macosarm::kMachTrapMessage);
+    constexpr std::int64_t unknown_mach_trap = -999;
+    set_trap(state, unknown_mach_trap);
     result = macosarm::dispatch_mach_trap(state, vm, svc(), context);
     expect(result.error == macosarm::MachTrapDispatchError::unsupported_trap,
-           "unimplemented negative Mach trap is rejected explicitly");
-    expect(result.trap_number == macosarm::kMachTrapMessage,
+           "unknown negative Mach trap is rejected explicitly");
+    expect(result.trap_number == unknown_mach_trap,
            "unsupported Mach trap preserves signed trap number");
 
     state.x[16] = macosarm::kDarwinSysWrite;
