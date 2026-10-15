@@ -4,6 +4,7 @@
 #include "macosarm/image_loader.hpp"
 #include "macosarm/macho.hpp"
 #include "macosarm/process.hpp"
+#include "macosarm/process_startup.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -16,6 +17,7 @@ struct SessionConfig {
     std::uint64_t stack_base{0x700000000ULL};
     std::uint64_t stack_size{8ULL * 1024ULL * 1024ULL};
     std::uint64_t instruction_budget{1'000'000ULL};
+    ProcessStartupConfig startup{};
 };
 
 enum class SessionError {
@@ -23,6 +25,7 @@ enum class SessionError {
     parse_failure,
     load_failure,
     stack_failure,
+    startup_failure,
     cpu_init_failure,
 };
 
@@ -32,6 +35,7 @@ struct SessionResult {
     LoadError load_error{LoadError::none};
     VmError vm_error{VmError::none};
     CpuInitError cpu_error{CpuInitError::none};
+    ProcessStartupResult startup{};
     LoadedImage image{};
     CpuState final_state{};
     ProcessResult process{};

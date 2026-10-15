@@ -37,11 +37,22 @@ SessionResult run_macho_session(
         return result;
     }
 
+    result.startup = build_process_startup(
+        address_space,
+        config.stack_base,
+        config.stack_size,
+        config.startup);
+    if (!result.startup) {
+        result.error = SessionError::startup_failure;
+        result.vm_error = result.startup.vm_error;
+        return result;
+    }
+
     CpuState state{};
     const CpuInitResult initialized = initialize_cpu(
         state,
         loaded.image,
-        config.stack_base + config.stack_size);
+        result.startup.layout.stack_pointer);
     if (!initialized) {
         result.error = SessionError::cpu_init_failure;
         result.cpu_error = initialized.error;
@@ -64,6 +75,7 @@ std::string_view session_error_name(SessionError error) noexcept {
     case SessionError::parse_failure: return "parse_failure";
     case SessionError::load_failure: return "load_failure";
     case SessionError::stack_failure: return "stack_failure";
+    case SessionError::startup_failure: return "startup_failure";
     case SessionError::cpu_init_failure: return "cpu_init_failure";
     }
     return "unknown";
