@@ -365,8 +365,10 @@ int dyld_graph_fixups_main() {
             fixture.graph,
             fixture.address_space,
             config);
-        expect(static_cast<bool>(applied) && applied.authenticated_slots.size() == 1,
-               "authenticated graph fixup applies and publishes one retained slot policy");
+        expect(static_cast<bool>(applied) &&
+                   applied.authenticated_slots.size() == 1 &&
+                   applied.pointer_auth_error == PointerAuthError::none,
+               "authenticated graph fixup applies without pointer-auth errors and publishes one retained slot policy");
         if (applied.authenticated_slots.size() == 1) {
             const auto& slot = applied.authenticated_slots.front();
             expect(slot.storage_address == storage &&
@@ -412,8 +414,6 @@ int dyld_graph_fixups_main() {
     expect(macosarm::dyld::loaded_image_graph_fixups_error_name(
                LoadedImageGraphFixupsError::rollback_failure) == "rollback_failure",
            "graph fixup application errors have stable names");
-    expect(PointerAuthError::none == PointerAuthError::none,
-           "pointer-auth error enum remains available to graph fixup callers");
 
     if (failures != 0) {
         std::cerr << failures << " graph-wide fixup test(s) failed\n";
