@@ -148,6 +148,39 @@ int main() {
                "one process run forwards guest stdout bytes");
     }
 
+    {
+        GuestAddressSpace vm;
+        expect(static_cast<bool>(vm.map(code_base, GuestAddressSpace::kPageSize,
+                                        Protection::read | Protection::execute)),
+               "Mach process code page maps");
+
+        std::array<std::byte, GuestAddressSpace::kPageSize> code{};
+        put_instruction(code, 0, 0x92800370U);  // movn x16, #27 => -28 (task_self_trap)
+        put_instruction(code, 4, 0xd4001001U);  // svc #0x80
+        put_instruction(code, 8, 0xaa0003f3U);  // mov x19, x0
+        put_instruction(code, 12, 0xd2800000U); // mov x0, #0
+        put_instruction(code, 16, 0xd2800030U); // mov x16, #1 (exit)
+        put_instruction(code, 20, 0xd4001001U); // svc #0x80
+        expect(static_cast<bool>(vm.load_bytes(code_base, code)), "Mach process program loads");
+
+        macosarm::CpuState state{};
+        state.pc = code_base;
+        state.sp = 0x700000000ULL;
+
+        CaptureHost host;
+        macosarm::DynarmicBackend backend;
+        const auto result = macosarm::run_process(state, vm, backend, host, 16);
+
+        expect(result.reason == macosarm::ProcessStopReason::exited,
+               "real JIT resumes from Mach task_self into BSD exit");
+        expect(result.exit_status == 0, "mixed Mach/BSD JIT program exits cleanly");
+        expect(result.instructions_executed == 6,
+               "mixed Mach/BSD path accounts for every translated instruction");
+        expect(state.x[19] == macosarm::MachContext::kDefaultTaskSelfPort,
+               "translated ARM64 observes the synthetic task-self port");
+        expect(state.pc == code_base + 24, "mixed trap program leaves PC after final SVC");
+    }
+
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return EXIT_FAILURE;
