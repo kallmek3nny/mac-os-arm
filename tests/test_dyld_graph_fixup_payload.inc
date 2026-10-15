@@ -150,13 +150,38 @@ int dyld_graph_fixup_payload_main() {
             executable,
             vm,
             store.callback());
+        expect(result.error == DependencyGraphError::parse_failure &&
+                   result.parse_error == macosarm::macho::ErrorCode::malformed_linkedit_data,
+               "Mach-O parser rejects an out-of-file dependency fixup range first");
+        expect(result.graph.images.empty(),
+               "malformed dependency fixup range clears partially built graph");
+        expect(vm.mappings().empty(),
+               "malformed dependency fixup range leaves no dependency mappings behind");
+    }
+
+    {
+        const std::vector<std::byte> root_bytes =
+            make_dylib("/usr/lib/rootBroken.dylib", 0x541000000ULL);
+        const auto parsed = macosarm::macho::parse(root_bytes);
+        expect(static_cast<bool>(parsed), "manual root fixup-range fixture parses normally");
+        macosarm::macho::Image root = parsed.image;
+        root.chained_fixups.offset = 0x3ff0;
+        root.chained_fixups.size = 0x40;
+        root.chained_fixups.present = true;
+        GuestAddressSpace vm;
+        const auto result = macosarm::dyld::load_dependency_graph(
+            root,
+            root_bytes,
+            LoadedImage{0x541000000ULL, 0, 1},
+            "/usr/lib/rootBroken.dylib",
+            executable,
+            vm,
+            {});
         expect(result.error == DependencyGraphError::fixups_payload_failure &&
                    result.fixups_payload_error == ChainedFixupPayloadError::range_out_of_bounds,
-               "out-of-file chained-fixup payload fails graph construction explicitly");
+               "retained root fixup payload independently validates supplied image range");
         expect(result.graph.images.empty(),
-               "fixup-payload graph failure clears partially built graph");
-        expect(vm.mappings().empty(),
-               "fixup-payload graph failure leaves no dependency mappings behind");
+               "invalid supplied root fixup range fails closed before graph publication");
     }
 
     {
