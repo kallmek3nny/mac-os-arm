@@ -1,5 +1,5 @@
-#include "macosarm/darwin_syscall.hpp"
 #include "macosarm/dynarmic_backend.hpp"
+#include "macosarm/process.hpp"
 
 #include <array>
 #include <cstddef>
@@ -109,10 +109,10 @@ int main() {
         GuestAddressSpace vm;
         expect(static_cast<bool>(vm.map(code_base, GuestAddressSpace::kPageSize,
                                         Protection::read | Protection::execute)),
-               "Darwin syscall code page maps");
+               "process code page maps");
         expect(static_cast<bool>(vm.map(data_base, GuestAddressSpace::kPageSize,
                                         Protection::read)),
-               "Darwin syscall data page maps");
+               "process data page maps");
 
         std::array<std::byte, GuestAddressSpace::kPageSize> code{};
         put_instruction(code, 0, 0xd2800090U);  // mov x16, #4 (write)
@@ -120,11 +120,11 @@ int main() {
         put_instruction(code, 8, 0xd28000e0U);  // mov x0, #7
         put_instruction(code, 12, 0xd2800030U); // mov x16, #1 (exit)
         put_instruction(code, 16, 0xd4001001U); // svc #0x80
-        expect(static_cast<bool>(vm.load_bytes(code_base, code)), "Darwin syscall program loads");
+        expect(static_cast<bool>(vm.load_bytes(code_base, code)), "process program loads");
 
         const std::array<std::byte, 5> message{
             std::byte{'h'}, std::byte{'e'}, std::byte{'l'}, std::byte{'l'}, std::byte{'o'}};
-        expect(static_cast<bool>(vm.load_bytes(data_base, message)), "Darwin syscall message loads");
+        expect(static_cast<bool>(vm.load_bytes(data_base, message)), "process message loads");
 
         macosarm::CpuState state{};
         state.pc = code_base;
@@ -135,28 +135,17 @@ int main() {
 
         CaptureHost host;
         macosarm::DynarmicBackend backend;
+        const auto result = macosarm::run_process(state, vm, backend, host, 16);
 
-        const auto write_trap = backend.run(state, vm, 16);
-        expect(write_trap.reason == StopReason::supervisor_call, "real JIT reaches Darwin write SVC");
-        expect(state.x[16] == macosarm::kDarwinSysWrite, "JIT places write number in x16");
-        expect(state.pc == code_base + 8, "JIT resumes after write SVC");
-
-        const auto write_result = macosarm::dispatch_darwin_syscall(state, vm, write_trap, host);
-        expect(static_cast<bool>(write_result), "Darwin write dispatch succeeds after JIT trap");
-        expect(write_result.action == macosarm::SyscallAction::resume, "write returns to ARM64 guest");
-        expect(state.x[0] == message.size(), "write return value reaches ARM64 x0");
+        expect(result.reason == macosarm::ProcessStopReason::exited,
+               "process runner drives real JIT through write and exit");
+        expect(result.exit_status == 7, "process runner preserves ARM64 exit status");
+        expect(result.instructions_executed == 5,
+               "process runner totals real JIT instructions across both syscalls");
+        expect(state.pc == code_base + 20, "process runner leaves PC after final SVC");
+        expect(state.x[16] == macosarm::kDarwinSysExit, "final JIT syscall number is exit");
         expect(host.fd == 1 && host.bytes == std::vector<std::byte>(message.begin(), message.end()),
-               "host receives guest stdout bytes");
-
-        const auto exit_trap = backend.run(state, vm, 16);
-        expect(exit_trap.reason == StopReason::supervisor_call, "real JIT reaches Darwin exit SVC");
-        expect(state.x[16] == macosarm::kDarwinSysExit, "JIT places exit number in x16");
-        expect(state.pc == code_base + 20, "JIT advances past exit SVC");
-
-        const auto exit_result = macosarm::dispatch_darwin_syscall(state, vm, exit_trap, host);
-        expect(static_cast<bool>(exit_result), "Darwin exit dispatch succeeds after JIT trap");
-        expect(exit_result.action == macosarm::SyscallAction::exit_process, "exit stops guest process");
-        expect(exit_result.exit_status == 7, "ARM64 exit status survives JIT and syscall bridge");
+               "one process run forwards guest stdout bytes");
     }
 
     if (failures != 0) {
