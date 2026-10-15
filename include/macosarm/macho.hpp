@@ -14,8 +14,11 @@ constexpr std::int32_t kCpuTypeArm64 = 0x0100000c;
 constexpr std::int32_t kCpuSubtypeArm64All = 0;
 constexpr std::int32_t kCpuSubtypeArm64e = 2;
 constexpr std::uint32_t kMhExecute = 2;
+constexpr std::uint32_t kMhDylib = 6;
+constexpr std::uint32_t kMhDylinker = 7;
 constexpr std::uint32_t kLcReqDyld = 0x80000000U;
 constexpr std::uint32_t kLcLoadDylib = 0x0c;
+constexpr std::uint32_t kLcIdDylib = 0x0d;
 constexpr std::uint32_t kLcLoadDylinker = 0x0e;
 constexpr std::uint32_t kLcLoadWeakDylib = 0x18U | kLcReqDyld;
 constexpr std::uint32_t kLcSegment64 = 0x19;
@@ -53,6 +56,13 @@ struct DylibDependency {
     std::uint32_t compatibility_version{};
 };
 
+struct DylibIdentity {
+    std::string install_name;
+    std::uint32_t timestamp{};
+    std::uint32_t current_version{};
+    std::uint32_t compatibility_version{};
+};
+
 struct FileRange {
     std::uint32_t offset{};
     std::uint32_t size{};
@@ -68,6 +78,8 @@ struct Image {
     bool has_entry_point{};
     std::string dynamic_linker;
     bool has_dynamic_linker{};
+    DylibIdentity dylib_identity;
+    bool has_dylib_identity{};
     std::vector<std::string> runpaths;
     std::vector<DylibDependency> dependencies;
     FileRange exports_trie;
@@ -85,10 +97,13 @@ enum class ErrorCode {
     malformed_segment,
     malformed_dynamic_linker,
     malformed_dylib,
+    malformed_dylib_identity,
     malformed_runpath,
     malformed_linkedit_data,
+    missing_dylib_identity,
     duplicate_entry_point,
     duplicate_dynamic_linker,
+    duplicate_dylib_identity,
     duplicate_exports_trie,
     duplicate_chained_fixups,
 };

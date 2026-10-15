@@ -47,6 +47,16 @@ Fixture valid_fixture() {
     return fixture;
 }
 
+Fixture shared_fixture() {
+    Fixture fixture = valid_fixture();
+    fixture.image.file_type = macosarm::macho::kMhDylib;
+    fixture.image.has_entry_point = false;
+    fixture.image.entry_file_offset = 0;
+    fixture.image.has_dylib_identity = true;
+    fixture.image.dylib_identity.install_name = "@rpath/libPhase13.dylib";
+    return fixture;
+}
+
 } // namespace
 
 int main() {
@@ -83,6 +93,56 @@ int main() {
                "loaded __TEXT remains non-writable");
         expect(static_cast<bool>(vm.write(0x100004010ULL, patch)),
                "loaded __DATA remains writable");
+    }
+
+    {
+        auto fixture = shared_fixture();
+        GuestAddressSpace vm;
+        const auto result = macosarm::load_shared_image(fixture.image, fixture.file, vm);
+        expect(static_cast<bool>(result), "MH_DYLIB shared image loads without LC_MAIN");
+        expect(result.image.preferred_load_address == 0x100000000ULL,
+               "shared image preferred load address computed");
+        expect(result.image.entry_address == 0, "shared image has no synthetic entrypoint");
+        expect(result.image.mapped_segments == 3, "shared image maps every non-empty segment");
+        expect(vm.mappings().size() == 3, "shared image mappings installed");
+
+        std::array<std::byte, 2> data{};
+        expect(static_cast<bool>(vm.read(0x100004000ULL, data)), "shared data bytes readable");
+        expect(data[0] == std::byte{0xaa} && data[1] == std::byte{0xbb},
+               "shared image file bytes copied");
+    }
+
+    {
+        auto fixture = shared_fixture();
+        GuestAddressSpace vm;
+        const auto result = macosarm::load_image(fixture.image, fixture.file, vm);
+        expect(static_cast<bool>(result), "generic image mapper accepts shared image");
+        expect(result.image.entry_address == 0, "generic mapper preserves absent entrypoint");
+    }
+
+    {
+        auto fixture = shared_fixture();
+        GuestAddressSpace vm;
+        const auto result = macosarm::load_executable(fixture.image, fixture.file, vm);
+        expect(result.error == LoadError::wrong_file_type, "executable loader rejects MH_DYLIB");
+        expect(vm.mappings().empty(), "wrong executable type leaves VM untouched");
+    }
+
+    {
+        auto fixture = valid_fixture();
+        GuestAddressSpace vm;
+        const auto result = macosarm::load_shared_image(fixture.image, fixture.file, vm);
+        expect(result.error == LoadError::wrong_file_type, "shared loader rejects MH_EXECUTE");
+        expect(vm.mappings().empty(), "wrong shared type leaves VM untouched");
+    }
+
+    {
+        auto fixture = shared_fixture();
+        fixture.image.file_type = macosarm::macho::kMhDylinker;
+        GuestAddressSpace vm;
+        const auto result = macosarm::load_shared_image(fixture.image, fixture.file, vm);
+        expect(static_cast<bool>(result), "MH_DYLINKER shared image loads without LC_MAIN");
+        expect(result.image.entry_address == 0, "dylinker load does not invent entrypoint");
     }
 
     {
@@ -152,6 +212,22 @@ int main() {
         expect(maps.size() == 1 && maps[0].base == 0x100000000ULL,
                "rollback preserves preexisting mapping and removes PAGEZERO");
     }
+
+    {
+        auto fixture = shared_fixture();
+        GuestAddressSpace vm;
+        expect(static_cast<bool>(vm.map(0x100000000ULL, 0x4000, Protection::read)),
+               "preexisting shared-image collision installed");
+        const auto result = macosarm::load_shared_image(fixture.image, fixture.file, vm);
+        expect(result.error == LoadError::vm_failure, "shared image overlap reported as VM failure");
+        expect(result.vm_error == VmError::overlap, "shared overlap VM error preserved");
+        const auto maps = vm.mappings();
+        expect(maps.size() == 1 && maps[0].base == 0x100000000ULL,
+               "shared rollback preserves preexisting mapping");
+    }
+
+    expect(macosarm::load_error_name(LoadError::wrong_file_type) == "wrong_file_type",
+           "new loader error has stable name");
 
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";

@@ -143,6 +143,40 @@ std::vector<std::byte> metadata_image() {
     return bytes;
 }
 
+std::vector<std::byte> dylib_image() {
+    constexpr std::uint32_t command_bytes = 72 + 56;
+    std::vector<std::byte> bytes(0x400, std::byte{0});
+
+    put_u32(bytes, 0, macosarm::macho::kMhMagic64);
+    put_u32(bytes, 4, static_cast<std::uint32_t>(macosarm::macho::kCpuTypeArm64));
+    put_u32(bytes, 8, static_cast<std::uint32_t>(macosarm::macho::kCpuSubtypeArm64e));
+    put_u32(bytes, 12, macosarm::macho::kMhDylib);
+    put_u32(bytes, 16, 2);
+    put_u32(bytes, 20, command_bytes);
+
+    constexpr std::size_t segment = 32;
+    put_u32(bytes, segment, macosarm::macho::kLcSegment64);
+    put_u32(bytes, segment + 4, 72);
+    put_name(bytes, segment + 8, "__TEXT");
+    put_u64(bytes, segment + 24, 0x180000000ULL);
+    put_u64(bytes, segment + 32, 0x400ULL);
+    put_u64(bytes, segment + 40, 0);
+    put_u64(bytes, segment + 48, 0x400ULL);
+    put_u32(bytes, segment + 56, 5);
+    put_u32(bytes, segment + 60, 5);
+
+    constexpr std::size_t identity = 104;
+    put_u32(bytes, identity, macosarm::macho::kLcIdDylib);
+    put_u32(bytes, identity + 4, 56);
+    put_u32(bytes, identity + 8, 24);
+    put_u32(bytes, identity + 12, 9);
+    put_u32(bytes, identity + 16, 0x00020304U);
+    put_u32(bytes, identity + 20, 0x00020000U);
+    put_string(bytes, identity + 24, "@rpath/libPhase13.dylib");
+
+    return bytes;
+}
+
 } // namespace
 
 int main() {
@@ -184,6 +218,29 @@ int main() {
     }
 
     {
+        const auto result = macosarm::macho::parse(dylib_image());
+        expect(static_cast<bool>(result), "MH_DYLIB image parses");
+        expect(result.image.file_type == macosarm::macho::kMhDylib, "dylib file type preserved");
+        expect(result.image.has_dylib_identity, "LC_ID_DYLIB detected");
+        expect(result.image.dylib_identity.install_name == "@rpath/libPhase13.dylib",
+               "dylib install name parsed");
+        expect(result.image.dylib_identity.timestamp == 9, "dylib identity timestamp parsed");
+        expect(result.image.dylib_identity.current_version == 0x00020304U,
+               "dylib identity current version parsed");
+        expect(result.image.dylib_identity.compatibility_version == 0x00020000U,
+               "dylib identity compatibility version parsed");
+        expect(!result.image.has_entry_point, "dylib does not require LC_MAIN");
+    }
+
+    {
+        auto bytes = valid_image();
+        put_u32(bytes, 12, macosarm::macho::kMhDylinker);
+        const auto result = macosarm::macho::parse(bytes);
+        expect(static_cast<bool>(result), "MH_DYLINKER image parses");
+        expect(result.image.file_type == macosarm::macho::kMhDylinker, "dylinker file type preserved");
+    }
+
+    {
         std::vector<std::byte> bytes(8, std::byte{0});
         const auto result = macosarm::macho::parse(bytes);
         expect(result.error == macosarm::macho::ErrorCode::truncated, "short header rejected");
@@ -201,6 +258,14 @@ int main() {
         put_u32(bytes, 4, 0x01000007U);
         const auto result = macosarm::macho::parse(bytes);
         expect(result.error == macosarm::macho::ErrorCode::unsupported_cpu, "x86_64 image rejected");
+    }
+
+    {
+        auto bytes = valid_image();
+        put_u32(bytes, 12, 8);
+        const auto result = macosarm::macho::parse(bytes);
+        expect(result.error == macosarm::macho::ErrorCode::unsupported_file_type,
+               "unsupported Mach-O file type rejected");
     }
 
     {
@@ -291,9 +356,50 @@ int main() {
                "duplicate dynamic linker rejected");
     }
 
+    {
+        auto bytes = dylib_image();
+        put_u32(bytes, 104 + 8, 56);
+        const auto result = macosarm::macho::parse(bytes);
+        expect(result.error == macosarm::macho::ErrorCode::malformed_dylib_identity,
+               "dylib identity path outside command rejected");
+    }
+
+    {
+        auto bytes = dylib_image();
+        put_u32(bytes, 104, 0x99);
+        const auto result = macosarm::macho::parse(bytes);
+        expect(result.error == macosarm::macho::ErrorCode::missing_dylib_identity,
+               "MH_DYLIB without LC_ID_DYLIB rejected");
+    }
+
+    {
+        auto bytes = dylib_image();
+        put_u32(bytes, 16, 3);
+        put_u32(bytes, 20, 72 + 56 + 56);
+        constexpr std::size_t duplicate = 160;
+        put_u32(bytes, duplicate, macosarm::macho::kLcIdDylib);
+        put_u32(bytes, duplicate + 4, 56);
+        put_u32(bytes, duplicate + 8, 24);
+        put_string(bytes, duplicate + 24, "@rpath/libDuplicate.dylib");
+        const auto result = macosarm::macho::parse(bytes);
+        expect(result.error == macosarm::macho::ErrorCode::duplicate_dylib_identity,
+               "duplicate LC_ID_DYLIB rejected");
+    }
+
+    {
+        auto bytes = dylib_image();
+        put_u32(bytes, 12, macosarm::macho::kMhExecute);
+        const auto result = macosarm::macho::parse(bytes);
+        expect(result.error == macosarm::macho::ErrorCode::malformed_dylib_identity,
+               "LC_ID_DYLIB in executable rejected");
+    }
+
     expect(macosarm::macho::error_name(macosarm::macho::ErrorCode::malformed_dynamic_linker) ==
                "malformed_dynamic_linker",
-           "new parser errors have stable names");
+           "dyld parser errors have stable names");
+    expect(macosarm::macho::error_name(macosarm::macho::ErrorCode::missing_dylib_identity) ==
+               "missing_dylib_identity",
+           "dylib identity errors have stable names");
 
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
