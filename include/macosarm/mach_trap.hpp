@@ -3,9 +3,13 @@
 #include "macosarm/address_space.hpp"
 #include "macosarm/execution.hpp"
 
+#include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <optional>
 #include <string_view>
+#include <unordered_map>
+#include <vector>
 
 namespace macosarm {
 
@@ -32,6 +36,31 @@ constexpr std::uint32_t kMachVmProtExecute = 0x4;
 constexpr std::uint32_t kMachVmProtMask =
     kMachVmProtRead | kMachVmProtWrite | kMachVmProtExecute;
 
+constexpr std::uint32_t kMachMsgSuccess = 0;
+constexpr std::uint32_t kMachSendInvalidData = 0x10000002;
+constexpr std::uint32_t kMachSendInvalidDest = 0x10000003;
+constexpr std::uint32_t kMachSendMsgTooSmall = 0x10000008;
+constexpr std::uint32_t kMachSendInvalidNotify = 0x1000000b;
+constexpr std::uint32_t kMachSendTooLarge = 0x1000000e;
+constexpr std::uint32_t kMachSendInvalidType = 0x1000000f;
+constexpr std::uint32_t kMachSendInvalidHeader = 0x10000010;
+constexpr std::uint32_t kMachRcvInvalidName = 0x10004002;
+constexpr std::uint32_t kMachRcvTimedOut = 0x10004003;
+constexpr std::uint32_t kMachRcvTooLarge = 0x10004004;
+constexpr std::uint32_t kMachRcvInvalidData = 0x10004008;
+
+constexpr std::uint32_t kMachSendMsg = 0x00000001;
+constexpr std::uint32_t kMachRcvMsg = 0x00000002;
+constexpr std::uint32_t kMachSendTimeout = 0x00000010;
+constexpr std::uint32_t kMachRcvTimeout = 0x00000100;
+constexpr std::uint32_t kMachMsgSimpleSupportedOptions =
+    kMachSendMsg | kMachRcvMsg | kMachSendTimeout | kMachRcvTimeout;
+constexpr std::uint32_t kMachMsgBitsRemoteMask = 0x0000001f;
+constexpr std::uint32_t kMachMsgBitsLocalMask = 0x00001f00;
+constexpr std::uint32_t kMachMsgBitsComplex = 0x80000000U;
+constexpr std::size_t kMachMsgHeaderSize = 24;
+constexpr std::size_t kMachMsgMaxInlineSize = 1024 * 1024;
+
 class MachContext {
 public:
     static constexpr std::uint32_t kDefaultTaskSelfPort = 0x101;
@@ -44,12 +73,17 @@ public:
     [[nodiscard]] std::uint32_t thread_self_port() const noexcept { return thread_self_port_; }
     [[nodiscard]] std::uint32_t host_self_port() const noexcept { return host_self_port_; }
     [[nodiscard]] std::optional<std::uint32_t> allocate_reply_port() noexcept;
+    [[nodiscard]] bool is_receive_port(std::uint32_t port) const noexcept;
+    [[nodiscard]] bool enqueue_message(std::uint32_t port, std::vector<std::byte> message);
+    [[nodiscard]] std::optional<std::vector<std::byte>> dequeue_message(std::uint32_t port);
+    [[nodiscard]] std::size_t queued_message_count(std::uint32_t port) const noexcept;
 
 private:
     std::uint32_t task_self_port_{kDefaultTaskSelfPort};
     std::uint32_t thread_self_port_{kDefaultThreadSelfPort};
     std::uint32_t host_self_port_{kDefaultHostSelfPort};
     std::uint32_t next_reply_port_{kFirstReplyPort};
+    std::unordered_map<std::uint32_t, std::deque<std::vector<std::byte>>> receive_queues_;
 };
 
 enum class MachTrapDispatchError {
