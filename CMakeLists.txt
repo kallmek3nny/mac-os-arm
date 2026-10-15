@@ -111,6 +111,14 @@ if(BUILD_TESTING)
     )
     add_test(NAME mach-trap-dispatch COMMAND test_mach_trap)
 
+    add_executable(test_mach_msg tests/test_mach_msg.cpp)
+    target_link_libraries(test_mach_msg PRIVATE macosarm_macho)
+    target_compile_options(test_mach_msg PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>
+        $<$<CXX_COMPILER_ID:MSVC>:/W4;/WX>
+    )
+    add_test(NAME mach-msg-transport COMMAND test_mach_msg)
+
     add_executable(test_process tests/test_process.cpp)
     target_link_libraries(test_process PRIVATE macosarm_macho)
     target_compile_options(test_process PRIVATE
@@ -143,5 +151,13 @@ if(BUILD_TESTING)
             $<$<CXX_COMPILER_ID:MSVC>:/W4;/WX>
         )
         add_test(NAME raw-macho-dynarmic-session COMMAND test_session_dynarmic)
+
+        add_executable(test_mach_msg_dynarmic tests/test_mach_msg_dynarmic.cpp)
+        target_link_libraries(test_mach_msg_dynarmic PRIVATE macosarm_dynarmic)
+        target_compile_options(test_mach_msg_dynarmic PRIVATE
+            $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>
+            $<$<CXX_COMPILER_ID:MSVC>:/W4;/WX>
+        )
+        add_test(NAME dynarmic-mach-msg-transport COMMAND test_mach_msg_dynarmic)
     endif()
 endif()
