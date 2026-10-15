@@ -39,6 +39,6 @@ jobs:
       - name: build JIT backend
         run: timeout 420s cmake --build build-jit --config Release --parallel 2
         timeout-minutes: 8
-      - name: test real ARM64 JIT execution
-        run: timeout 120s ctest --test-dir build-jit --output-on-failure --timeout 30 -R 'dynarmic-arm64-jit|execution-contract'
+      - name: test real ARM64 JIT and raw Mach-O session
+        run: timeout 120s ctest --test-dir build-jit --output-on-failure --timeout 30 -R 'dynarmic-arm64-jit|raw-macho-dynarmic-session|execution-contract'
         timeout-minutes: 3
