@@ -368,7 +368,7 @@ void normalize_simple_message_for_receive(std::vector<std::byte>& message) noexc
 
 } // namespace
 
-std::optional<std::uint32_t> MachContext::allocate_reply_port() noexcept {
+std::optional<std::uint32_t> MachContext::allocate_reply_port() {
     if (receive_queues_.size() >= kMaxReplyPorts ||
         next_reply_port_ == 0 ||
         next_reply_port_ == std::numeric_limits<std::uint32_t>::max()) {
