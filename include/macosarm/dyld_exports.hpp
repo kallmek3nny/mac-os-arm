@@ -26,7 +26,7 @@ constexpr std::size_t kMaxExportTrieDepth = 512;
 
 enum class ExportKind {
     regular,
-    thread_local,
+    thread_local_storage,
     absolute,
     reexport,
     stub_and_resolver,

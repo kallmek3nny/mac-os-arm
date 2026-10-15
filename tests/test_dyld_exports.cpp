@@ -171,7 +171,7 @@ int main() {
         expect(weak != nullptr && weak->weak_definition && weak->value == 0x44,
                "weak definition flag decoded");
         const auto* tls = find_symbol(result, "_tls");
-        expect(tls != nullptr && tls->kind == ExportKind::thread_local && tls->value == 0x88,
+        expect(tls != nullptr && tls->kind == ExportKind::thread_local_storage && tls->value == 0x88,
                "thread-local export decoded");
         const auto* absolute = find_symbol(result, "_abs");
         expect(absolute != nullptr && absolute->kind == ExportKind::absolute && absolute->value == 0xfeed,

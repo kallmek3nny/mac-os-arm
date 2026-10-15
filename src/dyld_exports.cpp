@@ -142,7 +142,7 @@ private:
                 return fail(ExportTrieError::malformed_uleb, payload_file_offset + cursor);
             }
         } else if (kind_bits == kExportKindThreadLocal) {
-            symbol.kind = ExportKind::thread_local;
+            symbol.kind = ExportKind::thread_local_storage;
         } else if (kind_bits == kExportKindAbsolute) {
             symbol.kind = ExportKind::absolute;
         } else {
@@ -286,7 +286,7 @@ ExportTrieResult parse_image_exports(
 std::string_view export_kind_name(ExportKind kind) noexcept {
     switch (kind) {
     case ExportKind::regular: return "regular";
-    case ExportKind::thread_local: return "thread_local";
+    case ExportKind::thread_local_storage: return "thread_local";
     case ExportKind::absolute: return "absolute";
     case ExportKind::reexport: return "reexport";
     case ExportKind::stub_and_resolver: return "stub_and_resolver";
