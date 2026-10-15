@@ -30,6 +30,16 @@ void put_instruction(
     }
 }
 
+std::uint64_t read_guest_u64(const macosarm::GuestAddressSpace& vm, std::uint64_t address) {
+    std::array<std::byte, 8> bytes{};
+    expect(static_cast<bool>(vm.read(address, bytes)), "JIT test reads guest u64");
+    std::uint64_t value = 0;
+    for (std::size_t i = 0; i < bytes.size(); ++i) {
+        value |= static_cast<std::uint64_t>(std::to_integer<unsigned char>(bytes[i])) << (i * 8);
+    }
+    return value;
+}
+
 struct CaptureHost final : macosarm::DarwinHostServices {
     std::vector<std::byte> bytes;
     std::int32_t fd{-1};
@@ -179,6 +189,58 @@ int main() {
         expect(state.x[19] == macosarm::MachContext::kDefaultTaskSelfPort,
                "translated ARM64 observes the synthetic task-self port");
         expect(state.pc == code_base + 24, "mixed trap program leaves PC after final SVC");
+    }
+
+    {
+        constexpr std::uint64_t control_base = 0x300000000ULL;
+        GuestAddressSpace vm;
+        expect(static_cast<bool>(vm.map(code_base, GuestAddressSpace::kPageSize,
+                                        Protection::read | Protection::execute)),
+               "Mach VM JIT code page maps");
+        expect(static_cast<bool>(vm.map(control_base, GuestAddressSpace::kPageSize,
+                                        Protection::read | Protection::write)),
+               "Mach VM JIT control page maps");
+
+        std::array<std::byte, GuestAddressSpace::kPageSize> code{};
+        put_instruction(code, 0, 0x92800370U);  // movn x16, #27 => -28 task_self
+        put_instruction(code, 4, 0xd4001001U);  // svc #0x80
+        put_instruction(code, 8, 0xaa0003f4U);  // mov x20, x0
+        put_instruction(code, 12, 0xaa1403e0U); // mov x0, x20 (target task port)
+        put_instruction(code, 16, 0xd2880002U); // mov x2, #0x4000 (one 16K page)
+        put_instruction(code, 20, 0xd2800023U); // mov x3, #1 (VM_FLAGS_ANYWHERE)
+        put_instruction(code, 24, 0x92800130U); // movn x16, #9 => -10 mach_vm_allocate
+        put_instruction(code, 28, 0xd4001001U); // svc #0x80
+        put_instruction(code, 32, 0xaa0003f5U); // mov x21, x0 (kern_return_t)
+        put_instruction(code, 36, 0xd2800000U); // mov x0, #0
+        put_instruction(code, 40, 0xd2800030U); // mov x16, #1 (exit)
+        put_instruction(code, 44, 0xd4001001U); // svc #0x80
+        expect(static_cast<bool>(vm.load_bytes(code_base, code)), "Mach VM JIT program loads");
+
+        macosarm::CpuState state{};
+        state.pc = code_base;
+        state.sp = 0x700000000ULL;
+        state.x[1] = control_base;
+
+        CaptureHost host;
+        macosarm::DynarmicBackend backend;
+        const auto result = macosarm::run_process(state, vm, backend, host, 32);
+
+        expect(result.reason == macosarm::ProcessStopReason::exited,
+               "real JIT resumes after mach_vm_allocate and reaches BSD exit");
+        expect(result.exit_status == 0, "Mach VM JIT program exits cleanly");
+        expect(result.instructions_executed == 12,
+               "Mach VM JIT path accounts for every translated instruction");
+        expect(state.x[20] == macosarm::MachContext::kDefaultTaskSelfPort,
+               "Mach VM JIT keeps the task-self port across traps");
+        expect(state.x[21] == macosarm::kMachKernSuccess,
+               "translated guest observes KERN_SUCCESS from mach_vm_allocate");
+
+        const std::uint64_t allocated = read_guest_u64(vm, control_base);
+        expect(allocated == macosarm::MachContext::kVmAnywhereBase,
+               "mach_vm_allocate copyout reaches guest memory during real JIT run");
+        const std::array<std::byte, 1> marker{std::byte{0x6b}};
+        expect(static_cast<bool>(vm.write(allocated, marker)),
+               "real JIT Mach allocation is writable guest memory");
     }
 
     if (failures != 0) {
