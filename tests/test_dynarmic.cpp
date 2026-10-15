@@ -36,10 +36,15 @@
 #undef expect
 #undef failures
 
+#include "test_dynarmic_initializers.inc"
+
 int main() {
     const int legacy_result = legacy_dynarmic_main();
     const int pauth_result = pauth_dynarmic_main();
-    return legacy_result == EXIT_SUCCESS && pauth_result == EXIT_SUCCESS
+    const int initializer_result = dynarmic_initializer_main();
+    return legacy_result == EXIT_SUCCESS &&
+                   pauth_result == EXIT_SUCCESS &&
+                   initializer_result == EXIT_SUCCESS
                ? EXIT_SUCCESS
                : EXIT_FAILURE;
 }
