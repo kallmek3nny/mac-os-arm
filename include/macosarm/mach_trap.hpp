@@ -41,6 +41,7 @@ constexpr std::uint32_t kMachSendInvalidData = 0x10000002;
 constexpr std::uint32_t kMachSendInvalidDest = 0x10000003;
 constexpr std::uint32_t kMachSendMsgTooSmall = 0x10000008;
 constexpr std::uint32_t kMachSendInvalidNotify = 0x1000000b;
+constexpr std::uint32_t kMachSendNoBuffer = 0x1000000d;
 constexpr std::uint32_t kMachSendTooLarge = 0x1000000e;
 constexpr std::uint32_t kMachSendInvalidType = 0x1000000f;
 constexpr std::uint32_t kMachSendInvalidHeader = 0x10000010;
@@ -60,6 +61,7 @@ constexpr std::uint32_t kMachMsgBitsLocalMask = 0x00001f00;
 constexpr std::uint32_t kMachMsgBitsComplex = 0x80000000U;
 constexpr std::size_t kMachMsgHeaderSize = 24;
 constexpr std::size_t kMachMsgMaxInlineSize = 1024 * 1024;
+constexpr std::size_t kMachMsgMaxQueueDepth = 64;
 
 class MachContext {
 public:
@@ -67,6 +69,7 @@ public:
     static constexpr std::uint32_t kDefaultThreadSelfPort = 0x102;
     static constexpr std::uint32_t kDefaultHostSelfPort = 0x103;
     static constexpr std::uint32_t kFirstReplyPort = 0x2000;
+    static constexpr std::size_t kMaxReplyPorts = 4096;
     static constexpr std::uint64_t kVmAnywhereBase = 0x1000000000ULL;
 
     [[nodiscard]] std::uint32_t task_self_port() const noexcept { return task_self_port_; }
@@ -75,7 +78,8 @@ public:
     [[nodiscard]] std::optional<std::uint32_t> allocate_reply_port() noexcept;
     [[nodiscard]] bool is_receive_port(std::uint32_t port) const noexcept;
     [[nodiscard]] bool enqueue_message(std::uint32_t port, std::vector<std::byte> message);
-    [[nodiscard]] std::optional<std::vector<std::byte>> dequeue_message(std::uint32_t port);
+    [[nodiscard]] const std::vector<std::byte>* peek_message(std::uint32_t port) const noexcept;
+    [[nodiscard]] bool pop_message(std::uint32_t port) noexcept;
     [[nodiscard]] std::size_t queued_message_count(std::uint32_t port) const noexcept;
 
 private:
