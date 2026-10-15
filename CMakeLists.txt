@@ -13,6 +13,7 @@ add_library(macosarm_macho
     src/darwin_syscall.cpp
     src/process.cpp
     src/session.cpp
+    src/native_host.cpp
 )
 target_include_directories(macosarm_macho PUBLIC include)
 target_compile_options(macosarm_macho PRIVATE
@@ -47,6 +48,13 @@ if(MACOSARM_ENABLE_DYNARMIC)
     target_include_directories(macosarm_dynarmic PUBLIC include)
     target_link_libraries(macosarm_dynarmic PUBLIC macosarm_macho PRIVATE dynarmic)
     target_compile_options(macosarm_dynarmic PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>
+        $<$<CXX_COMPILER_ID:MSVC>:/W4;/WX>
+    )
+
+    add_executable(macarm-run src/macarm_run.cpp)
+    target_link_libraries(macarm-run PRIVATE macosarm_dynarmic)
+    target_compile_options(macarm-run PRIVATE
         $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>
         $<$<CXX_COMPILER_ID:MSVC>:/W4;/WX>
     )
@@ -118,6 +126,14 @@ if(BUILD_TESTING)
     )
     add_test(NAME macho-session-bootstrap COMMAND test_session)
 
+    add_executable(test_native_host tests/test_native_host.cpp)
+    target_link_libraries(test_native_host PRIVATE macosarm_macho)
+    target_compile_options(test_native_host PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>
+        $<$<CXX_COMPILER_ID:MSVC>:/W4;/WX>
+    )
+    add_test(NAME native-host-service COMMAND test_native_host)
+
     if(MACOSARM_ENABLE_DYNARMIC)
         add_executable(test_dynarmic tests/test_dynarmic.cpp)
         target_link_libraries(test_dynarmic PRIVATE macosarm_dynarmic)
@@ -134,5 +150,6 @@ if(BUILD_TESTING)
             $<$<CXX_COMPILER_ID:MSVC>:/W4;/WX>
         )
         add_test(NAME raw-macho-dynarmic-session COMMAND test_session_dynarmic)
+        add_test(NAME runner-cli-help COMMAND macarm-run --help)
     endif()
 endif()
