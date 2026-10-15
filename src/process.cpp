@@ -10,6 +10,7 @@ namespace {
         0,
         VmError::none,
         SyscallDispatchError::none,
+        MachTrapDispatchError::none,
     };
 }
 
@@ -29,6 +30,7 @@ ProcessResult run_process(
             0,
             VmError::none,
             SyscallDispatchError::none,
+            MachTrapDispatchError::none,
         };
     }
 
@@ -53,6 +55,7 @@ ProcessResult run_process(
                 0,
                 VmError::none,
                 SyscallDispatchError::none,
+                MachTrapDispatchError::none,
             };
 
         case StopReason::supervisor_call: {
@@ -83,6 +86,7 @@ ProcessResult run_process(
                         0,
                         VmError::none,
                         dispatch.error,
+                        MachTrapDispatchError::none,
                     };
                 }
                 if (dispatch.action == SyscallAction::exit_process) {
@@ -92,6 +96,7 @@ ProcessResult run_process(
                         dispatch.exit_status,
                         VmError::none,
                         SyscallDispatchError::none,
+                        MachTrapDispatchError::none,
                     };
                 }
             }
@@ -103,6 +108,7 @@ ProcessResult run_process(
                     0,
                     VmError::none,
                     SyscallDispatchError::none,
+                    MachTrapDispatchError::none,
                 };
             }
             break;
@@ -115,6 +121,7 @@ ProcessResult run_process(
                 0,
                 VmError::none,
                 SyscallDispatchError::none,
+                MachTrapDispatchError::none,
             };
 
         case StopReason::memory_fault:
@@ -124,6 +131,7 @@ ProcessResult run_process(
                 0,
                 execution.vm_error,
                 SyscallDispatchError::none,
+                MachTrapDispatchError::none,
             };
 
         case StopReason::backend_error:
@@ -137,6 +145,7 @@ ProcessResult run_process(
         0,
         VmError::none,
         SyscallDispatchError::none,
+        MachTrapDispatchError::none,
     };
 }
 
