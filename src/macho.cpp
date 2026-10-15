@@ -137,6 +137,10 @@ private:
     }
 }
 
+[[nodiscard]] bool supported_file_type(std::uint32_t file_type) noexcept {
+    return file_type == kMhExecute || file_type == kMhDylib || file_type == kMhDylinker;
+}
+
 } // namespace
 
 ParseResult parse(std::span<const std::byte> bytes) {
@@ -175,8 +179,8 @@ ParseResult parse(std::span<const std::byte> bytes) {
     if (cpu_type != kCpuTypeArm64) {
         return fail(ErrorCode::unsupported_cpu, "image is not ARM64");
     }
-    if (file_type != kMhExecute) {
-        return fail(ErrorCode::unsupported_file_type, "only MH_EXECUTE images are supported");
+    if (!supported_file_type(file_type)) {
+        return fail(ErrorCode::unsupported_file_type, "unsupported Mach-O file type");
     }
     if (!reader.contains(kHeaderSize, commands_size)) {
         return fail(ErrorCode::malformed_load_commands, "load-command region extends past end of file");
@@ -229,7 +233,8 @@ ParseResult parse(std::span<const std::byte> bytes) {
             segment.initial_protection = initial_protection;
 
             constexpr std::uint64_t kSection64Size = 80;
-            const std::uint64_t required_size = kSegment64Size + static_cast<std::uint64_t>(section_count) * kSection64Size;
+            const std::uint64_t required_size =
+                kSegment64Size + static_cast<std::uint64_t>(section_count) * kSection64Size;
             if (required_size > command_size) {
                 return fail(ErrorCode::malformed_segment, "LC_SEGMENT_64 section table exceeds command size");
             }
@@ -254,6 +259,29 @@ ParseResult parse(std::span<const std::byte> bytes) {
                 return fail(ErrorCode::malformed_load_commands, "LC_MAIN entry offset exceeds image size");
             }
             result.image.has_entry_point = true;
+        } else if (command == kLcIdDylib) {
+            if (result.image.file_type != kMhDylib) {
+                return fail(ErrorCode::malformed_dylib_identity, "LC_ID_DYLIB is only valid in MH_DYLIB images");
+            }
+            if (command_size < kDylibCommandSize) {
+                return fail(ErrorCode::malformed_dylib_identity, "LC_ID_DYLIB is too small");
+            }
+            if (result.image.has_dylib_identity) {
+                return fail(ErrorCode::duplicate_dylib_identity, "multiple LC_ID_DYLIB commands are not supported");
+            }
+
+            std::uint32_t path_offset = 0;
+            DylibIdentity identity;
+            if (!reader.read_u32(cursor + 8, path_offset) ||
+                !reader.read_u32(cursor + 12, identity.timestamp) ||
+                !reader.read_u32(cursor + 16, identity.current_version) ||
+                !reader.read_u32(cursor + 20, identity.compatibility_version) ||
+                !command_string(reader, cursor, command_size, path_offset,
+                                static_cast<std::uint32_t>(kDylibCommandSize), identity.install_name)) {
+                return fail(ErrorCode::malformed_dylib_identity, "invalid LC_ID_DYLIB command");
+            }
+            result.image.dylib_identity = std::move(identity);
+            result.image.has_dylib_identity = true;
         } else if (command == kLcLoadDylinker) {
             if (command_size < kDylinkerCommandSize) {
                 return fail(ErrorCode::malformed_dynamic_linker, "LC_LOAD_DYLINKER is too small");
@@ -287,7 +315,8 @@ ParseResult parse(std::span<const std::byte> bytes) {
             }
             std::uint32_t data_offset = 0;
             std::uint32_t data_size = 0;
-            if (!reader.read_u32(cursor + 8, data_offset) || !reader.read_u32(cursor + 12, data_size) ||
+            if (!reader.read_u32(cursor + 8, data_offset) ||
+                !reader.read_u32(cursor + 12, data_size) ||
                 !linkedit_range_valid(bytes.size(), data_offset, data_size)) {
                 return fail(ErrorCode::malformed_linkedit_data, "dyld linkedit range exceeds image size");
             }
@@ -335,6 +364,9 @@ ParseResult parse(std::span<const std::byte> bytes) {
     if (cursor != commands_end) {
         return fail(ErrorCode::malformed_load_commands, "load-command count does not consume declared command region");
     }
+    if (result.image.file_type == kMhDylib && !result.image.has_dylib_identity) {
+        return fail(ErrorCode::missing_dylib_identity, "MH_DYLIB image is missing LC_ID_DYLIB");
+    }
 
     return result;
 }
@@ -350,10 +382,13 @@ std::string_view error_name(ErrorCode error) noexcept {
     case ErrorCode::malformed_segment: return "malformed_segment";
     case ErrorCode::malformed_dynamic_linker: return "malformed_dynamic_linker";
     case ErrorCode::malformed_dylib: return "malformed_dylib";
+    case ErrorCode::malformed_dylib_identity: return "malformed_dylib_identity";
     case ErrorCode::malformed_runpath: return "malformed_runpath";
     case ErrorCode::malformed_linkedit_data: return "malformed_linkedit_data";
+    case ErrorCode::missing_dylib_identity: return "missing_dylib_identity";
     case ErrorCode::duplicate_entry_point: return "duplicate_entry_point";
     case ErrorCode::duplicate_dynamic_linker: return "duplicate_dynamic_linker";
+    case ErrorCode::duplicate_dylib_identity: return "duplicate_dylib_identity";
     case ErrorCode::duplicate_exports_trie: return "duplicate_exports_trie";
     case ErrorCode::duplicate_chained_fixups: return "duplicate_chained_fixups";
     }
