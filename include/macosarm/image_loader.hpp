@@ -12,6 +12,7 @@ namespace macosarm {
 
 enum class LoadError {
     none,
+    wrong_file_type,
     missing_entry_point,
     missing_text_segment,
     malformed_segment,
@@ -36,7 +37,22 @@ struct LoadResult {
     }
 };
 
+// Maps a parsed image at its preferred virtual addresses. If LC_MAIN is present,
+// the returned entry address is validated against an executable segment; images
+// without LC_MAIN map with entry_address == 0.
+[[nodiscard]] LoadResult load_image(
+    const macho::Image& image,
+    std::span<const std::byte> file_bytes,
+    GuestAddressSpace& address_space);
+
+// Strict process bootstrap path. Only MH_EXECUTE with a valid LC_MAIN is accepted.
 [[nodiscard]] LoadResult load_executable(
+    const macho::Image& image,
+    std::span<const std::byte> file_bytes,
+    GuestAddressSpace& address_space);
+
+// Shared-image path for dyld bring-up. MH_DYLIB and MH_DYLINKER do not require LC_MAIN.
+[[nodiscard]] LoadResult load_shared_image(
     const macho::Image& image,
     std::span<const std::byte> file_bytes,
     GuestAddressSpace& address_space);
