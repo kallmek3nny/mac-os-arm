@@ -16,6 +16,7 @@ add_library(macosarm_macho
     src/dyld_symbols.cpp
     src/dyld_fixups.cpp
     src/dyld_fixup_apply.cpp
+    src/pointer_auth.cpp
     src/execution.cpp
     src/darwin_syscall.cpp
     src/mach_trap.cpp
@@ -149,6 +150,14 @@ if(BUILD_TESTING)
         $<$<CXX_COMPILER_ID:MSVC>:/W4;/WX>
     )
     add_test(NAME dyld-arm64e-chained-fixup-apply COMMAND test_dyld_fixup_arm64e)
+
+    add_executable(test_pointer_auth tests/test_pointer_auth.cpp)
+    target_link_libraries(test_pointer_auth PRIVATE macosarm_macho)
+    target_compile_options(test_pointer_auth PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>
+        $<$<CXX_COMPILER_ID:MSVC>:/W4;/WX>
+    )
+    add_test(NAME pointer-auth-policy COMMAND test_pointer_auth)
 
     add_executable(test_parse_load_integration tests/test_parse_load_integration.cpp)
     target_link_libraries(test_parse_load_integration PRIVATE macosarm_macho)
