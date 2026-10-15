@@ -11,6 +11,7 @@ add_library(macosarm_macho
     src/image_loader.cpp
     src/execution.cpp
     src/darwin_syscall.cpp
+    src/mach_trap.cpp
     src/process.cpp
     src/session.cpp
 )
@@ -101,6 +102,14 @@ if(BUILD_TESTING)
         $<$<CXX_COMPILER_ID:MSVC>:/W4;/WX>
     )
     add_test(NAME darwin-syscall-dispatch COMMAND test_darwin_syscall)
+
+    add_executable(test_mach_trap tests/test_mach_trap.cpp)
+    target_link_libraries(test_mach_trap PRIVATE macosarm_macho)
+    target_compile_options(test_mach_trap PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>
+        $<$<CXX_COMPILER_ID:MSVC>:/W4;/WX>
+    )
+    add_test(NAME mach-trap-dispatch COMMAND test_mach_trap)
 
     add_executable(test_process tests/test_process.cpp)
     target_link_libraries(test_process PRIVATE macosarm_macho)
