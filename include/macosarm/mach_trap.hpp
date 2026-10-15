@@ -19,12 +19,26 @@ constexpr std::int64_t kMachTrapTaskSelf = -28;
 constexpr std::int64_t kMachTrapHostSelf = -29;
 constexpr std::int64_t kMachTrapMessage = -31;
 
+constexpr std::uint32_t kMachKernSuccess = 0;
+constexpr std::uint32_t kMachKernInvalidAddress = 1;
+constexpr std::uint32_t kMachKernProtectionFailure = 2;
+constexpr std::uint32_t kMachKernNoSpace = 3;
+constexpr std::uint32_t kMachKernInvalidArgument = 4;
+
+constexpr std::uint64_t kMachVmFlagsAnywhere = 0x1;
+constexpr std::uint32_t kMachVmProtRead = 0x1;
+constexpr std::uint32_t kMachVmProtWrite = 0x2;
+constexpr std::uint32_t kMachVmProtExecute = 0x4;
+constexpr std::uint32_t kMachVmProtMask =
+    kMachVmProtRead | kMachVmProtWrite | kMachVmProtExecute;
+
 class MachContext {
 public:
     static constexpr std::uint32_t kDefaultTaskSelfPort = 0x101;
     static constexpr std::uint32_t kDefaultThreadSelfPort = 0x102;
     static constexpr std::uint32_t kDefaultHostSelfPort = 0x103;
     static constexpr std::uint32_t kFirstReplyPort = 0x2000;
+    static constexpr std::uint64_t kVmAnywhereBase = 0x1000000000ULL;
 
     [[nodiscard]] std::uint32_t task_self_port() const noexcept { return task_self_port_; }
     [[nodiscard]] std::uint32_t thread_self_port() const noexcept { return thread_self_port_; }
