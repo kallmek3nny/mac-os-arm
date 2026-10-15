@@ -75,7 +75,7 @@ public:
     [[nodiscard]] std::uint32_t task_self_port() const noexcept { return task_self_port_; }
     [[nodiscard]] std::uint32_t thread_self_port() const noexcept { return thread_self_port_; }
     [[nodiscard]] std::uint32_t host_self_port() const noexcept { return host_self_port_; }
-    [[nodiscard]] std::optional<std::uint32_t> allocate_reply_port() noexcept;
+    [[nodiscard]] std::optional<std::uint32_t> allocate_reply_port();
     [[nodiscard]] bool is_receive_port(std::uint32_t port) const noexcept;
     [[nodiscard]] bool enqueue_message(std::uint32_t port, std::vector<std::byte> message);
     [[nodiscard]] const std::vector<std::byte>* peek_message(std::uint32_t port) const noexcept;
