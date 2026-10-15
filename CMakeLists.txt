@@ -9,6 +9,7 @@ add_library(macosarm_macho
     src/macho.cpp
     src/address_space.cpp
     src/image_loader.cpp
+    src/dyld_paths.cpp
     src/execution.cpp
     src/darwin_syscall.cpp
     src/mach_trap.cpp
@@ -78,6 +79,14 @@ if(BUILD_TESTING)
         $<$<CXX_COMPILER_ID:MSVC>:/W4;/WX>
     )
     add_test(NAME image-loader COMMAND test_image_loader)
+
+    add_executable(test_dyld_paths tests/test_dyld_paths.cpp)
+    target_link_libraries(test_dyld_paths PRIVATE macosarm_macho)
+    target_compile_options(test_dyld_paths PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>
+        $<$<CXX_COMPILER_ID:MSVC>:/W4;/WX>
+    )
+    add_test(NAME dyld-path-resolution COMMAND test_dyld_paths)
 
     add_executable(test_parse_load_integration tests/test_parse_load_integration.cpp)
     target_link_libraries(test_parse_load_integration PRIVATE macosarm_macho)
