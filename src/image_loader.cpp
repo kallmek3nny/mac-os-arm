@@ -39,36 +39,35 @@ namespace {
     return false;
 }
 
-} // namespace
-
-LoadResult load_executable(
-    const macho::Image& image,
-    std::span<const std::byte> file_bytes,
-    GuestAddressSpace& address_space) {
-
-    if (!image.has_entry_point) {
-        return {{}, LoadError::missing_entry_point, VmError::none};
-    }
-
-    const macho::Segment* text = nullptr;
+[[nodiscard]] const macho::Segment* find_text_segment(const macho::Image& image) noexcept {
     for (const auto& segment : image.segments) {
         if (segment.name == "__TEXT") {
-            text = &segment;
-            break;
+            return &segment;
         }
     }
+    return nullptr;
+}
+
+[[nodiscard]] LoadResult validate_layout(
+    const macho::Image& image,
+    std::span<const std::byte> file_bytes) {
+
+    const macho::Segment* text = find_text_segment(image);
     if (text == nullptr) {
         return {{}, LoadError::missing_text_segment, VmError::none};
     }
     if (text->vm_address < text->file_offset) {
-        return {{}, LoadError::bad_entry_point, VmError::none};
+        return {{}, LoadError::malformed_segment, VmError::none};
     }
 
     const std::uint64_t preferred_load_address = text->vm_address - text->file_offset;
-    if (add_overflows(preferred_load_address, image.entry_file_offset)) {
-        return {{}, LoadError::bad_entry_point, VmError::none};
+    std::uint64_t entry_address = 0;
+    if (image.has_entry_point) {
+        if (add_overflows(preferred_load_address, image.entry_file_offset)) {
+            return {{}, LoadError::bad_entry_point, VmError::none};
+        }
+        entry_address = preferred_load_address + image.entry_file_offset;
     }
-    const std::uint64_t entry_address = preferred_load_address + image.entry_file_offset;
 
     for (const auto& segment : image.segments) {
         if (segment.vm_size == 0) {
@@ -90,8 +89,23 @@ LoadResult load_executable(
         }
     }
 
-    if (!entry_is_executable(image, entry_address)) {
+    if (image.has_entry_point && !entry_is_executable(image, entry_address)) {
         return {{}, LoadError::bad_entry_point, VmError::none};
+    }
+
+    return {LoadedImage{preferred_load_address, entry_address, 0}, LoadError::none, VmError::none};
+}
+
+} // namespace
+
+LoadResult load_image(
+    const macho::Image& image,
+    std::span<const std::byte> file_bytes,
+    GuestAddressSpace& address_space) {
+
+    LoadResult result = validate_layout(image, file_bytes);
+    if (!result) {
+        return result;
     }
 
     std::vector<Mapping> created;
@@ -129,12 +143,39 @@ LoadResult load_executable(
         }
     }
 
-    return {LoadedImage{preferred_load_address, entry_address, created.size()}, LoadError::none, VmError::none};
+    result.image.mapped_segments = created.size();
+    return result;
+}
+
+LoadResult load_executable(
+    const macho::Image& image,
+    std::span<const std::byte> file_bytes,
+    GuestAddressSpace& address_space) {
+
+    if (image.file_type != macho::kMhExecute) {
+        return {{}, LoadError::wrong_file_type, VmError::none};
+    }
+    if (!image.has_entry_point) {
+        return {{}, LoadError::missing_entry_point, VmError::none};
+    }
+    return load_image(image, file_bytes, address_space);
+}
+
+LoadResult load_shared_image(
+    const macho::Image& image,
+    std::span<const std::byte> file_bytes,
+    GuestAddressSpace& address_space) {
+
+    if (image.file_type != macho::kMhDylib && image.file_type != macho::kMhDylinker) {
+        return {{}, LoadError::wrong_file_type, VmError::none};
+    }
+    return load_image(image, file_bytes, address_space);
 }
 
 std::string_view load_error_name(LoadError error) noexcept {
     switch (error) {
     case LoadError::none: return "none";
+    case LoadError::wrong_file_type: return "wrong_file_type";
     case LoadError::missing_entry_point: return "missing_entry_point";
     case LoadError::missing_text_segment: return "missing_text_segment";
     case LoadError::malformed_segment: return "malformed_segment";
