@@ -1,5 +1,6 @@
 #include "macosarm/dyld_exports.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
