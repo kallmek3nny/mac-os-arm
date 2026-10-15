@@ -564,6 +564,7 @@ private:
                 result.address = applied.address;
                 result.rolled_back = applied.rolled_back;
                 const bool include_current =
+                    static_cast<bool>(applied) ||
                     applied.error == ChainedFixupsApplyError::rollback_failure;
                 const std::size_t restore_count =
                     applied_prepared_images + (include_current ? 1U : 0U);
@@ -597,6 +598,7 @@ private:
                 result.address = applied.address;
                 result.rolled_back = applied.rolled_back;
                 const bool include_current =
+                    static_cast<bool>(applied) ||
                     applied.error == Arm64eFixupsApplyError::rollback_failure;
                 const std::size_t restore_count =
                     applied_prepared_images + (include_current ? 1U : 0U);
