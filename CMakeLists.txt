@@ -14,6 +14,7 @@ add_library(macosarm_macho
     src/dyld_exports.cpp
     src/dyld_graph.cpp
     src/dyld_symbols.cpp
+    src/dyld_fixups.cpp
     src/execution.cpp
     src/darwin_syscall.cpp
     src/mach_trap.cpp
@@ -123,6 +124,14 @@ if(BUILD_TESTING)
         $<$<CXX_COMPILER_ID:MSVC>:/W4;/WX>
     )
     add_test(NAME dyld-symbol-resolution COMMAND test_dyld_symbols)
+
+    add_executable(test_dyld_fixups tests/test_dyld_fixups.cpp)
+    target_link_libraries(test_dyld_fixups PRIVATE macosarm_macho)
+    target_compile_options(test_dyld_fixups PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>
+        $<$<CXX_COMPILER_ID:MSVC>:/W4;/WX>
+    )
+    add_test(NAME dyld-chained-fixups-metadata COMMAND test_dyld_fixups)
 
     add_executable(test_parse_load_integration tests/test_parse_load_integration.cpp)
     target_link_libraries(test_parse_load_integration PRIVATE macosarm_macho)
