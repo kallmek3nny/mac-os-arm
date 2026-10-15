@@ -11,6 +11,7 @@ add_library(macosarm_macho
     src/image_loader.cpp
     src/execution.cpp
     src/darwin_syscall.cpp
+    src/process.cpp
 )
 target_include_directories(macosarm_macho PUBLIC include)
 target_compile_options(macosarm_macho PRIVATE
@@ -99,6 +100,14 @@ if(BUILD_TESTING)
         $<$<CXX_COMPILER_ID:MSVC>:/W4;/WX>
     )
     add_test(NAME darwin-syscall-dispatch COMMAND test_darwin_syscall)
+
+    add_executable(test_process tests/test_process.cpp)
+    target_link_libraries(test_process PRIVATE macosarm_macho)
+    target_compile_options(test_process PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>
+        $<$<CXX_COMPILER_ID:MSVC>:/W4;/WX>
+    )
+    add_test(NAME process-runner COMMAND test_process)
 
     if(MACOSARM_ENABLE_DYNARMIC)
         add_executable(test_dynarmic tests/test_dynarmic.cpp)
