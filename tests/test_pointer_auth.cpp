@@ -17,12 +17,12 @@ void expect(bool condition, const std::string& label) {
 }
 
 macosarm::PointerAuthKeySet test_keys() {
-    return {{
-        {0x0123456789abcdefULL, 0xfedcba9876543210ULL},
-        {0x1111222233334444ULL, 0x5555666677778888ULL},
-        {0x1020304050607080ULL, 0x90a0b0c0d0e0f000ULL},
-        {0x0f1e2d3c4b5a6978ULL, 0x8796a5b4c3d2e1f0ULL},
-    }};
+    macosarm::PointerAuthKeySet keys;
+    keys.values[0] = {0x0123456789abcdefULL, 0xfedcba9876543210ULL};
+    keys.values[1] = {0x1111222233334444ULL, 0x5555666677778888ULL};
+    keys.values[2] = {0x1020304050607080ULL, 0x90a0b0c0d0e0f000ULL};
+    keys.values[3] = {0x0f1e2d3c4b5a6978ULL, 0x8796a5b4c3d2e1f0ULL};
+    return keys;
 }
 
 } // namespace
