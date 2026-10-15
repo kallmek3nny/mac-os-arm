@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -31,10 +32,57 @@ template <typename T>
     return bytes;
 }
 
+enum class PauthDispatch {
+    not_pauth,
+    executed,
+    failed,
+};
+
+constexpr std::uint32_t kPacia1716 = 0xd503211fU;
+constexpr std::uint32_t kPacib1716 = 0xd503215fU;
+constexpr std::uint32_t kAutia1716 = 0xd503219fU;
+constexpr std::uint32_t kAutib1716 = 0xd50321dfU;
+constexpr std::uint32_t kXpaclri = 0xd50320ffU;
+constexpr std::uint32_t kPaciaz = 0xd503231fU;
+constexpr std::uint32_t kPaciasp = 0xd503233fU;
+constexpr std::uint32_t kPacibz = 0xd503235fU;
+constexpr std::uint32_t kPacibsp = 0xd503237fU;
+constexpr std::uint32_t kAutiaz = 0xd503239fU;
+constexpr std::uint32_t kAutiasp = 0xd50323bfU;
+constexpr std::uint32_t kAutibz = 0xd50323dfU;
+constexpr std::uint32_t kAutibsp = 0xd50323ffU;
+
+[[nodiscard]] bool is_pointer_auth_instruction(std::uint32_t instruction) noexcept {
+    switch (instruction) {
+    case kPacia1716:
+    case kPacib1716:
+    case kAutia1716:
+    case kAutib1716:
+    case kXpaclri:
+    case kPaciaz:
+    case kPaciasp:
+    case kPacibz:
+    case kPacibsp:
+    case kAutiaz:
+    case kAutiasp:
+    case kAutibz:
+    case kAutibsp:
+        return true;
+    default:
+        return false;
+    }
+}
+
 } // namespace
 
 struct DynarmicBackend::Impl final : Dynarmic::A64::UserCallbacks {
-    Impl() {
+    Impl() : Impl(std::nullopt) {}
+
+    explicit Impl(std::optional<PointerAuthKeySet> pointer_auth_keys) {
+        if (pointer_auth_keys.has_value()) {
+            pointer_auth.emplace(*pointer_auth_keys);
+        }
+
         Dynarmic::A64::UserConfig config{};
         config.callbacks = this;
         config.enable_cycle_counting = false;
@@ -65,6 +113,20 @@ struct DynarmicBackend::Impl final : Dynarmic::A64::UserCallbacks {
         while (executed < instruction_budget) {
             pending_result.reset();
             jit->ClearHalt(Dynarmic::HaltReason::UserDefined1);
+
+            const std::optional<std::uint32_t> instruction = peek_instruction();
+            if (instruction.has_value() && is_pointer_auth_instruction(*instruction)) {
+                const PauthDispatch dispatch = emulate_pointer_auth_instruction(*instruction);
+                ++executed;
+                if (dispatch == PauthDispatch::failed) {
+                    copy_state_from_jit(state);
+                    return {StopReason::exception, executed, 0, VmError::none};
+                }
+                if (dispatch == PauthDispatch::executed) {
+                    continue;
+                }
+            }
+
             (void)jit->Step();
             ++executed;
 
@@ -172,6 +234,101 @@ struct DynarmicBackend::Impl final : Dynarmic::A64::UserCallbacks {
     std::uint64_t GetCNTPCT() override { return 0; }
 
 private:
+    [[nodiscard]] std::optional<std::uint32_t> peek_instruction() const {
+        std::array<std::byte, 4> bytes{};
+        const VmResult result = address_space->fetch_code(jit->GetPC(), bytes);
+        if (!result) {
+            return std::nullopt;
+        }
+        return decode_little_endian<std::uint32_t>(bytes);
+    }
+
+    [[nodiscard]] PauthDispatch emulate_pointer_auth_instruction(std::uint32_t instruction) {
+        if (!pointer_auth.has_value()) {
+            return PauthDispatch::failed;
+        }
+
+        if (jit->GetPC() > std::numeric_limits<std::uint64_t>::max() - 4U) {
+            return PauthDispatch::failed;
+        }
+
+        auto registers = jit->GetRegisters();
+        const std::uint64_t sp = jit->GetSP();
+
+        auto sign_register = [&](std::size_t index, PointerAuthKey key, std::uint64_t modifier) {
+            const PointerAuthResult result = pointer_auth->sign(registers[index], key, modifier);
+            if (!result) {
+                return false;
+            }
+            registers[index] = result.pointer;
+            return true;
+        };
+
+        auto authenticate_register =
+            [&](std::size_t index, PointerAuthKey key, std::uint64_t modifier) {
+                const PointerAuthResult result =
+                    pointer_auth->authenticate(registers[index], key, modifier);
+                if (!result) {
+                    return false;
+                }
+                registers[index] = result.pointer;
+                return true;
+            };
+
+        bool success = false;
+        switch (instruction) {
+        case kPacia1716:
+            success = sign_register(17, PointerAuthKey::instruction_a, registers[16]);
+            break;
+        case kPacib1716:
+            success = sign_register(17, PointerAuthKey::instruction_b, registers[16]);
+            break;
+        case kAutia1716:
+            success = authenticate_register(17, PointerAuthKey::instruction_a, registers[16]);
+            break;
+        case kAutib1716:
+            success = authenticate_register(17, PointerAuthKey::instruction_b, registers[16]);
+            break;
+        case kPaciaz:
+            success = sign_register(30, PointerAuthKey::instruction_a, 0);
+            break;
+        case kPaciasp:
+            success = sign_register(30, PointerAuthKey::instruction_a, sp);
+            break;
+        case kPacibz:
+            success = sign_register(30, PointerAuthKey::instruction_b, 0);
+            break;
+        case kPacibsp:
+            success = sign_register(30, PointerAuthKey::instruction_b, sp);
+            break;
+        case kAutiaz:
+            success = authenticate_register(30, PointerAuthKey::instruction_a, 0);
+            break;
+        case kAutiasp:
+            success = authenticate_register(30, PointerAuthKey::instruction_a, sp);
+            break;
+        case kAutibz:
+            success = authenticate_register(30, PointerAuthKey::instruction_b, 0);
+            break;
+        case kAutibsp:
+            success = authenticate_register(30, PointerAuthKey::instruction_b, sp);
+            break;
+        case kXpaclri:
+            registers[30] = PointerAuthenticator::strip(registers[30]);
+            success = true;
+            break;
+        default:
+            return PauthDispatch::not_pauth;
+        }
+
+        if (!success) {
+            return PauthDispatch::failed;
+        }
+        jit->SetRegisters(registers);
+        jit->SetPC(jit->GetPC() + 4U);
+        return PauthDispatch::executed;
+    }
+
     template <typename T>
     [[nodiscard]] T read_scalar(Dynarmic::A64::VAddr vaddr) {
         std::array<std::byte, sizeof(T)> bytes{};
@@ -245,10 +402,13 @@ private:
 
     GuestAddressSpace* address_space{};
     std::optional<ExecutionResult> pending_result;
+    std::optional<PointerAuthenticator> pointer_auth;
     std::unique_ptr<Dynarmic::A64::Jit> jit;
 };
 
 DynarmicBackend::DynarmicBackend() : impl_(std::make_unique<Impl>()) {}
+DynarmicBackend::DynarmicBackend(PointerAuthKeySet pointer_auth_keys)
+    : impl_(std::make_unique<Impl>(pointer_auth_keys)) {}
 DynarmicBackend::~DynarmicBackend() = default;
 DynarmicBackend::DynarmicBackend(DynarmicBackend&&) noexcept = default;
 DynarmicBackend& DynarmicBackend::operator=(DynarmicBackend&&) noexcept = default;
