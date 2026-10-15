@@ -25,10 +25,12 @@ void graphwide_rewrite_import(
 } // namespace
 
 int dyld_graph_fixups_edgecases_main() {
+    using macosarm::VmError;
     using macosarm::dyld::ChainedFixupsApplyError;
     using macosarm::dyld::ChainedPointerFormat;
     using macosarm::dyld::GraphFixupScanError;
     using macosarm::dyld::LoadedImageGraphFixupsError;
+    using macosarm::dyld::LoadedImageGraphFixupsResult;
 
     {
         GraphwideFixture fixture;
@@ -147,6 +149,71 @@ int dyld_graph_fixups_edgecases_main() {
                    fixture.address_space,
                    GraphwideFixture::root_base + 0x20) == 0,
                "missing weak graph bind materializes a null pointer");
+    }
+
+    {
+        GraphwideFixture fixture;
+        fixture.graph.images[0].chained_fixups_payload =
+            graphwide_payload(ChainedPointerFormat::arm64e_userland);
+        fixture.graph.images[1].chained_fixups_payload =
+            graphwide_payload(ChainedPointerFormat::arm64e_userland24);
+        constexpr std::uint64_t root_offset = 0xb00;
+        constexpr std::uint64_t dependency_offset = 0xc00;
+        expect(graphwide_store_u64(
+                   fixture.address_space,
+                   GraphwideFixture::root_base + 0x20,
+                   graphwide_arm64e_rebase(root_offset)) &&
+                   graphwide_store_u64(
+                       fixture.address_space,
+                       GraphwideFixture::dependency_base + 0x20,
+                       graphwide_arm64e_rebase(dependency_offset)),
+               "multi-image ARM64e fixture stores raw chains");
+
+        const auto result = macosarm::dyld::apply_loaded_image_graph_fixups(
+            fixture.graph,
+            fixture.address_space);
+        expect(static_cast<bool>(result) &&
+                   result.fixups_processed == 2 &&
+                   result.authenticated_slots.empty(),
+               "ARM64e userland and userland24 apply coherently across graph images");
+        expect(graphwide_read_u64(
+                   fixture.address_space,
+                   GraphwideFixture::root_base + 0x20) ==
+                   GraphwideFixture::root_base + root_offset &&
+                   graphwide_read_u64(
+                       fixture.address_space,
+                       GraphwideFixture::dependency_base + 0x20) ==
+                   GraphwideFixture::dependency_base + dependency_offset,
+               "multi-image ARM64e rebases use each image base independently");
+    }
+
+    {
+        macosarm::GuestAddressSpace vm;
+        std::vector<macosarm::dyld::graph_fixup_detail::PreparedImage> prepared(1);
+        prepared[0].image_index = 7;
+        constexpr std::uint64_t address = 0x12345000ULL;
+        prepared[0].journal.push_back({address, 0x1122334455667788ULL});
+        LoadedImageGraphFixupsResult result;
+        result.authenticated_slots.push_back({
+            address,
+            macosarm::PointerAuthKey::data_a,
+            0x1234,
+            true,
+        });
+
+        const bool restored = macosarm::dyld::graph_fixup_detail::restore_prepared_images(
+            prepared,
+            prepared.size(),
+            vm,
+            result);
+        expect(!restored &&
+                   result.error == LoadedImageGraphFixupsError::rollback_failure &&
+                   result.failed_image_index == 7 &&
+                   result.address == address &&
+                   result.vm_error == VmError::unmapped &&
+                   result.rolled_back &&
+                   result.authenticated_slots.empty(),
+               "graph rollback write failure is explicit and suppresses stale authenticated-slot state");
     }
 
     if (failures != 0) {
