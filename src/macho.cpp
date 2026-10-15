@@ -61,6 +61,22 @@ public:
         return value;
     }
 
+    [[nodiscard]] bool read_cstring(std::size_t offset, std::size_t end, std::string& out) const {
+        if (offset >= end || end > bytes_.size()) {
+            return false;
+        }
+        out.clear();
+        for (std::size_t cursor = offset; cursor < end; ++cursor) {
+            const auto ch = static_cast<char>(std::to_integer<unsigned char>(bytes_[cursor]));
+            if (ch == '\0') {
+                return !out.empty();
+            }
+            out.push_back(ch);
+        }
+        out.clear();
+        return false;
+    }
+
 private:
     std::span<const std::byte> bytes_;
 };
@@ -76,6 +92,51 @@ private:
     return b > std::numeric_limits<std::uint64_t>::max() - a;
 }
 
+[[nodiscard]] bool command_string(
+    const Reader& reader,
+    std::size_t cursor,
+    std::uint32_t command_size,
+    std::uint32_t string_offset,
+    std::uint32_t minimum_offset,
+    std::string& out) {
+    if (string_offset < minimum_offset || string_offset >= command_size) {
+        return false;
+    }
+    const std::size_t start = cursor + static_cast<std::size_t>(string_offset);
+    const std::size_t end = cursor + static_cast<std::size_t>(command_size);
+    return reader.read_cstring(start, end, out);
+}
+
+[[nodiscard]] bool linkedit_range_valid(
+    std::size_t image_size,
+    std::uint32_t offset,
+    std::uint32_t size) noexcept {
+    const std::uint64_t end = static_cast<std::uint64_t>(offset) + static_cast<std::uint64_t>(size);
+    return static_cast<std::uint64_t>(offset) <= image_size && end <= image_size;
+}
+
+[[nodiscard]] bool dylib_kind_for_command(std::uint32_t command, DylibLoadKind& kind) noexcept {
+    switch (command) {
+    case kLcLoadDylib:
+        kind = DylibLoadKind::normal;
+        return true;
+    case kLcLoadWeakDylib:
+        kind = DylibLoadKind::weak;
+        return true;
+    case kLcReexportDylib:
+        kind = DylibLoadKind::reexport;
+        return true;
+    case kLcLazyLoadDylib:
+        kind = DylibLoadKind::lazy;
+        return true;
+    case kLcLoadUpwardDylib:
+        kind = DylibLoadKind::upward;
+        return true;
+    default:
+        return false;
+    }
+}
+
 } // namespace
 
 ParseResult parse(std::span<const std::byte> bytes) {
@@ -83,6 +144,10 @@ ParseResult parse(std::span<const std::byte> bytes) {
     constexpr std::size_t kLoadCommandHeaderSize = 8;
     constexpr std::size_t kSegment64Size = 72;
     constexpr std::size_t kEntryPointSize = 24;
+    constexpr std::size_t kDylinkerCommandSize = 12;
+    constexpr std::size_t kDylibCommandSize = 24;
+    constexpr std::size_t kRpathCommandSize = 12;
+    constexpr std::size_t kLinkeditDataCommandSize = 16;
 
     const Reader reader(bytes);
     if (!reader.contains(0, kHeaderSize)) {
@@ -111,7 +176,7 @@ ParseResult parse(std::span<const std::byte> bytes) {
         return fail(ErrorCode::unsupported_cpu, "image is not ARM64");
     }
     if (file_type != kMhExecute) {
-        return fail(ErrorCode::unsupported_file_type, "only MH_EXECUTE images are supported in phase 0");
+        return fail(ErrorCode::unsupported_file_type, "only MH_EXECUTE images are supported");
     }
     if (!reader.contains(kHeaderSize, commands_size)) {
         return fail(ErrorCode::malformed_load_commands, "load-command region extends past end of file");
@@ -189,6 +254,79 @@ ParseResult parse(std::span<const std::byte> bytes) {
                 return fail(ErrorCode::malformed_load_commands, "LC_MAIN entry offset exceeds image size");
             }
             result.image.has_entry_point = true;
+        } else if (command == kLcLoadDylinker) {
+            if (command_size < kDylinkerCommandSize) {
+                return fail(ErrorCode::malformed_dynamic_linker, "LC_LOAD_DYLINKER is too small");
+            }
+            if (result.image.has_dynamic_linker) {
+                return fail(ErrorCode::duplicate_dynamic_linker, "multiple LC_LOAD_DYLINKER commands are not supported");
+            }
+            std::uint32_t path_offset = 0;
+            if (!reader.read_u32(cursor + 8, path_offset) ||
+                !command_string(reader, cursor, command_size, path_offset,
+                                static_cast<std::uint32_t>(kDylinkerCommandSize),
+                                result.image.dynamic_linker)) {
+                return fail(ErrorCode::malformed_dynamic_linker, "invalid LC_LOAD_DYLINKER path");
+            }
+            result.image.has_dynamic_linker = true;
+        } else if (command == kLcRpath) {
+            if (command_size < kRpathCommandSize) {
+                return fail(ErrorCode::malformed_runpath, "LC_RPATH is too small");
+            }
+            std::uint32_t path_offset = 0;
+            std::string path;
+            if (!reader.read_u32(cursor + 8, path_offset) ||
+                !command_string(reader, cursor, command_size, path_offset,
+                                static_cast<std::uint32_t>(kRpathCommandSize), path)) {
+                return fail(ErrorCode::malformed_runpath, "invalid LC_RPATH path");
+            }
+            result.image.runpaths.push_back(std::move(path));
+        } else if (command == kLcDyldExportsTrie || command == kLcDyldChainedFixups) {
+            if (command_size < kLinkeditDataCommandSize) {
+                return fail(ErrorCode::malformed_linkedit_data, "dyld linkedit command is too small");
+            }
+            std::uint32_t data_offset = 0;
+            std::uint32_t data_size = 0;
+            if (!reader.read_u32(cursor + 8, data_offset) || !reader.read_u32(cursor + 12, data_size) ||
+                !linkedit_range_valid(bytes.size(), data_offset, data_size)) {
+                return fail(ErrorCode::malformed_linkedit_data, "dyld linkedit range exceeds image size");
+            }
+
+            FileRange* destination = nullptr;
+            ErrorCode duplicate_error = ErrorCode::duplicate_exports_trie;
+            if (command == kLcDyldExportsTrie) {
+                destination = &result.image.exports_trie;
+                duplicate_error = ErrorCode::duplicate_exports_trie;
+            } else {
+                destination = &result.image.chained_fixups;
+                duplicate_error = ErrorCode::duplicate_chained_fixups;
+            }
+            if (destination->present) {
+                return fail(duplicate_error, "duplicate dyld linkedit command");
+            }
+            destination->offset = data_offset;
+            destination->size = data_size;
+            destination->present = true;
+        } else {
+            DylibLoadKind kind = DylibLoadKind::normal;
+            if (dylib_kind_for_command(command, kind)) {
+                if (command_size < kDylibCommandSize) {
+                    return fail(ErrorCode::malformed_dylib, "dylib load command is too small");
+                }
+
+                std::uint32_t path_offset = 0;
+                DylibDependency dependency;
+                dependency.kind = kind;
+                if (!reader.read_u32(cursor + 8, path_offset) ||
+                    !reader.read_u32(cursor + 12, dependency.timestamp) ||
+                    !reader.read_u32(cursor + 16, dependency.current_version) ||
+                    !reader.read_u32(cursor + 20, dependency.compatibility_version) ||
+                    !command_string(reader, cursor, command_size, path_offset,
+                                    static_cast<std::uint32_t>(kDylibCommandSize), dependency.path)) {
+                    return fail(ErrorCode::malformed_dylib, "invalid dylib load command");
+                }
+                result.image.dependencies.push_back(std::move(dependency));
+            }
         }
 
         cursor += command_size;
@@ -210,7 +348,25 @@ std::string_view error_name(ErrorCode error) noexcept {
     case ErrorCode::unsupported_file_type: return "unsupported_file_type";
     case ErrorCode::malformed_load_commands: return "malformed_load_commands";
     case ErrorCode::malformed_segment: return "malformed_segment";
+    case ErrorCode::malformed_dynamic_linker: return "malformed_dynamic_linker";
+    case ErrorCode::malformed_dylib: return "malformed_dylib";
+    case ErrorCode::malformed_runpath: return "malformed_runpath";
+    case ErrorCode::malformed_linkedit_data: return "malformed_linkedit_data";
     case ErrorCode::duplicate_entry_point: return "duplicate_entry_point";
+    case ErrorCode::duplicate_dynamic_linker: return "duplicate_dynamic_linker";
+    case ErrorCode::duplicate_exports_trie: return "duplicate_exports_trie";
+    case ErrorCode::duplicate_chained_fixups: return "duplicate_chained_fixups";
+    }
+    return "unknown";
+}
+
+std::string_view dylib_load_kind_name(DylibLoadKind kind) noexcept {
+    switch (kind) {
+    case DylibLoadKind::normal: return "normal";
+    case DylibLoadKind::weak: return "weak";
+    case DylibLoadKind::reexport: return "reexport";
+    case DylibLoadKind::lazy: return "lazy";
+    case DylibLoadKind::upward: return "upward";
     }
     return "unknown";
 }
