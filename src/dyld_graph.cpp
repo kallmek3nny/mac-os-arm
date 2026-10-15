@@ -33,6 +33,19 @@ public:
             return std::move(result_);
         }
 
+        macho::InitializerMetadata root_initializer_metadata;
+        if (!root_file_bytes_.empty()) {
+            macho::InitializerMetadataResult root_initializers =
+                macho::parse_initializer_metadata(root_file_bytes_);
+            if (!root_initializers) {
+                result_.error = DependencyGraphError::initializer_metadata_failure;
+                result_.failed_image_index = 0;
+                result_.initializer_error = root_initializers.error;
+                return std::move(result_);
+            }
+            root_initializer_metadata = std::move(root_initializers.metadata);
+        }
+
         ExportTrieResult root_exports = parse_image_exports(root_image_, root_file_bytes_);
         if (!root_exports) {
             result_.error = DependencyGraphError::exports_failure;
@@ -44,6 +57,7 @@ public:
         GraphImage root;
         root.path = std::string(root_path_);
         root.image = root_image_;
+        root.initializers = std::move(root_initializer_metadata);
         root.mapping = root_mapping_;
         root.exports = std::move(root_exports.symbols);
         root.owns_mapping = false;
@@ -186,6 +200,16 @@ private:
                 return fail(DependencyGraphError::parse_failure, image_index, dependency_index);
             }
 
+            macho::InitializerMetadataResult initializers =
+                macho::parse_initializer_metadata(candidate_bytes);
+            if (!initializers) {
+                result_.initializer_error = initializers.error;
+                return fail(
+                    DependencyGraphError::initializer_metadata_failure,
+                    image_index,
+                    dependency_index);
+            }
+
             ExportTrieResult exports = parse_image_exports(parsed.image, candidate_bytes);
             if (!exports) {
                 result_.exports_error = exports.error;
@@ -202,6 +226,7 @@ private:
             GraphImage child;
             child.path = resolved_path;
             child.image = std::move(parsed.image);
+            child.initializers = std::move(initializers.metadata);
             child.mapping = loaded.image;
             child.exports = std::move(exports.symbols);
             child.owns_mapping = true;
@@ -275,6 +300,7 @@ std::string_view dependency_graph_error_name(DependencyGraphError error) noexcep
     case DependencyGraphError::lookup_failure: return "lookup_failure";
     case DependencyGraphError::dependency_not_found: return "dependency_not_found";
     case DependencyGraphError::parse_failure: return "parse_failure";
+    case DependencyGraphError::initializer_metadata_failure: return "initializer_metadata_failure";
     case DependencyGraphError::exports_failure: return "exports_failure";
     case DependencyGraphError::load_failure: return "load_failure";
     }
