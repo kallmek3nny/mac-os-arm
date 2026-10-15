@@ -1,12 +1,14 @@
 #include "macosarm/dynarmic_backend.hpp"
 #include "macosarm/session.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -135,31 +137,66 @@ struct CaptureHost final : macosarm::DarwinHostServices {
 } // namespace
 
 int main() {
-    const auto file = executable_with_write_and_exit();
-    CaptureHost host;
-    macosarm::DynarmicBackend backend;
-    macosarm::SessionConfig config{};
-    config.instruction_budget = 64;
+    {
+        const auto file = executable_with_write_and_exit();
+        CaptureHost host;
+        macosarm::DynarmicBackend backend;
+        macosarm::SessionConfig config{};
+        config.instruction_budget = 64;
 
-    const auto result = macosarm::run_macho_session(file, backend, host, config);
-    expect(static_cast<bool>(result), "raw ARM64 Mach-O session initializes");
-    expect(result.process.reason == macosarm::ProcessStopReason::exited,
-           "raw ARM64 Mach-O executes through process exit");
-    expect(result.process.exit_status == 7, "raw Mach-O preserves exit status 7");
-    expect(result.process.instructions_executed == 9,
-           "raw Mach-O executes nine ARM64 instructions across two syscalls");
-    expect(result.image.entry_address == 0x100000200ULL,
-           "raw Mach-O LC_MAIN becomes the translated entry PC");
-    expect(result.final_state.pc == 0x100000224ULL,
-           "final PC is immediately after the exit SVC");
-    expect(result.final_state.x[16] == macosarm::kDarwinSysExit,
-           "final ARM64 syscall register contains exit");
+        const auto result = macosarm::run_macho_session(file, backend, host, config);
+        expect(static_cast<bool>(result), "raw ARM64 Mach-O session initializes");
+        expect(result.process.reason == macosarm::ProcessStopReason::exited,
+               "raw ARM64 Mach-O executes through process exit");
+        expect(result.process.exit_status == 7, "raw Mach-O preserves exit status 7");
+        expect(result.process.instructions_executed == 9,
+               "raw Mach-O executes nine ARM64 instructions across two syscalls");
+        expect(result.image.entry_address == 0x100000200ULL,
+               "raw Mach-O LC_MAIN becomes the translated entry PC");
+        expect(result.final_state.pc == 0x100000224ULL,
+               "final PC is immediately after the exit SVC");
+        expect(result.final_state.x[16] == macosarm::kDarwinSysExit,
+               "final ARM64 syscall register contains exit");
 
-    const std::vector<std::byte> expected{
-        std::byte{'h'}, std::byte{'e'}, std::byte{'l'}, std::byte{'l'}, std::byte{'o'}};
-    expect(host.fd == 1, "raw Mach-O writes to stdout fd 1");
-    expect(host.bytes == expected,
-           "raw Mach-O __DATA bytes survive parse/load/JIT and reach host write");
+        const std::vector<std::byte> expected{
+            std::byte{'h'}, std::byte{'e'}, std::byte{'l'}, std::byte{'l'}, std::byte{'o'}};
+        expect(host.fd == 1, "raw Mach-O writes to stdout fd 1");
+        expect(host.bytes == expected,
+               "raw Mach-O __DATA bytes survive parse/load/JIT and reach host write");
+    }
+
+    {
+        auto file = executable_with_write_and_exit();
+        constexpr std::size_t entry = 0x200;
+        put_u32(file, entry, 0xf94003e0U);     // ldr x0, [sp] -> argc
+        put_u32(file, entry + 4, 0xd2800030U); // mov x16, #1 (exit)
+        put_u32(file, entry + 8, 0xd4001001U); // svc #0x80
+
+        const std::array<std::string_view, 3> arguments{"demo", "one", "two"};
+        const std::array<std::string_view, 1> environment{"MODE=dynarmic"};
+        const std::array<std::string_view, 1> apple{"executable_path=demo"};
+        CaptureHost host;
+        macosarm::DynarmicBackend backend;
+        macosarm::SessionConfig config{};
+        config.instruction_budget = 16;
+        config.startup.arguments = std::span<const std::string_view>(arguments);
+        config.startup.environment = std::span<const std::string_view>(environment);
+        config.startup.apple = std::span<const std::string_view>(apple);
+
+        const auto result = macosarm::run_macho_session(file, backend, host, config);
+        expect(static_cast<bool>(result),
+               "real Dynarmic session accepts materialized Darwin startup stack");
+        expect(result.process.reason == macosarm::ProcessStopReason::exited &&
+                   result.process.exit_status == 3,
+               "real Dynarmic guest loads argc directly from initial sp");
+        expect(result.process.instructions_executed == 3,
+               "argc startup probe executes exactly three ARM64 instructions");
+        expect(result.startup.layout.argc == 3 &&
+                   result.final_state.sp == result.startup.layout.stack_pointer,
+               "real Dynarmic preserves materialized startup stack pointer");
+        expect(result.final_state.pc == 0x10000020cULL,
+               "argc startup probe stops immediately after exit SVC");
+    }
 
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
