@@ -2,6 +2,7 @@
 
 #include "macosarm/darwin_syscall.hpp"
 #include "macosarm/execution.hpp"
+#include "macosarm/mach_trap.hpp"
 
 #include <cstdint>
 #include <string_view>
@@ -15,6 +16,7 @@ enum class ProcessStopReason {
     memory_fault,
     backend_error,
     syscall_error,
+    mach_trap_error,
 };
 
 struct ProcessResult {
@@ -23,6 +25,7 @@ struct ProcessResult {
     std::int32_t exit_status{};
     VmError vm_error{VmError::none};
     SyscallDispatchError syscall_error{SyscallDispatchError::none};
+    MachTrapDispatchError mach_trap_error{MachTrapDispatchError::none};
 };
 
 [[nodiscard]] ProcessResult run_process(
