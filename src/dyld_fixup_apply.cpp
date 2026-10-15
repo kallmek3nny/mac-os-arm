@@ -7,14 +7,26 @@
 namespace macosarm::dyld {
 namespace {
 
-constexpr std::uint64_t kTarget36Mask = (std::uint64_t{1} << 36) - 1;
+constexpr std::uint64_t kGenericTarget36Mask = (std::uint64_t{1} << 36) - 1;
 constexpr std::uint64_t kHigh8Mask = 0xff;
-constexpr std::uint64_t kRebaseReservedMask = (std::uint64_t{1} << 7) - 1;
-constexpr std::uint64_t kBindOrdinalMask = (std::uint64_t{1} << 24) - 1;
-constexpr std::uint64_t kBindAddendMask = 0xff;
-constexpr std::uint64_t kBindReservedMask = (std::uint64_t{1} << 19) - 1;
-constexpr std::uint64_t kNextMask = (std::uint64_t{1} << 12) - 1;
-constexpr std::uint64_t kBindBit = std::uint64_t{1} << 63;
+constexpr std::uint64_t kGenericRebaseReservedMask = (std::uint64_t{1} << 7) - 1;
+constexpr std::uint64_t kGenericBindOrdinalMask = (std::uint64_t{1} << 24) - 1;
+constexpr std::uint64_t kGenericBindAddendMask = 0xff;
+constexpr std::uint64_t kGenericBindReservedMask = (std::uint64_t{1} << 19) - 1;
+constexpr std::uint64_t kGenericNextMask = (std::uint64_t{1} << 12) - 1;
+constexpr std::uint64_t kGenericBindBit = std::uint64_t{1} << 63;
+
+constexpr std::uint64_t kArm64eTarget43Mask = (std::uint64_t{1} << 43) - 1;
+constexpr std::uint64_t kArm64eBindOrdinal16Mask = (std::uint64_t{1} << 16) - 1;
+constexpr std::uint64_t kArm64eBindOrdinal24Mask = (std::uint64_t{1} << 24) - 1;
+constexpr std::uint64_t kArm64eBindZero16Mask = (std::uint64_t{1} << 16) - 1;
+constexpr std::uint64_t kArm64eBindZero8Mask = (std::uint64_t{1} << 8) - 1;
+constexpr std::uint64_t kArm64eAddend19Mask = (std::uint64_t{1} << 19) - 1;
+constexpr std::uint64_t kArm64eAddend19Sign = std::uint64_t{1} << 18;
+constexpr std::uint64_t kArm64eNextMask = (std::uint64_t{1} << 11) - 1;
+constexpr std::uint64_t kArm64eBindBit = std::uint64_t{1} << 62;
+constexpr std::uint64_t kArm64eAuthBit = std::uint64_t{1} << 63;
+
 constexpr std::int32_t kBindSpecialDylibSelf = 0;
 constexpr std::int32_t kBindSpecialDylibMainExecutable = -1;
 constexpr std::int32_t kBindSpecialDylibFlatLookup = -2;
@@ -50,6 +62,34 @@ constexpr std::int32_t kBindSpecialDylibWeakLookup = -3;
     return true;
 }
 
+[[nodiscard]] std::int64_t sign_extend_19(std::uint64_t value) noexcept {
+    value &= kArm64eAddend19Mask;
+    if ((value & kArm64eAddend19Sign) == 0) {
+        return static_cast<std::int64_t>(value);
+    }
+    return static_cast<std::int64_t>(value) - (std::int64_t{1} << 19);
+}
+
+[[nodiscard]] bool is_generic_format(ChainedPointerFormat format) noexcept {
+    return format == ChainedPointerFormat::generic64 ||
+           format == ChainedPointerFormat::generic64_offset;
+}
+
+[[nodiscard]] bool is_arm64e_format(ChainedPointerFormat format) noexcept {
+    return format == ChainedPointerFormat::arm64e ||
+           format == ChainedPointerFormat::arm64e_userland ||
+           format == ChainedPointerFormat::arm64e_userland24;
+}
+
+[[nodiscard]] bool arm64e_uses_image_offset(ChainedPointerFormat format) noexcept {
+    return format == ChainedPointerFormat::arm64e_userland ||
+           format == ChainedPointerFormat::arm64e_userland24;
+}
+
+[[nodiscard]] bool arm64e_uses_24bit_ordinal(ChainedPointerFormat format) noexcept {
+    return format == ChainedPointerFormat::arm64e_userland24;
+}
+
 [[nodiscard]] std::uint64_t decode_u64(const std::array<std::byte, 8>& bytes) noexcept {
     std::uint64_t value = 0;
     for (std::size_t index = 0; index < bytes.size(); ++index) {
@@ -78,6 +118,13 @@ struct ImportResolution {
     std::uint64_t address{};
     ChainedFixupsApplyError error{ChainedFixupsApplyError::none};
     SymbolResolutionError symbol_error{SymbolResolutionError::none};
+};
+
+struct DecodedPointer {
+    std::uint64_t replacement{};
+    std::uint64_t next{};
+    std::uint64_t stride{};
+    std::size_t import_index{ChainedFixupsApplyResult::kNoIndex};
 };
 
 class Applier {
@@ -163,8 +210,8 @@ private:
                 ChainedFixupsApplyError::invalid_page_size,
                 segment_index);
         }
-        if (starts.pointer_format != ChainedPointerFormat::generic64 &&
-            starts.pointer_format != ChainedPointerFormat::generic64_offset) {
+        if (!is_generic_format(starts.pointer_format) &&
+            !is_arm64e_format(starts.pointer_format)) {
             return fail(
                 ChainedFixupsApplyError::unsupported_pointer_format,
                 segment_index);
@@ -265,6 +312,223 @@ private:
         return result_;
     }
 
+    [[nodiscard]] ChainedFixupsApplyResult decode_generic_pointer(
+        std::size_t segment_index,
+        std::size_t page_index,
+        const ChainedSegmentStarts& starts,
+        std::uint64_t address,
+        std::uint64_t raw,
+        DecodedPointer& decoded) {
+        decoded.next = (raw >> 51) & kGenericNextMask;
+        decoded.stride = 4;
+        const bool is_bind = (raw & kGenericBindBit) != 0;
+
+        if (is_bind) {
+            const std::uint64_t reserved = (raw >> 32) & kGenericBindReservedMask;
+            if (reserved != 0) {
+                return fail(
+                    ChainedFixupsApplyError::pointer_reserved_bits,
+                    segment_index,
+                    page_index,
+                    decoded.import_index,
+                    address);
+            }
+
+            decoded.import_index =
+                static_cast<std::size_t>(raw & kGenericBindOrdinalMask);
+            if (decoded.import_index >= metadata_.imports.size()) {
+                return fail(
+                    ChainedFixupsApplyError::bind_ordinal_out_of_range,
+                    segment_index,
+                    page_index,
+                    decoded.import_index,
+                    address);
+            }
+
+            const ImportResolution resolution =
+                resolve_import(metadata_.imports[decoded.import_index]);
+            if (!resolution.success) {
+                return fail(
+                    resolution.error,
+                    segment_index,
+                    page_index,
+                    decoded.import_index,
+                    address,
+                    VmError::none,
+                    resolution.symbol_error);
+            }
+
+            if (resolution.weak_null) {
+                decoded.replacement = 0;
+                return result_;
+            }
+
+            if (!add_signed(
+                    resolution.address,
+                    metadata_.imports[decoded.import_index].addend,
+                    decoded.replacement)) {
+                return fail(
+                    ChainedFixupsApplyError::addend_overflow,
+                    segment_index,
+                    page_index,
+                    decoded.import_index,
+                    address);
+            }
+            const std::uint64_t pointer_addend =
+                (raw >> 24) & kGenericBindAddendMask;
+            if (add_overflows(decoded.replacement, pointer_addend)) {
+                return fail(
+                    ChainedFixupsApplyError::addend_overflow,
+                    segment_index,
+                    page_index,
+                    decoded.import_index,
+                    address);
+            }
+            decoded.replacement += pointer_addend;
+            return result_;
+        }
+
+        const std::uint64_t reserved = (raw >> 44) & kGenericRebaseReservedMask;
+        if (reserved != 0) {
+            return fail(
+                ChainedFixupsApplyError::pointer_reserved_bits,
+                segment_index,
+                page_index,
+                decoded.import_index,
+                address);
+        }
+
+        const std::uint64_t target = raw & kGenericTarget36Mask;
+        const std::uint64_t high8 = (raw >> 36) & kHigh8Mask;
+        const std::uint64_t unpacked_target = target | (high8 << 56);
+        if (starts.pointer_format == ChainedPointerFormat::generic64) {
+            decoded.replacement = unpacked_target;
+            return result_;
+        }
+
+        if (add_overflows(image_->mapping.preferred_load_address, unpacked_target)) {
+            return fail(
+                ChainedFixupsApplyError::addend_overflow,
+                segment_index,
+                page_index,
+                decoded.import_index,
+                address);
+        }
+        decoded.replacement = image_->mapping.preferred_load_address + unpacked_target;
+        return result_;
+    }
+
+    [[nodiscard]] ChainedFixupsApplyResult decode_arm64e_pointer(
+        std::size_t segment_index,
+        std::size_t page_index,
+        const ChainedSegmentStarts& starts,
+        std::uint64_t address,
+        std::uint64_t raw,
+        DecodedPointer& decoded) {
+        decoded.next = (raw >> 51) & kArm64eNextMask;
+        decoded.stride = 8;
+        const bool is_bind = (raw & kArm64eBindBit) != 0;
+        const bool is_auth = (raw & kArm64eAuthBit) != 0;
+
+        if (is_auth) {
+            return fail(
+                ChainedFixupsApplyError::authenticated_pointer_unsupported,
+                segment_index,
+                page_index,
+                decoded.import_index,
+                address);
+        }
+
+        if (is_bind) {
+            const bool ordinal24 = arm64e_uses_24bit_ordinal(starts.pointer_format);
+            const std::uint64_t zero = ordinal24
+                ? ((raw >> 24) & kArm64eBindZero8Mask)
+                : ((raw >> 16) & kArm64eBindZero16Mask);
+            if (zero != 0) {
+                return fail(
+                    ChainedFixupsApplyError::pointer_reserved_bits,
+                    segment_index,
+                    page_index,
+                    decoded.import_index,
+                    address);
+            }
+
+            const std::uint64_t ordinal_mask = ordinal24
+                ? kArm64eBindOrdinal24Mask
+                : kArm64eBindOrdinal16Mask;
+            decoded.import_index = static_cast<std::size_t>(raw & ordinal_mask);
+            if (decoded.import_index >= metadata_.imports.size()) {
+                return fail(
+                    ChainedFixupsApplyError::bind_ordinal_out_of_range,
+                    segment_index,
+                    page_index,
+                    decoded.import_index,
+                    address);
+            }
+
+            const ImportResolution resolution =
+                resolve_import(metadata_.imports[decoded.import_index]);
+            if (!resolution.success) {
+                return fail(
+                    resolution.error,
+                    segment_index,
+                    page_index,
+                    decoded.import_index,
+                    address,
+                    VmError::none,
+                    resolution.symbol_error);
+            }
+
+            if (resolution.weak_null) {
+                decoded.replacement = 0;
+                return result_;
+            }
+
+            if (!add_signed(
+                    resolution.address,
+                    metadata_.imports[decoded.import_index].addend,
+                    decoded.replacement)) {
+                return fail(
+                    ChainedFixupsApplyError::addend_overflow,
+                    segment_index,
+                    page_index,
+                    decoded.import_index,
+                    address);
+            }
+            const std::int64_t pointer_addend = sign_extend_19(raw >> 32);
+            std::uint64_t with_pointer_addend = 0;
+            if (!add_signed(decoded.replacement, pointer_addend, with_pointer_addend)) {
+                return fail(
+                    ChainedFixupsApplyError::addend_overflow,
+                    segment_index,
+                    page_index,
+                    decoded.import_index,
+                    address);
+            }
+            decoded.replacement = with_pointer_addend;
+            return result_;
+        }
+
+        const std::uint64_t target = raw & kArm64eTarget43Mask;
+        const std::uint64_t high8 = (raw >> 43) & kHigh8Mask;
+        const std::uint64_t unpacked_target = target | (high8 << 56);
+        if (!arm64e_uses_image_offset(starts.pointer_format)) {
+            decoded.replacement = unpacked_target;
+            return result_;
+        }
+
+        if (add_overflows(image_->mapping.preferred_load_address, unpacked_target)) {
+            return fail(
+                ChainedFixupsApplyError::addend_overflow,
+                segment_index,
+                page_index,
+                decoded.import_index,
+                address);
+        }
+        decoded.replacement = image_->mapping.preferred_load_address + unpacked_target;
+        return result_;
+    }
+
     [[nodiscard]] ChainedFixupsApplyResult apply_chain(
         std::size_t segment_index,
         std::size_t page_index,
@@ -298,119 +562,48 @@ private:
             }
 
             const std::uint64_t raw = decode_u64(bytes);
-            const std::uint64_t next = (raw >> 51) & kNextMask;
-            const bool is_bind = (raw & kBindBit) != 0;
-
-            std::uint64_t replacement = 0;
-            std::size_t import_index = ChainedFixupsApplyResult::kNoIndex;
-            if (is_bind) {
-                const std::uint64_t reserved = (raw >> 32) & kBindReservedMask;
-                if (reserved != 0) {
-                    return fail(
-                        ChainedFixupsApplyError::pointer_reserved_bits,
-                        segment_index,
-                        page_index,
-                        import_index,
-                        address);
-                }
-
-                import_index = static_cast<std::size_t>(raw & kBindOrdinalMask);
-                if (import_index >= metadata_.imports.size()) {
-                    return fail(
-                        ChainedFixupsApplyError::bind_ordinal_out_of_range,
-                        segment_index,
-                        page_index,
-                        import_index,
-                        address);
-                }
-
-                const ImportResolution resolution = resolve_import(metadata_.imports[import_index]);
-                if (!resolution.success) {
-                    return fail(
-                        resolution.error,
-                        segment_index,
-                        page_index,
-                        import_index,
-                        address,
-                        VmError::none,
-                        resolution.symbol_error);
-                }
-
-                if (resolution.weak_null) {
-                    replacement = 0;
-                } else {
-                    if (!add_signed(
-                            resolution.address,
-                            metadata_.imports[import_index].addend,
-                            replacement)) {
-                        return fail(
-                            ChainedFixupsApplyError::addend_overflow,
-                            segment_index,
-                            page_index,
-                            import_index,
-                            address);
-                    }
-                    const std::uint64_t pointer_addend = (raw >> 24) & kBindAddendMask;
-                    if (add_overflows(replacement, pointer_addend)) {
-                        return fail(
-                            ChainedFixupsApplyError::addend_overflow,
-                            segment_index,
-                            page_index,
-                            import_index,
-                            address);
-                    }
-                    replacement += pointer_addend;
-                }
-            } else {
-                const std::uint64_t reserved = (raw >> 44) & kRebaseReservedMask;
-                if (reserved != 0) {
-                    return fail(
-                        ChainedFixupsApplyError::pointer_reserved_bits,
-                        segment_index,
-                        page_index,
-                        import_index,
-                        address);
-                }
-
-                const std::uint64_t target = raw & kTarget36Mask;
-                const std::uint64_t high8 = (raw >> 36) & kHigh8Mask;
-                const std::uint64_t unpacked_target = target | (high8 << 56);
-                if (starts.pointer_format == ChainedPointerFormat::generic64) {
-                    replacement = unpacked_target;
-                } else {
-                    if (add_overflows(image_->mapping.preferred_load_address, unpacked_target)) {
-                        return fail(
-                            ChainedFixupsApplyError::addend_overflow,
-                            segment_index,
-                            page_index,
-                            import_index,
-                            address);
-                    }
-                    replacement = image_->mapping.preferred_load_address + unpacked_target;
-                }
+            DecodedPointer decoded;
+            const ChainedFixupsApplyResult decoded_result =
+                is_generic_format(starts.pointer_format)
+                    ? decode_generic_pointer(
+                          segment_index, page_index, starts, address, raw, decoded)
+                    : decode_arm64e_pointer(
+                          segment_index, page_index, starts, address, raw, decoded);
+            if (!decoded_result) {
+                return decoded_result;
             }
 
             std::uint64_t next_address = 0;
-            if (next != 0) {
-                const std::uint64_t delta = next * 4;
+            if (decoded.next != 0) {
+                if (multiply_overflows(decoded.next, decoded.stride)) {
+                    return fail(
+                        ChainedFixupsApplyError::page_address_overflow,
+                        segment_index,
+                        page_index,
+                        decoded.import_index,
+                        address);
+                }
+                const std::uint64_t delta = decoded.next * decoded.stride;
                 const std::uint64_t offset_in_page = address - page_address;
-                if (delta > page_size - offset_in_page ||
+                if (offset_in_page > page_size ||
+                    delta > page_size - offset_in_page ||
                     page_size - offset_in_page - delta < 8) {
                     return fail(
                         ChainedFixupsApplyError::chain_next_out_of_page,
                         segment_index,
                         page_index,
-                        import_index,
+                        decoded.import_index,
                         address);
                 }
                 const std::uint64_t offset_in_segment = address - segment.vm_address;
-                if (delta > segment.vm_size - offset_in_segment ||
+                if (offset_in_segment > segment.vm_size ||
+                    delta > segment.vm_size - offset_in_segment ||
                     segment.vm_size - offset_in_segment - delta < 8) {
                     return fail(
                         ChainedFixupsApplyError::chain_next_out_of_segment,
                         segment_index,
                         page_index,
-                        import_index,
+                        decoded.import_index,
                         address);
                 }
                 if (add_overflows(address, delta)) {
@@ -418,27 +611,27 @@ private:
                         ChainedFixupsApplyError::page_address_overflow,
                         segment_index,
                         page_index,
-                        import_index,
+                        decoded.import_index,
                         address);
                 }
                 next_address = address + delta;
             }
 
-            const auto replacement_bytes = encode_u64(replacement);
+            const auto replacement_bytes = encode_u64(decoded.replacement);
             const VmResult written = address_space_.write(address, replacement_bytes);
             if (!written) {
                 return fail(
                     ChainedFixupsApplyError::write_failure,
                     segment_index,
                     page_index,
-                    import_index,
+                    decoded.import_index,
                     address,
                     written.error);
             }
             patches_.push_back(Patch{address, raw});
             ++result_.fixups_processed;
 
-            if (next == 0) {
+            if (decoded.next == 0) {
                 break;
             }
             address = next_address;
@@ -580,6 +773,8 @@ std::string_view chained_fixups_apply_error_name(ChainedFixupsApplyError error) 
         return "metadata_segment_count_exceeds_image";
     case ChainedFixupsApplyError::invalid_page_size: return "invalid_page_size";
     case ChainedFixupsApplyError::unsupported_pointer_format: return "unsupported_pointer_format";
+    case ChainedFixupsApplyError::authenticated_pointer_unsupported:
+        return "authenticated_pointer_unsupported";
     case ChainedFixupsApplyError::segment_offset_overflow: return "segment_offset_overflow";
     case ChainedFixupsApplyError::segment_offset_mismatch: return "segment_offset_mismatch";
     case ChainedFixupsApplyError::page_count_exceeds_segment: return "page_count_exceeds_segment";

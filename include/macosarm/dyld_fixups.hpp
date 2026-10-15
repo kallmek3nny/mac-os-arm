@@ -123,6 +123,7 @@ enum class ChainedFixupsApplyError {
     metadata_segment_count_exceeds_image,
     invalid_page_size,
     unsupported_pointer_format,
+    authenticated_pointer_unsupported,
     segment_offset_overflow,
     segment_offset_mismatch,
     page_count_exceeds_segment,
@@ -177,10 +178,12 @@ struct ChainedFixupsApplyResult {
     const macho::Image& image,
     std::span<const std::byte> file_bytes);
 
-// Apply the generic 64-bit chained pointer formats transactionally. ARM64e/PAC
-// formats are deliberately rejected until their authentication policy exists.
-// All writes must land in the selected image's Mach-O segments and also pass
-// GuestAddressSpace write-protection checks. Any failure rolls back prior writes.
+// Apply supported 64-bit chained pointer formats transactionally. Generic64,
+// generic64-offset, and unauthenticated ARM64e/userland/userland24 entries are
+// decoded exactly. Authenticated ARM64e entries are deliberately rejected until
+// translated ARM64e execution has a real PAC policy. All writes must land in the
+// selected image's Mach-O segments and pass GuestAddressSpace protection checks.
+// Any failure rolls back prior writes.
 [[nodiscard]] ChainedFixupsApplyResult apply_chained_fixups(
     const LoadedImageGraph& graph,
     std::size_t image_index,
