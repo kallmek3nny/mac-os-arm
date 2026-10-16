@@ -1,5 +1,7 @@
 #include "macosarm/session.hpp"
 
+#include "macosarm/darwin_commpage.hpp"
+
 namespace macosarm {
 
 SessionResult run_macho_session(
@@ -26,6 +28,13 @@ SessionResult run_macho_session(
         return result;
     }
     result.image = loaded.image;
+
+    const DarwinCommpageResult commpage = materialize_darwin_commpage(address_space);
+    if (!commpage) {
+        result.error = SessionError::commpage_failure;
+        result.vm_error = commpage.vm_error;
+        return result;
+    }
 
     const VmResult stack = address_space.map(
         config.stack_base,
@@ -124,6 +133,7 @@ std::string_view session_error_name(SessionError error) noexcept {
     case SessionError::none: return "none";
     case SessionError::parse_failure: return "parse_failure";
     case SessionError::load_failure: return "load_failure";
+    case SessionError::commpage_failure: return "commpage_failure";
     case SessionError::stack_failure: return "stack_failure";
     case SessionError::startup_failure: return "startup_failure";
     case SessionError::cpu_init_failure: return "cpu_init_failure";
