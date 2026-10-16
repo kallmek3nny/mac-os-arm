@@ -89,6 +89,7 @@ constexpr std::uint64_t kRootBase = 0x100000000ULL;
 constexpr std::uint64_t kRootEntry = kRootBase + 0x200ULL;
 constexpr std::uint64_t kDependencyBase = 0x790000000ULL;
 constexpr std::uint64_t kDependencyInitializer = kDependencyBase + 0x200ULL;
+constexpr std::uint64_t kExpectedMainThreadTsdOffset = 80ULL;
 constexpr std::string_view kExecutablePath =
     "/Applications/ProgramVarsProbe.app/Contents/MacOS/ProgramVarsProbe";
 constexpr std::string_view kDependencyPath = "/usr/lib/libSystem.B.dylib";
@@ -120,9 +121,16 @@ std::vector<std::byte> executable_with_program_vars_probe() {
     put_u32(bytes, 20U, static_cast<std::uint32_t>(command - 32U));
 
     std::size_t code = 0x200U;
-    const std::array<std::uint32_t, 4> instructions{
-        0xd10043eaU, // sub x10, sp, #16
-        0xf9400140U, // ldr x0, [x10] -> initializer-observed argc
+    const std::array<std::uint32_t, 11> instructions{
+        0xd53bd069U, // mrs x9, TPIDRRO_EL0
+        0xb40000e9U, // cbz x9, failure
+        0xf940012aU, // ldr x10, [x9] -> pthread-self TSD slot
+        0xb40000aaU, // cbz x10, failure
+        0xd10043ebU, // sub x11, sp, #16
+        0xf9400160U, // ldr x0, [x11] -> initializer-observed argc
+        0xd2800030U, // mov x16, #1 (exit)
+        0xd4001001U, // svc #0x80
+        0xd2800c60U, // failure: mov x0, #99
         0xd2800030U, // mov x16, #1 (exit)
         0xd4001001U, // svc #0x80
     };
@@ -166,20 +174,24 @@ std::vector<std::byte> dependency_with_libsystem_startup_probe() {
     put_u32(bytes, 20U, static_cast<std::uint32_t>(command - 32U));
 
     std::size_t code = 0x200U;
-    const std::array<std::uint32_t, 17> instructions{
+    const std::array<std::uint32_t, 21> instructions{
         0xf9400489U, // ldr x9, [x4, #8] -> ProgramVars.NXArgcPtr
         0xb940012aU, // ldr w10, [x9] -> argc
         0xf940046cU, // ldr x12, [x3, #8] -> generated main_stack apple entry
         0x52800000U, // mov w0, #0 (failure value)
         0x3940018dU, // ldrb w13, [x12]
         0x7101b5bfU, // cmp w13, #'m'
-        0x54000101U, // b.ne failure
+        0x54000181U, // b.ne failure
         0x39402d8dU, // ldrb w13, [x12, #11]
         0x7100c1bfU, // cmp w13, #'0'
-        0x540000a1U, // b.ne failure
+        0x54000121U, // b.ne failure
         0x3940318dU, // ldrb w13, [x12, #12]
         0x7101e1bfU, // cmp w13, #'x'
-        0x54000041U, // b.ne failure
+        0x540000c1U, // b.ne failure
+        0xd53bd06eU, // mrs x14, TPIDRRO_EL0
+        0xb400008eU, // cbz x14, failure
+        0xf94001cfU, // ldr x15, [x14] -> pthread-self TSD slot
+        0xb400004fU, // cbz x15, failure
         0xaa0a03e0U, // mov x0, x10
         0xd10043ebU, // failure: sub x11, sp, #16
         0xf9000160U, // str x0, [x11]
@@ -242,21 +254,24 @@ int main() {
            "real Dynarmic session materializes libSystem startup state");
     expect(result.program_vars_address == config.stack_base,
            "session exposes the generated ProgramVars record at deterministic guest memory");
-    expect(result.bootstrap.initialization.execution.instructions_executed == 17U,
-           "translated initializer consumes ProgramVars and the generated main_stack apple entry");
+    expect(result.bootstrap.initialization.execution.instructions_executed == 21U,
+           "translated initializer consumes ProgramVars, main_stack, and main-thread TPIDRRO state");
+    expect(result.final_state.tpidrro_el0 ==
+               config.stack_base + kExpectedMainThreadTsdOffset,
+           "main-thread TPIDRRO state survives initializer-to-main CPU restoration");
     expect(result.process.reason == macosarm::ProcessStopReason::exited &&
                result.process.exit_status == 2,
-           "translated main observes argc only after main_stack has the kernel-style hex shape");
-    expect(result.process.instructions_executed == 4U,
-           "libSystem startup proof executes the four-instruction main path");
-    expect(result.final_state.pc == kRootEntry + 16U,
-           "libSystem startup proof stops immediately after the exit SVC");
+           "translated main reads non-null pthread-self through TPIDRRO before observing argc");
+    expect(result.process.instructions_executed == 8U,
+           "libSystem startup proof executes the successful TPIDRRO-aware main path");
+    expect(result.final_state.pc == kRootEntry + 32U,
+           "libSystem startup proof stops immediately after the successful exit SVC");
 
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return EXIT_FAILURE;
     }
 
-    std::cout << "libSystem ProgramVars/main_stack Dynarmic bootstrap passed\n";
+    std::cout << "libSystem ProgramVars/main_stack/TPIDRRO Dynarmic bootstrap passed\n";
     return EXIT_SUCCESS;
 }

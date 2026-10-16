@@ -88,6 +88,7 @@ struct DynarmicBackend::Impl final : Dynarmic::A64::UserCallbacks {
         config.enable_cycle_counting = false;
         config.check_halt_on_memory_access = true;
         config.code_cache_size = 16 * 1024 * 1024;
+        config.tpidrro_el0 = &tpidrro_el0;
         jit = std::make_unique<Dynarmic::A64::Jit>(config);
     }
 
@@ -372,6 +373,7 @@ private:
     }
 
     void copy_state_to_jit(const CpuState& state) {
+        tpidrro_el0 = state.tpidrro_el0;
         jit->SetRegisters(state.x);
         jit->SetSP(state.sp);
         jit->SetPC(state.pc);
@@ -390,6 +392,7 @@ private:
         state.x = jit->GetRegisters();
         state.sp = jit->GetSP();
         state.pc = jit->GetPC();
+        state.tpidrro_el0 = tpidrro_el0;
         state.pstate = jit->GetPstate();
         state.fpcr = jit->GetFpcr();
         state.fpsr = jit->GetFpsr();
@@ -403,6 +406,7 @@ private:
     GuestAddressSpace* address_space{};
     std::optional<ExecutionResult> pending_result;
     std::optional<PointerAuthenticator> pointer_auth;
+    std::uint64_t tpidrro_el0{};
     std::unique_ptr<Dynarmic::A64::Jit> jit;
 };
 
