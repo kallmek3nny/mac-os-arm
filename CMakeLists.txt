@@ -250,3 +250,25 @@ if(BUILD_TESTING)
         add_test(NAME dynarmic-mach-msg-transport COMMAND test_mach_msg_dynarmic)
     endif()
 endif()
+
+if(BUILD_TESTING)
+    add_executable(test_darwin_commpage tests/test_darwin_commpage.cpp)
+    target_link_libraries(test_darwin_commpage PRIVATE macosarm_macho)
+    target_compile_options(test_darwin_commpage PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>
+        $<$<CXX_COMPILER_ID:MSVC>:/W4;/WX>
+    )
+    add_test(NAME darwin-commpage-bootstrap COMMAND test_darwin_commpage)
+
+    if(MACOSARM_ENABLE_DYNARMIC)
+        add_executable(test_commpage_dynarmic tests/test_commpage_dynarmic.cpp)
+        target_link_libraries(test_commpage_dynarmic PRIVATE macosarm_dynarmic)
+        target_compile_options(test_commpage_dynarmic PRIVATE
+            $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>
+            $<$<CXX_COMPILER_ID:MSVC>:/W4;/WX>
+        )
+        add_test(
+            NAME raw-macho-dynarmic-session-commpage
+            COMMAND test_commpage_dynarmic)
+    endif()
+endif()
