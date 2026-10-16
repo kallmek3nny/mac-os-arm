@@ -40,6 +40,7 @@ enum class SessionError {
     commpage_failure,
     stack_failure,
     startup_failure,
+    program_vars_failure,
     cpu_init_failure,
     bootstrap_config_failure,
     bootstrap_failure,
@@ -52,6 +53,7 @@ struct SessionResult {
     VmError vm_error{VmError::none};
     CpuInitError cpu_error{CpuInitError::none};
     ProcessStartupResult startup{};
+    std::uint64_t program_vars_address{};
     LoadedImage image{};
     dyld::ImageGraphBootstrapResult bootstrap{};
     CpuState final_state{};

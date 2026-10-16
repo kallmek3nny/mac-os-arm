@@ -241,6 +241,16 @@ if(BUILD_TESTING)
         )
         add_test(NAME raw-macho-dynarmic-session COMMAND test_session_dynarmic)
 
+        add_executable(test_program_vars_dynarmic tests/test_program_vars_dynarmic.cpp)
+        target_link_libraries(test_program_vars_dynarmic PRIVATE macosarm_dynarmic)
+        target_compile_options(test_program_vars_dynarmic PRIVATE
+            $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>
+            $<$<CXX_COMPILER_ID:MSVC>:/W4;/WX>
+        )
+        add_test(
+            NAME raw-macho-dynarmic-session-program-vars
+            COMMAND test_program_vars_dynarmic)
+
         add_executable(test_mach_msg_dynarmic tests/test_mach_msg_dynarmic.cpp)
         target_link_libraries(test_mach_msg_dynarmic PRIVATE macosarm_dynarmic)
         target_compile_options(test_mach_msg_dynarmic PRIVATE
