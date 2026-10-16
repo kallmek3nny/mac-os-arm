@@ -25,7 +25,9 @@ constexpr std::size_t kProgramVarsEnvpOffset = 56U;
 constexpr std::size_t kProgramVarsPrognameOffset = 64U;
 constexpr std::size_t kProgramVarsStorageBytes = 80U;
 constexpr std::size_t kArm64PthreadTsdOffset = 224U;
+constexpr std::size_t kArm64PthreadErrnoOffset = 172U;
 constexpr std::size_t kMainThreadTsdSlots = 10U;
+constexpr std::size_t kMainThreadTsdErrnoSlot = 1U;
 constexpr std::size_t kMainThreadTsdBytes = kMainThreadTsdSlots * sizeof(std::uint64_t);
 constexpr std::size_t kMainThreadBootstrapBytes =
     kArm64PthreadTsdOffset + kMainThreadTsdBytes;
@@ -58,6 +60,16 @@ void encode_u32(
 
 void encode_u64(
     std::array<std::byte, kProgramVarsStorageBytes>& bytes,
+    std::size_t offset,
+    std::uint64_t value) {
+    for (std::size_t index = 0; index < sizeof(value); ++index) {
+        bytes.at(offset + index) =
+            static_cast<std::byte>((value >> (index * 8U)) & 0xffU);
+    }
+}
+
+void encode_main_thread_u64(
+    std::array<std::byte, kMainThreadBootstrapBytes>& bytes,
     std::size_t offset,
     std::uint64_t value) {
     for (std::size_t index = 0; index < sizeof(value); ++index) {
@@ -214,6 +226,8 @@ void encode_u64(
         static_cast<std::uint64_t>(kMainThreadBootstrapBytes);
     constexpr std::uint64_t kTsdOffset =
         static_cast<std::uint64_t>(kArm64PthreadTsdOffset);
+    constexpr std::uint64_t kErrnoOffset =
+        static_cast<std::uint64_t>(kArm64PthreadErrnoOffset);
 
     if (stack_base > std::numeric_limits<std::uint64_t>::max() - kProgramVarsBytes) {
         result.startup_error = ProcessStartupError::address_overflow;
@@ -231,11 +245,13 @@ void encode_u64(
     }
 
     const std::uint64_t tsd_base = self_address + kTsdOffset;
+    const std::uint64_t errno_address = self_address + kErrnoOffset;
     std::array<std::byte, kMainThreadBootstrapBytes> bytes{};
-    for (std::size_t index = 0; index < sizeof(self_address); ++index) {
-        bytes[kArm64PthreadTsdOffset + index] =
-            static_cast<std::byte>((self_address >> (index * 8U)) & 0xffU);
-    }
+    encode_main_thread_u64(bytes, kArm64PthreadTsdOffset, self_address);
+    encode_main_thread_u64(
+        bytes,
+        kArm64PthreadTsdOffset + kMainThreadTsdErrnoSlot * sizeof(std::uint64_t),
+        errno_address);
 
     const VmResult written = address_space.write(self_address, bytes);
     if (!written) {
@@ -384,10 +400,11 @@ SessionResult run_macho_session(
             result.program_vars_address = bootstrap_config.program_vars;
         }
 
-        // On arm64, libpthread derives pthread_self by subtracting the stable
-        // LP64 pthread TSD offset (224 bytes) from TPIDRRO_EL0. Materialize
-        // only the prefix needed for that contract plus direct TSD slots. Slot
-        // zero also points back to the pthread base, matching direct TSD users.
+        // Apple open-source early pthread bootstrap requires both pthread-self
+        // and errno to be available through direct TSD before __pthread_init
+        // finishes. Slot zero points back to the pthread base, while slot one
+        // points at the source-grounded pthread_s::err_no cell. This remains
+        // only the minimal early bootstrap contract, not a complete pthread_s.
         const MainThreadBootstrapMaterializationResult main_thread =
             materialize_main_thread_bootstrap(
                 address_space,
