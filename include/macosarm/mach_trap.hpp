@@ -30,6 +30,8 @@ constexpr std::uint32_t kMachKernNoSpace = 3;
 constexpr std::uint32_t kMachKernInvalidArgument = 4;
 
 constexpr std::uint64_t kMachVmFlagsAnywhere = 0x1;
+constexpr std::uint64_t kMachVmFlagsAliasMask = 0xff000000ULL;
+constexpr std::uint64_t kMachVmTagOsAllocOnce = 73ULL << 24U;
 constexpr std::uint32_t kMachVmProtRead = 0x1;
 constexpr std::uint32_t kMachVmProtWrite = 0x2;
 constexpr std::uint32_t kMachVmProtExecute = 0x4;
