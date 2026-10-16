@@ -133,7 +133,7 @@ std::vector<std::byte> executable_with_program_vars_probe() {
     return bytes;
 }
 
-std::vector<std::byte> dependency_with_program_vars_initializer() {
+std::vector<std::byte> dependency_with_libsystem_startup_probe() {
     std::vector<std::byte> bytes(0x4000, std::byte{0});
     put_u32(bytes, 0U, macosarm::macho::kMhMagic64);
     put_u32(bytes, 4U, static_cast<std::uint32_t>(macosarm::macho::kCpuTypeArm64));
@@ -166,11 +166,23 @@ std::vector<std::byte> dependency_with_program_vars_initializer() {
     put_u32(bytes, 20U, static_cast<std::uint32_t>(command - 32U));
 
     std::size_t code = 0x200U;
-    const std::array<std::uint32_t, 5> instructions{
+    const std::array<std::uint32_t, 17> instructions{
         0xf9400489U, // ldr x9, [x4, #8] -> ProgramVars.NXArgcPtr
         0xb940012aU, // ldr w10, [x9] -> argc
-        0xd10043ebU, // sub x11, sp, #16
-        0xf900016aU, // str x10, [x11]
+        0xf940046cU, // ldr x12, [x3, #8] -> generated main_stack apple entry
+        0x52800000U, // mov w0, #0 (failure value)
+        0x3940018dU, // ldrb w13, [x12]
+        0x7101b5bfU, // cmp w13, #'m'
+        0x54000101U, // b.ne failure
+        0x39402d8dU, // ldrb w13, [x12, #11]
+        0x7100c1bfU, // cmp w13, #'0'
+        0x540000a1U, // b.ne failure
+        0x3940318dU, // ldrb w13, [x12, #12]
+        0x7101e1bfU, // cmp w13, #'x'
+        0x54000041U, // b.ne failure
+        0xaa0a03e0U, // mov x0, x10
+        0xd10043ebU, // failure: sub x11, sp, #16
+        0xf9000160U, // str x0, [x11]
         0xd65f03c0U, // ret to initializer sentinel
     };
     for (const std::uint32_t instruction : instructions) {
@@ -192,7 +204,7 @@ struct NullHost final : macosarm::DarwinHostServices {
 
 int main() {
     const auto root = executable_with_program_vars_probe();
-    const auto dependency = dependency_with_program_vars_initializer();
+    const auto dependency = dependency_with_libsystem_startup_probe();
 
     const std::array<std::string_view, 2> arguments{
         kExecutablePath,
@@ -222,29 +234,29 @@ int main() {
             macosarm::dyld::ImageLookupStatus::not_found,
             {}};
     };
-    config.dyld->bootstrap.execution.instructions_per_initializer = 16U;
-    config.dyld->bootstrap.execution.total_instruction_budget = 16U;
+    config.dyld->bootstrap.execution.instructions_per_initializer = 32U;
+    config.dyld->bootstrap.execution.total_instruction_budget = 32U;
 
     const auto result = macosarm::run_macho_session(root, backend, host, config);
     expect(static_cast<bool>(result),
-           "real Dynarmic session materializes the libSystem ProgramVars startup contract");
+           "real Dynarmic session materializes libSystem startup state");
     expect(result.program_vars_address == config.stack_base,
            "session exposes the generated ProgramVars record at deterministic guest memory");
-    expect(result.bootstrap.initialization.execution.instructions_executed == 5U,
-           "translated initializer dereferences ProgramVars and returns through the sentinel");
+    expect(result.bootstrap.initialization.execution.instructions_executed == 17U,
+           "translated initializer consumes ProgramVars and the generated main_stack apple entry");
     expect(result.process.reason == macosarm::ProcessStopReason::exited &&
                result.process.exit_status == 2,
-           "translated main observes argc loaded through ProgramVars.NXArgcPtr");
+           "translated main observes argc only after main_stack has the kernel-style hex shape");
     expect(result.process.instructions_executed == 4U,
-           "ProgramVars proof executes the four-instruction main path");
+           "libSystem startup proof executes the four-instruction main path");
     expect(result.final_state.pc == kRootEntry + 16U,
-           "ProgramVars proof stops immediately after the exit SVC");
+           "libSystem startup proof stops immediately after the exit SVC");
 
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return EXIT_FAILURE;
     }
 
-    std::cout << "libSystem ProgramVars Dynarmic bootstrap passed\n";
+    std::cout << "libSystem ProgramVars/main_stack Dynarmic bootstrap passed\n";
     return EXIT_SUCCESS;
 }
