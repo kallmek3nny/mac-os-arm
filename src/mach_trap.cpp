@@ -253,6 +253,25 @@ void write_u32_le(
     return guest_mach_return(state, trap_number, kMachKernSuccess);
 }
 
+[[nodiscard]] MachTrapDispatchResult dispatch_port_deallocate(
+    CpuState& state,
+    MachContext& context,
+    std::int64_t trap_number) noexcept {
+
+    if (!valid_task_target(state, context)) {
+        return guest_mach_return(state, trap_number, kMachSendInvalidDest);
+    }
+    if (state.x[1] > std::numeric_limits<std::uint32_t>::max()) {
+        return guest_mach_return(state, trap_number, kMachKernInvalidName);
+    }
+
+    const std::uint32_t name = static_cast<std::uint32_t>(state.x[1]);
+    if (name != context.host_self_port() || !context.release_host_self_send_right()) {
+        return guest_mach_return(state, trap_number, kMachKernInvalidName);
+    }
+    return guest_mach_return(state, trap_number, kMachKernSuccess);
+}
+
 void normalize_simple_message_for_receive(std::vector<std::byte>& message) noexcept {
     std::span<std::byte> bytes{message};
     const std::uint32_t sender_bits = read_u32_le(bytes, 0);
@@ -390,6 +409,9 @@ constexpr std::array<std::uint32_t, kHostPriorityInfoCount> kHostPriorityInfoVal
 
         const std::uint32_t destination_port = read_u32_le(const_message, 8);
         if (destination_port == context.host_self_port()) {
+            if (!context.has_host_self_send_right()) {
+                return guest_mach_return(state, trap_number, kMachSendInvalidDest);
+            }
             const std::uint32_t host_result =
                 dispatch_host_priority_info_request(message, context);
             if (host_result != kMachMsgSuccess) {
@@ -437,6 +459,22 @@ constexpr std::array<std::uint32_t, kHostPriorityInfoCount> kHostPriorityInfoVal
 }
 
 } // namespace
+
+bool MachContext::acquire_host_self_send_right() noexcept {
+    if (host_self_send_refs_ == std::numeric_limits<std::uint32_t>::max()) {
+        return false;
+    }
+    ++host_self_send_refs_;
+    return true;
+}
+
+bool MachContext::release_host_self_send_right() noexcept {
+    if (host_self_send_refs_ == 0) {
+        return false;
+    }
+    --host_self_send_refs_;
+    return true;
+}
 
 std::optional<std::uint32_t> MachContext::allocate_reply_port() {
     if (receive_queues_.size() >= kMaxReplyPorts ||
@@ -515,6 +553,8 @@ MachTrapDispatchResult dispatch_mach_trap(
         return dispatch_vm_deallocate(state, address_space, context, trap_number);
     case kMachTrapVmProtect:
         return dispatch_vm_protect(state, address_space, context, trap_number);
+    case kMachTrapPortDeallocate:
+        return dispatch_port_deallocate(state, context, trap_number);
     case kMachTrapReplyPort: {
         const auto allocated = context.allocate_reply_port();
         if (!allocated.has_value()) {
@@ -530,6 +570,10 @@ MachTrapDispatchResult dispatch_mach_trap(
         state.x[0] = context.task_self_port();
         return {MachTrapDispatchError::none, trap_number, context.task_self_port()};
     case kMachTrapHostSelf:
+        if (!context.acquire_host_self_send_right()) {
+            state.x[0] = 0;
+            return {MachTrapDispatchError::none, trap_number, 0};
+        }
         state.x[0] = context.host_self_port();
         return {MachTrapDispatchError::none, trap_number, context.host_self_port()};
     case kMachTrapMessage:

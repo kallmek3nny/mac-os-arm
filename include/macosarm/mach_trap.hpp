@@ -17,6 +17,7 @@ constexpr std::int64_t kMachTrapVmAllocate = -10;
 constexpr std::int64_t kMachTrapVmDeallocate = -12;
 constexpr std::int64_t kMachTrapVmProtect = -14;
 constexpr std::int64_t kMachTrapVmMap = -15;
+constexpr std::int64_t kMachTrapPortDeallocate = -18;
 constexpr std::int64_t kMachTrapReplyPort = -26;
 constexpr std::int64_t kMachTrapThreadSelf = -27;
 constexpr std::int64_t kMachTrapTaskSelf = -28;
@@ -28,6 +29,7 @@ constexpr std::uint32_t kMachKernInvalidAddress = 1;
 constexpr std::uint32_t kMachKernProtectionFailure = 2;
 constexpr std::uint32_t kMachKernNoSpace = 3;
 constexpr std::uint32_t kMachKernInvalidArgument = 4;
+constexpr std::uint32_t kMachKernInvalidName = 15;
 
 constexpr std::uint64_t kMachVmFlagsAnywhere = 0x1;
 constexpr std::uint32_t kMachVmProtRead = 0x1;
@@ -77,6 +79,11 @@ public:
     [[nodiscard]] std::uint32_t task_self_port() const noexcept { return task_self_port_; }
     [[nodiscard]] std::uint32_t thread_self_port() const noexcept { return thread_self_port_; }
     [[nodiscard]] std::uint32_t host_self_port() const noexcept { return host_self_port_; }
+    [[nodiscard]] bool acquire_host_self_send_right() noexcept;
+    [[nodiscard]] bool has_host_self_send_right() const noexcept {
+        return host_self_send_refs_ != 0;
+    }
+    [[nodiscard]] bool release_host_self_send_right() noexcept;
     [[nodiscard]] std::optional<std::uint32_t> allocate_reply_port();
     [[nodiscard]] bool is_receive_port(std::uint32_t port) const noexcept;
     [[nodiscard]] bool enqueue_message(std::uint32_t port, std::vector<std::byte> message);
@@ -88,6 +95,7 @@ private:
     std::uint32_t task_self_port_{kDefaultTaskSelfPort};
     std::uint32_t thread_self_port_{kDefaultThreadSelfPort};
     std::uint32_t host_self_port_{kDefaultHostSelfPort};
+    std::uint32_t host_self_send_refs_{0};
     std::uint32_t next_reply_port_{kFirstReplyPort};
     std::unordered_map<std::uint32_t, std::deque<std::vector<std::byte>>> receive_queues_;
 };

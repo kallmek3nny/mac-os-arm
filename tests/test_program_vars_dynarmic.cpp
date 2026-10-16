@@ -208,37 +208,37 @@ std::vector<std::byte> dependency_with_libsystem_startup_probe() {
     put_u32(bytes, kHostInfoMessageFileOffset + 36U, 8U); // HOST_PRIORITY_INFO_COUNT
 
     std::size_t code = 0x200U;
-    const std::array<std::uint32_t, 61> instructions{
+    const std::array<std::uint32_t, 68> instructions{
         0xf9400489U, // ldr x9, [x4, #8] -> ProgramVars.NXArgcPtr
         0xb940012aU, // ldr w10, [x9] -> argc
         0xf940046cU, // ldr x12, [x3, #8] -> generated main_stack apple entry
         0x52800000U, // mov w0, #0 (failure value)
         0x3940018dU, // ldrb w13, [x12]
         0x7101b5bfU, // cmp w13, #'m'
-        0x54000681U, // b.ne failure
+        0x54000761U, // b.ne failure
         0x39402d8dU, // ldrb w13, [x12, #11]
         0x7100c1bfU, // cmp w13, #'0'
-        0x54000621U, // b.ne failure
+        0x54000701U, // b.ne failure
         0x3940318dU, // ldrb w13, [x12, #12]
         0x7101e1bfU, // cmp w13, #'x'
-        0x540005c1U, // b.ne failure
+        0x540006a1U, // b.ne failure
         0xd53bd06eU, // mrs x14, TPIDRRO_EL0
-        0xb400058eU, // cbz x14, failure
+        0xb400066eU, // cbz x14, failure
         0xd10381cfU, // sub x15, x14, #224 -> arm64 _pthread_self_direct()
         0xf94001d0U, // ldr x16, [x14] -> direct TSD PTHREAD_SELF slot
         0xeb0f021fU, // cmp x16, x15
-        0x54000501U, // b.ne failure
+        0x540005e1U, // b.ne failure
         0xf90001efU, // str x15, [x15] -> _pthread_init_signature with zero token
         0xf94001f1U, // ldr x17, [x15]
         0xeb0f023fU, // cmp x17, x15
-        0x54000481U, // b.ne failure
+        0x54000561U, // b.ne failure
         0x92800390U, // mov x16, #-29 -> mach_host_self trap
         0xd4001001U, // svc #0x80
-        0xb4000420U, // cbz x0, failure
-        0xaa0003f2U, // mov x18, x0 -> synthetic host port
+        0xb4000500U, // cbz x0, failure
+        0xaa0003f2U, // mov x18, x0 -> synthetic host send right
         0x92800330U, // mov x16, #-26 -> mach_reply_port trap
         0xd4001001U, // svc #0x80
-        0xb40003a0U, // cbz x0, failure
+        0xb4000480U, // cbz x0, failure
         0xaa0003f3U, // mov x19, x0 -> reply port
         0xd2880014U, // movz x20, #0x4000
         0xf2b20014U, // movk x20, #0x9000, lsl #16
@@ -254,18 +254,25 @@ std::vector<std::byte> dependency_with_libsystem_startup_probe() {
         0xd2800006U, // mov x6, #0 -> notify
         0x928003d0U, // mov x16, #-31 -> mach_msg trap
         0xd4001001U, // svc #0x80
-        0xb50001a0U, // cbnz x0, failure
+        0xb5000280U, // cbnz x0, failure
         0xb9401695U, // ldr w21, [x20, #20] -> reply id
         0x7104b2bfU, // cmp w21, #300
-        0x54000141U, // b.ne failure
+        0x54000221U, // b.ne failure
         0xb9402295U, // ldr w21, [x20, #32] -> MIG RetCode
-        0x35000115U, // cbnz w21, failure
+        0x350001f5U, // cbnz w21, failure
         0xb9402695U, // ldr w21, [x20, #36] -> host_info_outCnt
         0x710022bfU, // cmp w21, #8
-        0x540000a1U, // b.ne failure
+        0x54000181U, // b.ne failure
         0xb9403695U, // ldr w21, [x20, #52] -> user_priority
         0x71007ebfU, // cmp w21, #31 (BASEPRI_DEFAULT)
-        0x54000041U, // b.ne failure
+        0x54000121U, // b.ne failure
+        0x92800370U, // mov x16, #-28 -> task_self trap
+        0xd4001001U, // svc #0x80
+        0xb40000c0U, // cbz x0, failure
+        0xaa1203e1U, // mov x1, x18 -> host send right
+        0x92800230U, // mov x16, #-18 -> mach_port_deallocate fast path
+        0xd4001001U, // svc #0x80
+        0xb5000040U, // cbnz x0, failure
         0xaa0a03e0U, // mov x0, x10
         0xd10043ebU, // failure: sub x11, sp, #16
         0xf9000160U, // str x0, [x11]
@@ -325,17 +332,17 @@ int main() {
 
     const auto result = macosarm::run_macho_session(root, backend, host, config);
     expect(static_cast<bool>(result),
-           "real Dynarmic session reaches libpthread HOST_PRIORITY_INFO bootstrap");
+           "real Dynarmic session reaches libpthread mach_port_deallocate bootstrap");
     expect(result.program_vars_address == config.stack_base,
            "session exposes the generated ProgramVars record at deterministic guest memory");
-    expect(result.bootstrap.initialization.execution.instructions_executed == 61U,
-           "translated initializer crosses pthread signature and host_info startup contracts");
+    expect(result.bootstrap.initialization.execution.instructions_executed == 68U,
+           "translated initializer crosses pthread, host_info, and host-port release contracts");
     expect(result.final_state.tpidrro_el0 ==
                config.stack_base + kExpectedMainThreadTsdOffset,
            "TPIDRRO points at pthread_s::tsd and survives initializer-to-main CPU restoration");
     expect(result.process.reason == macosarm::ProcessStopReason::exited &&
                result.process.exit_status == 2,
-           "translated main still observes pthread signature after host_info bootstrap");
+           "translated main still observes pthread signature after host-port release");
     expect(result.process.instructions_executed == 13U,
            "libSystem startup proof preserves the successful arm64 pthread layout path");
     expect(result.final_state.pc == kRootEntry + 52U,
@@ -346,6 +353,6 @@ int main() {
         return EXIT_FAILURE;
     }
 
-    std::cout << "libSystem arm64 HOST_PRIORITY_INFO Dynarmic bootstrap passed\n";
+    std::cout << "libSystem arm64 mach_port_deallocate Dynarmic bootstrap passed\n";
     return EXIT_SUCCESS;
 }
