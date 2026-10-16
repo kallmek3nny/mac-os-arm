@@ -272,6 +272,68 @@ void normalize_simple_message_for_receive(std::vector<std::byte>& message) noexc
     write_u32_le(bytes, 12, destination_port);
 }
 
+constexpr std::size_t kHostInfoRequestSize = 40U;
+constexpr std::size_t kHostInfoReplySize = 72U;
+constexpr std::uint32_t kHostInfoMessageId = 200U;
+constexpr std::uint32_t kHostInfoReplyId = 300U;
+constexpr std::uint32_t kHostPriorityInfoFlavor = 5U;
+constexpr std::uint32_t kHostPriorityInfoCount = 8U;
+constexpr std::uint32_t kMachMsgTypeMoveSendOnce = 18U;
+constexpr std::array<std::uint32_t, kHostPriorityInfoCount> kHostPriorityInfoValues{
+    80U, // MINPRI_KERNEL
+    80U, // MINPRI_KERNEL
+    64U, // MINPRI_RESERVED
+    31U, // BASEPRI_DEFAULT
+    0U,  // DEPRESSPRI
+    0U,  // IDLEPRI
+    0U,  // MINPRI_USER
+    79U, // MAXPRI_RESERVED
+};
+
+[[nodiscard]] std::uint32_t dispatch_host_priority_info_request(
+    const std::vector<std::byte>& request,
+    MachContext& context) {
+
+    if (request.size() != kHostInfoRequestSize) {
+        return kMachSendInvalidData;
+    }
+
+    const std::span<const std::byte> request_bytes{request};
+    if (read_u32_le(request_bytes, 4U) != kHostInfoRequestSize ||
+        read_u32_le(request_bytes, 20U) != kHostInfoMessageId ||
+        read_u32_le(request_bytes, 32U) != kHostPriorityInfoFlavor ||
+        read_u32_le(request_bytes, 36U) < kHostPriorityInfoCount) {
+        return kMachSendInvalidData;
+    }
+
+    const std::uint32_t reply_port = read_u32_le(request_bytes, 12U);
+    if (!context.is_receive_port(reply_port)) {
+        return kMachSendInvalidReply;
+    }
+
+    std::vector<std::byte> reply(kHostInfoReplySize, std::byte{0});
+    std::span<std::byte> reply_bytes{reply};
+    write_u32_le(reply_bytes, 0U, kMachMsgTypeMoveSendOnce << 8U);
+    write_u32_le(reply_bytes, 4U, static_cast<std::uint32_t>(reply.size()));
+    write_u32_le(reply_bytes, 8U, 0U);
+    write_u32_le(reply_bytes, 12U, reply_port);
+    write_u32_le(reply_bytes, 16U, 0U);
+    write_u32_le(reply_bytes, 20U, kHostInfoReplyId);
+    for (std::size_t index = 0; index < 8U; ++index) {
+        reply[24U + index] = request[24U + index];
+    }
+    write_u32_le(reply_bytes, 32U, kMachKernSuccess);
+    write_u32_le(reply_bytes, 36U, kHostPriorityInfoCount);
+    for (std::size_t index = 0; index < kHostPriorityInfoValues.size(); ++index) {
+        write_u32_le(reply_bytes, 40U + (index * 4U), kHostPriorityInfoValues[index]);
+    }
+
+    if (!context.enqueue_message(reply_port, std::move(reply))) {
+        return kMachSendNoBuffer;
+    }
+    return kMachMsgSuccess;
+}
+
 [[nodiscard]] MachTrapDispatchResult dispatch_mach_message(
     CpuState& state,
     GuestAddressSpace& address_space,
@@ -327,13 +389,21 @@ void normalize_simple_message_for_receive(std::vector<std::byte>& message) noexc
         }
 
         const std::uint32_t destination_port = read_u32_le(const_message, 8);
-        if (!context.is_receive_port(destination_port)) {
-            return guest_mach_return(state, trap_number, kMachSendInvalidDest);
-        }
+        if (destination_port == context.host_self_port()) {
+            const std::uint32_t host_result =
+                dispatch_host_priority_info_request(message, context);
+            if (host_result != kMachMsgSuccess) {
+                return guest_mach_return(state, trap_number, host_result);
+            }
+        } else {
+            if (!context.is_receive_port(destination_port)) {
+                return guest_mach_return(state, trap_number, kMachSendInvalidDest);
+            }
 
-        normalize_simple_message_for_receive(message);
-        if (!context.enqueue_message(destination_port, std::move(message))) {
-            return guest_mach_return(state, trap_number, kMachSendNoBuffer);
+            normalize_simple_message_for_receive(message);
+            if (!context.enqueue_message(destination_port, std::move(message))) {
+                return guest_mach_return(state, trap_number, kMachSendNoBuffer);
+            }
         }
     }
 
