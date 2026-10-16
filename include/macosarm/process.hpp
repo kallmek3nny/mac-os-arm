@@ -33,6 +33,14 @@ struct ProcessResult {
     GuestAddressSpace& address_space,
     ExecutionBackend& backend,
     DarwinHostServices& host,
+    MachContext& mach_context,
+    std::uint64_t instruction_budget);
+
+[[nodiscard]] ProcessResult run_process(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    ExecutionBackend& backend,
+    DarwinHostServices& host,
     std::uint64_t instruction_budget);
 
 [[nodiscard]] std::string_view process_stop_reason_name(ProcessStopReason reason) noexcept;

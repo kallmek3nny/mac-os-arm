@@ -213,6 +213,44 @@ int main() {
         expect(backend.calls() == 0, "zero budget never enters backend");
     }
 
+    {
+        macosarm::GuestAddressSpace vm;
+        CaptureHost host;
+        macosarm::MachContext mach_context;
+
+        macosarm::CpuState first_state{};
+        ScriptedBackend first_backend({
+            {svc(1), true, 0, 0, 0,
+             static_cast<std::uint64_t>(macosarm::kMachTrapReplyPort)},
+        });
+        const auto first = macosarm::run_process(
+            first_state,
+            vm,
+            first_backend,
+            host,
+            mach_context,
+            1);
+        expect(first.reason == macosarm::ProcessStopReason::instruction_budget &&
+                   first_state.x[0] == macosarm::MachContext::kFirstReplyPort,
+               "caller-owned process Mach context allocates first reply port");
+
+        macosarm::CpuState second_state{};
+        ScriptedBackend second_backend({
+            {svc(1), true, 0, 0, 0,
+             static_cast<std::uint64_t>(macosarm::kMachTrapReplyPort)},
+        });
+        const auto second = macosarm::run_process(
+            second_state,
+            vm,
+            second_backend,
+            host,
+            mach_context,
+            1);
+        expect(second.reason == macosarm::ProcessStopReason::instruction_budget &&
+                   second_state.x[0] == macosarm::MachContext::kFirstReplyPort + 1U,
+               "caller-owned process Mach context persists across process runs");
+    }
+
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return EXIT_FAILURE;

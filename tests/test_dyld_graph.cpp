@@ -13,6 +13,7 @@
 #include "test_dyld_authenticated_initialization.inc"
 #include "test_process_startup_initializer_context.inc"
 #include "test_dyld_graph_bootstrap.inc"
+#include "test_session_graph_bootstrap.inc"
 
 int main() {
     const int legacy_result = legacy_dyld_graph_main();
@@ -27,6 +28,7 @@ int main() {
     const int authenticated_result = dyld_authenticated_initialization_main();
     const int startup_context_result = process_startup_initializer_context_main();
     const int bootstrap_result = dyld_graph_bootstrap_main();
+    const int session_bootstrap_result = session_graph_bootstrap_main();
     return legacy_result == EXIT_SUCCESS &&
                    metadata_result == EXIT_SUCCESS &&
                    fixup_payload_result == EXIT_SUCCESS &&
@@ -38,7 +40,8 @@ int main() {
                    integration_result == EXIT_SUCCESS &&
                    authenticated_result == EXIT_SUCCESS &&
                    startup_context_result == EXIT_SUCCESS &&
-                   bootstrap_result == EXIT_SUCCESS
+                   bootstrap_result == EXIT_SUCCESS &&
+                   session_bootstrap_result == EXIT_SUCCESS
                ? EXIT_SUCCESS
                : EXIT_FAILURE;
 }

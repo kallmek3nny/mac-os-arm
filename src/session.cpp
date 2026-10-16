@@ -59,11 +59,61 @@ SessionResult run_macho_session(
         return result;
     }
 
+    MachContext owned_mach_context;
+    MachContext& mach_context =
+        config.mach_context != nullptr ? *config.mach_context : owned_mach_context;
+
+    if (config.dyld.has_value()) {
+        const SessionDyldBootstrapConfig& dyld_config = *config.dyld;
+        if (dyld_config.root_path.empty() ||
+            dyld_config.executable_path.empty() ||
+            !dyld_config.image_lookup) {
+            result.error = SessionError::bootstrap_config_failure;
+            return result;
+        }
+
+        dyld::ImageGraphBootstrapConfig bootstrap_config = dyld_config.bootstrap;
+        // The complete session must share one Mach namespace. A nested
+        // initializer-only context would reset reply ports before main.
+        bootstrap_config.execution.mach_context = &mach_context;
+        result.bootstrap = dyld::bootstrap_image_graph(
+            parsed.image,
+            file_bytes,
+            loaded.image,
+            dyld_config.root_path,
+            dyld_config.executable_path,
+            address_space,
+            dyld_config.image_lookup,
+            result.startup.layout,
+            state,
+            backend,
+            host,
+            bootstrap_config);
+        if (!result.bootstrap) {
+            result.error = SessionError::bootstrap_failure;
+            return result;
+        }
+
+        // Initializers intentionally leave the CPU at their return sentinel and
+        // may mutate every general-purpose register. Restore the executable
+        // entry ABI from durable startup state before translated main begins.
+        const CpuInitResult restored = initialize_cpu(
+            state,
+            loaded.image,
+            result.startup.layout.stack_pointer);
+        if (!restored) {
+            result.error = SessionError::cpu_init_failure;
+            result.cpu_error = restored.error;
+            return result;
+        }
+    }
+
     result.process = run_process(
         state,
         address_space,
         backend,
         host,
+        mach_context,
         config.instruction_budget);
     result.final_state = state;
     return result;
@@ -77,6 +127,8 @@ std::string_view session_error_name(SessionError error) noexcept {
     case SessionError::stack_failure: return "stack_failure";
     case SessionError::startup_failure: return "startup_failure";
     case SessionError::cpu_init_failure: return "cpu_init_failure";
+    case SessionError::bootstrap_config_failure: return "bootstrap_config_failure";
+    case SessionError::bootstrap_failure: return "bootstrap_failure";
     }
     return "unknown";
 }

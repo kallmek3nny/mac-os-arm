@@ -21,6 +21,7 @@ ProcessResult run_process(
     GuestAddressSpace& address_space,
     ExecutionBackend& backend,
     DarwinHostServices& host,
+    MachContext& mach_context,
     std::uint64_t instruction_budget) {
 
     if (instruction_budget == 0) {
@@ -36,7 +37,6 @@ ProcessResult run_process(
 
     std::uint64_t remaining = instruction_budget;
     std::uint64_t total_executed = 0;
-    MachContext mach_context;
 
     while (remaining != 0) {
         const ExecutionResult execution = backend.run(state, address_space, remaining);
@@ -147,6 +147,22 @@ ProcessResult run_process(
         SyscallDispatchError::none,
         MachTrapDispatchError::none,
     };
+}
+
+ProcessResult run_process(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    ExecutionBackend& backend,
+    DarwinHostServices& host,
+    std::uint64_t instruction_budget) {
+    MachContext mach_context;
+    return run_process(
+        state,
+        address_space,
+        backend,
+        host,
+        mach_context,
+        instruction_budget);
 }
 
 std::string_view process_stop_reason_name(ProcessStopReason reason) noexcept {
