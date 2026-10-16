@@ -1,6 +1,7 @@
 #include "macosarm/dynarmic_backend.hpp"
 #include "macosarm/session.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -447,6 +448,194 @@ std::vector<std::byte> dependency_with_cross_image_export() {
     return bytes;
 }
 
+constexpr std::uint64_t kTransitiveSystemBase = 0x200000000ULL;
+constexpr std::uint64_t kTransitiveSystemInitializer = kTransitiveSystemBase + 0x200ULL;
+constexpr std::uint64_t kTransitiveSystemSlot = kTransitiveSystemBase + 0x1000ULL;
+constexpr std::uint64_t kTransitivePlatformBase = 0x300000000ULL;
+constexpr std::uint64_t kTransitivePlatformExport = kTransitivePlatformBase + 0x200ULL;
+constexpr std::string_view kTransitivePlatform =
+    "/usr/lib/system/libsystem_platform.dylib";
+
+[[nodiscard]] std::uint32_t single_segment_fixup_payload_size(std::string_view symbol) {
+    return static_cast<std::uint32_t>(64U + symbol.size() + 1U);
+}
+
+void put_single_segment_fixup_payload(
+    std::vector<std::byte>& bytes,
+    std::size_t payload,
+    std::string_view symbol) {
+    constexpr std::size_t header_size = 28U;
+    constexpr std::size_t starts_size = 8U;
+    constexpr std::size_t segment_size = 24U;
+    constexpr std::size_t imports_offset = header_size + starts_size + segment_size;
+    constexpr std::size_t symbols_offset = imports_offset + 4U;
+
+    put_u32(bytes, payload, 0U);
+    put_u32(bytes, payload + 4U, static_cast<std::uint32_t>(header_size));
+    put_u32(bytes, payload + 8U, static_cast<std::uint32_t>(imports_offset));
+    put_u32(bytes, payload + 12U, static_cast<std::uint32_t>(symbols_offset));
+    put_u32(bytes, payload + 16U, 1U);
+    put_u32(bytes, payload + 20U, macosarm::dyld::kChainedImport);
+    put_u32(bytes, payload + 24U, 0U);
+
+    put_u32(bytes, payload + header_size, 1U);
+    put_u32(bytes, payload + header_size + 4U, static_cast<std::uint32_t>(starts_size));
+
+    const std::size_t segment = payload + header_size + starts_size;
+    put_u32(bytes, segment, static_cast<std::uint32_t>(segment_size));
+    put_u16(bytes, segment + 4U, 0x4000U);
+    put_u16(
+        bytes,
+        segment + 6U,
+        static_cast<std::uint16_t>(macosarm::dyld::ChainedPointerFormat::generic64));
+    put_u64(bytes, segment + 8U, 0U);
+    put_u32(bytes, segment + 16U, 0U);
+    put_u16(bytes, segment + 20U, 1U);
+    put_u16(bytes, segment + 22U, 0x1000U);
+
+    put_u32(bytes, payload + imports_offset, 1U);
+    put_string(bytes, payload + symbols_offset, symbol);
+}
+
+[[nodiscard]] std::vector<std::byte> single_export_trie(std::string_view symbol) {
+    if (symbol.empty() || symbol.size() > 120U) {
+        std::abort();
+    }
+
+    const std::size_t leaf_offset = symbol.size() + 4U;
+    std::vector<std::byte> trie;
+    trie.reserve(leaf_offset + 5U);
+    trie.push_back(std::byte{0x00});
+    trie.push_back(std::byte{0x01});
+    for (const char ch : symbol) {
+        trie.push_back(static_cast<std::byte>(static_cast<unsigned char>(ch)));
+    }
+    trie.push_back(std::byte{0x00});
+    trie.push_back(static_cast<std::byte>(leaf_offset));
+    trie.push_back(std::byte{0x03});
+    trie.push_back(std::byte{0x00});
+    trie.push_back(std::byte{0x80});
+    trie.push_back(std::byte{0x04});
+    trie.push_back(std::byte{0x00});
+    return trie;
+}
+
+std::vector<std::byte> transitive_libsystem_with_bound_initializer() {
+    constexpr std::size_t fixup_payload_offset = 0x3000U;
+    constexpr std::string_view symbol = "_platform_init";
+    const std::uint32_t fixup_payload_size = single_segment_fixup_payload_size(symbol);
+
+    std::vector<std::byte> bytes(0x4000, std::byte{0});
+    put_u32(bytes, 0, macosarm::macho::kMhMagic64);
+    put_u32(bytes, 4, static_cast<std::uint32_t>(macosarm::macho::kCpuTypeArm64));
+    put_u32(bytes, 8, static_cast<std::uint32_t>(macosarm::macho::kCpuSubtypeArm64All));
+    put_u32(bytes, 12, macosarm::macho::kMhDylib);
+
+    std::size_t command = 32U;
+    put_segment(
+        bytes,
+        command,
+        "__TEXT",
+        kTransitiveSystemBase,
+        0x4000ULL,
+        0,
+        0x4000ULL,
+        7U,
+        7U);
+    command += 72U;
+    command += put_dylib_command(
+        bytes,
+        command,
+        macosarm::macho::kLcIdDylib,
+        kBootstrapDependency);
+    command += put_dylib_command(
+        bytes,
+        command,
+        macosarm::macho::kLcLoadDylib,
+        kTransitivePlatform);
+    put_u32(bytes, command, macosarm::macho::kLcDyldChainedFixups);
+    put_u32(bytes, command + 4U, 16U);
+    put_u32(bytes, command + 8U, static_cast<std::uint32_t>(fixup_payload_offset));
+    put_u32(bytes, command + 12U, fixup_payload_size);
+    command += 16U;
+    put_u32(bytes, command, macosarm::macho::kLcRoutines64);
+    put_u32(bytes, command + 4U, 72U);
+    put_u64(bytes, command + 8U, kTransitiveSystemInitializer);
+    put_u64(bytes, command + 16U, 0U);
+    command += 72U;
+
+    put_u32(bytes, 16, 5U);
+    put_u32(bytes, 20, static_cast<std::uint32_t>(command - 32U));
+
+    std::size_t code = 0x200U;
+    const std::uint32_t instructions[] = {
+        0xd282000aU, // mov x10, #0x1000
+        0xf2c0004aU, // movk x10, #2, lsl #32 -> 0x200001000
+        0xf940014bU, // ldr x11, [x10] -> fixed _platform_init pointer
+        0xd61f0160U, // br x11; preserve initializer sentinel in x30
+    };
+    for (const std::uint32_t instruction : instructions) {
+        put_u32(bytes, code, instruction);
+        code += 4U;
+    }
+
+    put_u64(bytes, 0x1000U, std::uint64_t{1} << 63U);
+    put_single_segment_fixup_payload(bytes, fixup_payload_offset, symbol);
+    return bytes;
+}
+
+std::vector<std::byte> transitive_platform_with_export() {
+    constexpr std::size_t export_offset = 0x3000U;
+    constexpr std::string_view symbol = "_platform_init";
+    const std::vector<std::byte> export_trie = single_export_trie(symbol);
+
+    std::vector<std::byte> bytes(0x4000, std::byte{0});
+    put_u32(bytes, 0, macosarm::macho::kMhMagic64);
+    put_u32(bytes, 4, static_cast<std::uint32_t>(macosarm::macho::kCpuTypeArm64));
+    put_u32(bytes, 8, static_cast<std::uint32_t>(macosarm::macho::kCpuSubtypeArm64All));
+    put_u32(bytes, 12, macosarm::macho::kMhDylib);
+
+    std::size_t command = 32U;
+    put_segment(
+        bytes,
+        command,
+        "__TEXT",
+        kTransitivePlatformBase,
+        0x4000ULL,
+        0,
+        0x4000ULL,
+        5U,
+        5U);
+    command += 72U;
+    command += put_dylib_command(
+        bytes,
+        command,
+        macosarm::macho::kLcIdDylib,
+        kTransitivePlatform);
+    put_u32(bytes, command, macosarm::macho::kLcDyldExportsTrie);
+    put_u32(bytes, command + 4U, 16U);
+    put_u32(bytes, command + 8U, static_cast<std::uint32_t>(export_offset));
+    put_u32(bytes, command + 12U, static_cast<std::uint32_t>(export_trie.size()));
+    command += 16U;
+
+    put_u32(bytes, 16, 3U);
+    put_u32(bytes, 20, static_cast<std::uint32_t>(command - 32U));
+
+    std::size_t code = 0x200U;
+    const std::uint32_t instructions[] = {
+        0xd28009a9U, // mov x9, #77
+        0xd10043eaU, // sub x10, sp, #16
+        0xf9000149U, // str x9, [x10]
+        0xd65f03c0U, // ret through libSystem initializer sentinel
+    };
+    for (const std::uint32_t instruction : instructions) {
+        put_u32(bytes, code, instruction);
+        code += 4U;
+    }
+    std::copy(export_trie.begin(), export_trie.end(), bytes.begin() + export_offset);
+    return bytes;
+}
+
 struct CaptureHost final : macosarm::DarwinHostServices {
     std::vector<std::byte> bytes;
     std::int32_t fd{-1};
@@ -606,9 +795,66 @@ int main() {
                "cross-image bind path executes eight ARM64 instructions including callee");
         expect(result.final_state.pc == kBootstrapEntry + 24U &&
                    result.final_state.x[0] == 42 &&
+                   result.final_state.x[10] == kFixupSlot &&
                    result.final_state.x[11] == kFixupExport,
-               "translated process exposes the resolved dependency target and exit value");
-        (void)kFixupSlot;
+               "translated process exposes the fixed slot, resolved target, and exit value");
+    }
+
+    {
+        const auto root = executable_with_dependency_bootstrap();
+        const auto libsystem = transitive_libsystem_with_bound_initializer();
+        const auto platform = transitive_platform_with_export();
+        CaptureHost host;
+        macosarm::DynarmicBackend backend;
+        macosarm::SessionConfig config{};
+        config.instruction_budget = 32;
+        config.dyld.emplace();
+        config.dyld->root_path = kBootstrapExecutable;
+        config.dyld->executable_path = kBootstrapExecutable;
+        config.dyld->image_lookup = [&libsystem, &platform](std::string_view path) {
+            if (path == kBootstrapDependency) {
+                return macosarm::dyld::ImageLookupResult{
+                    macosarm::dyld::ImageLookupStatus::found,
+                    libsystem};
+            }
+            if (path == kTransitivePlatform) {
+                return macosarm::dyld::ImageLookupResult{
+                    macosarm::dyld::ImageLookupStatus::found,
+                    platform};
+            }
+            return macosarm::dyld::ImageLookupResult{
+                macosarm::dyld::ImageLookupStatus::not_found,
+                {}};
+        };
+        config.dyld->bootstrap.execution.instructions_per_initializer = 16;
+        config.dyld->bootstrap.execution.total_instruction_budget = 16;
+
+        const auto result = macosarm::run_macho_session(root, backend, host, config);
+        expect(static_cast<bool>(result),
+               "real Dynarmic session runs a fixup-backed transitive dependency initializer");
+        expect(result.bootstrap.loading.graph.images.size() == 3,
+               "session bootstrap loads root, libSystem, and transitive platform dylib");
+        expect(result.bootstrap.fixups.fixups_processed == 1,
+               "graph bootstrap applies libSystem initializer bind before initialization");
+        expect(result.bootstrap.initialization.planning.plan.calls.size() == 1 &&
+                   result.bootstrap.initialization.planning.plan.calls.front().address ==
+                       kTransitiveSystemInitializer,
+               "initializer plan targets the synthetic libSystem initializer");
+        expect(result.bootstrap.initialization.execution.instructions_executed == 8,
+               "real Dynarmic executes libSystem bind dispatch plus platform helper");
+        expect(result.process.reason == macosarm::ProcessStopReason::exited &&
+                   result.process.exit_status == 77,
+               "root main observes durable state written by transitive bound initializer call");
+        expect(result.process.instructions_executed == 5 &&
+                   result.final_state.pc == kBootstrapEntry + 20U &&
+                   result.final_state.x[0] == 77,
+               "root main starts clean after transitive initializer execution");
+        expect(result.bootstrap.loading.graph.images.back().exports.size() == 1 &&
+                   result.bootstrap.loading.graph.images.back().exports.front().name ==
+                       "_platform_init",
+               "transitive graph retains the platform export consumed by libSystem bind");
+        (void)kTransitiveSystemSlot;
+        (void)kTransitivePlatformExport;
     }
 
     if (failures != 0) {
