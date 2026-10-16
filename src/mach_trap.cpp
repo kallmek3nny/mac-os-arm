@@ -199,6 +199,64 @@ void write_u32_le(
     return guest_mach_return(state, trap_number, kMachKernSuccess);
 }
 
+[[nodiscard]] MachTrapDispatchResult dispatch_vm_map(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    MachContext& context,
+    std::int64_t trap_number) {
+
+    if (!valid_task_target(state, context)) {
+        return guest_mach_return(state, trap_number, kMachKernInvalidArgument);
+    }
+
+    const std::uint64_t address_pointer = state.x[1];
+    const auto rounded_size = round_up_guest_page(state.x[2]);
+    const std::uint64_t mask = state.x[3];
+    const std::uint64_t raw_flags = state.x[4];
+    const std::uint64_t raw_protection = state.x[5];
+
+    if (!rounded_size.has_value() ||
+        mask != 0 ||
+        raw_flags > std::numeric_limits<std::uint32_t>::max() ||
+        raw_protection > std::numeric_limits<std::uint32_t>::max()) {
+        return guest_mach_return(state, trap_number, kMachKernInvalidArgument);
+    }
+
+    const std::uint32_t flags = static_cast<std::uint32_t>(raw_flags);
+    const std::uint32_t protection = static_cast<std::uint32_t>(raw_protection);
+    constexpr std::uint64_t supported_flags = kMachVmFlagsAnywhere | kMachVmFlagsAliasMask;
+    if ((raw_flags & kMachVmFlagsAnywhere) == 0 ||
+        (raw_flags & ~supported_flags) != 0 ||
+        (protection & ~kMachVmProtMask) != 0) {
+        return guest_mach_return(state, trap_number, kMachKernInvalidArgument);
+    }
+    (void)flags; // Alias bits are accepted as accounting metadata, not guest VM semantics.
+
+    const auto candidate = find_anywhere_range(address_space, *rounded_size);
+    if (!candidate.has_value()) {
+        return guest_mach_return(state, trap_number, kMachKernNoSpace);
+    }
+    const std::uint64_t base = *candidate;
+
+    const VmResult map_result = address_space.map(
+        base,
+        *rounded_size,
+        decode_vm_protection(protection));
+    if (!map_result) {
+        const std::uint32_t kern_return =
+            map_result.error == VmError::overlap ? kMachKernNoSpace : kMachKernInvalidArgument;
+        return guest_mach_return(state, trap_number, kern_return);
+    }
+
+    const VmResult copyout_result = write_guest_u64(address_space, address_pointer, base);
+    if (!copyout_result) {
+        (void)address_space.unmap(base, *rounded_size);
+        return guest_mach_return(state, trap_number, kMachKernInvalidAddress);
+    }
+
+    return guest_mach_return(state, trap_number, kMachKernSuccess);
+}
+
 [[nodiscard]] MachTrapDispatchResult dispatch_vm_deallocate(
     CpuState& state,
     GuestAddressSpace& address_space,
@@ -445,6 +503,8 @@ MachTrapDispatchResult dispatch_mach_trap(
         return dispatch_vm_deallocate(state, address_space, context, trap_number);
     case kMachTrapVmProtect:
         return dispatch_vm_protect(state, address_space, context, trap_number);
+    case kMachTrapVmMap:
+        return dispatch_vm_map(state, address_space, context, trap_number);
     case kMachTrapReplyPort: {
         const auto allocated = context.allocate_reply_port();
         if (!allocated.has_value()) {
