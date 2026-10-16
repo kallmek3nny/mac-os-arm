@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <random>
 #include <span>
 #include <string>
 #include <string_view>
@@ -29,6 +30,7 @@ constexpr std::size_t kMainThreadTsdBytes = kMainThreadTsdSlots * sizeof(std::ui
 constexpr std::size_t kMainThreadBootstrapBytes =
     kArm64PthreadTsdOffset + kMainThreadTsdBytes;
 constexpr std::string_view kMainStackAppleKey = "main_stack=";
+constexpr std::string_view kPtrMungeAppleKey = "ptr_munge=";
 
 struct ProgramVarsMaterializationResult {
     bool success{};
@@ -84,6 +86,26 @@ void encode_u64(
     output.append("0x");
     output.append(digits.data(), converted.ptr);
     return true;
+}
+
+[[nodiscard]] std::uint64_t make_ptr_munge_token() {
+    std::random_device entropy;
+    const std::uint64_t high = static_cast<std::uint64_t>(entropy()) & 0xffffffffULL;
+    const std::uint64_t low = static_cast<std::uint64_t>(entropy()) & 0xffffffffULL;
+    const std::uint64_t token = (high << 32U) | low;
+    // libpthread requires a nonzero process token. The fallback is only a
+    // rehosting compatibility value for the pathological all-zero entropy
+    // result; it is not an Apple kernel security or pointer-authentication claim.
+    return token != 0 ? token : 0x6d61636f7361726dULL;
+}
+
+[[nodiscard]] std::optional<std::string> make_ptr_munge_apple_entry() {
+    std::string entry{kPtrMungeAppleKey};
+    entry.reserve(32U);
+    if (!append_hex_u64(entry, make_ptr_munge_token())) {
+        return std::nullopt;
+    }
+    return entry;
 }
 
 [[nodiscard]] std::optional<std::string> make_main_stack_apple_entry(
@@ -273,21 +295,39 @@ SessionResult run_macho_session(
 
     ProcessStartupConfig startup_config = config.startup;
     std::string generated_main_stack;
+    std::string generated_ptr_munge;
     std::vector<std::string_view> augmented_apple;
-    if (config.dyld.has_value() &&
-        !has_apple_key(config.startup.apple, kMainStackAppleKey)) {
-        const std::optional<std::string> main_stack = make_main_stack_apple_entry(
-            config.stack_base,
-            config.stack_size);
-        if (!main_stack.has_value()) {
-            result.error = SessionError::startup_failure;
-            result.startup.error = ProcessStartupError::address_overflow;
-            return result;
+    if (config.dyld.has_value()) {
+        const bool needs_main_stack = !has_apple_key(config.startup.apple, kMainStackAppleKey);
+        const bool needs_ptr_munge = !has_apple_key(config.startup.apple, kPtrMungeAppleKey);
+        if (needs_main_stack || needs_ptr_munge) {
+            augmented_apple.assign(config.startup.apple.begin(), config.startup.apple.end());
         }
-        generated_main_stack = *main_stack;
-        augmented_apple.assign(config.startup.apple.begin(), config.startup.apple.end());
-        augmented_apple.emplace_back(generated_main_stack);
-        startup_config.apple = augmented_apple;
+        if (needs_main_stack) {
+            const std::optional<std::string> main_stack = make_main_stack_apple_entry(
+                config.stack_base,
+                config.stack_size);
+            if (!main_stack.has_value()) {
+                result.error = SessionError::startup_failure;
+                result.startup.error = ProcessStartupError::address_overflow;
+                return result;
+            }
+            generated_main_stack = *main_stack;
+            augmented_apple.emplace_back(generated_main_stack);
+        }
+        if (needs_ptr_munge) {
+            const std::optional<std::string> ptr_munge = make_ptr_munge_apple_entry();
+            if (!ptr_munge.has_value()) {
+                result.error = SessionError::startup_failure;
+                result.startup.error = ProcessStartupError::address_overflow;
+                return result;
+            }
+            generated_ptr_munge = *ptr_munge;
+            augmented_apple.emplace_back(generated_ptr_munge);
+        }
+        if (!augmented_apple.empty()) {
+            startup_config.apple = augmented_apple;
+        }
     }
 
     result.startup = build_process_startup(
