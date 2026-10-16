@@ -93,6 +93,7 @@ constexpr std::uint64_t kHostInfoMessageAddress = kDependencyBase + 0x4000ULL;
 constexpr std::size_t kHostInfoMessageFileOffset = 0x4000U;
 constexpr std::uint64_t kExpectedMainThreadPthreadOffset = 80ULL;
 constexpr std::uint64_t kArm64PthreadTsdOffset = 224ULL;
+constexpr std::uint64_t kArm64PthreadErrnoOffset = 172ULL;
 constexpr std::uint64_t kExpectedMainThreadTsdOffset =
     kExpectedMainThreadPthreadOffset + kArm64PthreadTsdOffset;
 constexpr std::string_view kExecutablePath =
@@ -126,18 +127,24 @@ std::vector<std::byte> executable_with_program_vars_probe() {
     put_u32(bytes, 20U, static_cast<std::uint32_t>(command - 32U));
 
     std::size_t code = 0x200U;
-    const std::array<std::uint32_t, 16> instructions{
+    const std::array<std::uint32_t, 22> instructions{
         0xd53bd069U, // mrs x9, TPIDRRO_EL0
-        0xb4000189U, // cbz x9, failure
+        0xb4000249U, // cbz x9, failure
         0xd103812aU, // sub x10, x9, #224 -> arm64 pthread_self
         0xf940012bU, // ldr x11, [x9] -> direct TSD PTHREAD_SELF slot
         0xeb0a017fU, // cmp x11, x10
-        0x54000101U, // b.ne failure
+        0x540001c1U, // b.ne failure
         0xf940014cU, // ldr x12, [x10] -> signature initialized by dependency
         0xeb0a019fU, // cmp x12, x10
-        0x540000a1U, // b.ne failure
+        0x54000161U, // b.ne failure
+        0xf940052dU, // ldr x13, [x9, #8] -> direct TSD ERRNO slot
+        0x9102b14eU, // add x14, x10, #172 -> &pthread->err_no
+        0xeb0e01bfU, // cmp x13, x14
+        0x540000e1U, // b.ne failure
         0xd10043edU, // sub x13, sp, #16
         0xf94001a0U, // ldr x0, [x13] -> initializer-observed argc
+        0xb90001c0U, // str w0, [x14] -> write main-thread errno cell
+        0xb94001c0U, // ldr w0, [x14] -> read main-thread errno cell
         0xd2800030U, // mov x16, #1 (exit)
         0xd4001001U, // svc #0x80
         0xd2800c60U, // failure: mov x0, #99
@@ -344,7 +351,7 @@ int main() {
 
     const auto result = macosarm::run_macho_session(root, backend, host, config);
     expect(static_cast<bool>(result),
-           "real Dynarmic session reaches libpthread ptr_munge bootstrap");
+           "real Dynarmic session reaches libpthread errno TSD bootstrap");
     expect(result.program_vars_address == config.stack_base,
            "session exposes the generated ProgramVars record at deterministic guest memory");
     expect(result.bootstrap.initialization.execution.instructions_executed == 80U,
@@ -354,17 +361,17 @@ int main() {
            "TPIDRRO points at pthread_s::tsd and survives initializer-to-main CPU restoration");
     expect(result.process.reason == macosarm::ProcessStopReason::exited &&
                result.process.exit_status == 2,
-           "translated main still observes pthread signature after ptr_munge metadata bootstrap");
-    expect(result.process.instructions_executed == 13U,
-           "libSystem startup proof preserves the successful arm64 pthread layout path");
-    expect(result.final_state.pc == kRootEntry + 52U,
-           "libSystem startup proof stops immediately after the successful exit SVC");
+           "translated main validates direct errno TSD and writable err_no while preserving argc");
+    expect(result.process.instructions_executed == 19U,
+           "libSystem startup proof executes the successful errno TSD path within the existing process budget");
+    expect(result.final_state.pc == kRootEntry + 76U,
+           "libSystem startup proof stops immediately after the successful errno-backed exit SVC");
 
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return EXIT_FAILURE;
     }
 
-    std::cout << "libSystem arm64 ptr_munge Dynarmic bootstrap passed\n";
+    std::cout << "libSystem arm64 errno TSD Dynarmic bootstrap passed\n";
     return EXIT_SUCCESS;
 }
