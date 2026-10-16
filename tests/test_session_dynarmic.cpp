@@ -22,6 +22,12 @@ void expect(bool condition, const std::string& label) {
     }
 }
 
+void put_u16(std::vector<std::byte>& bytes, std::size_t offset, std::uint16_t value) {
+    for (std::size_t i = 0; i < 2; ++i) {
+        bytes.at(offset + i) = static_cast<std::byte>((value >> (i * 8)) & 0xffU);
+    }
+}
+
 void put_u32(std::vector<std::byte>& bytes, std::size_t offset, std::uint32_t value) {
     for (std::size_t i = 0; i < 4; ++i) {
         bytes.at(offset + i) = static_cast<std::byte>((value >> (i * 8)) & 0xffU);
@@ -287,6 +293,160 @@ std::vector<std::byte> dependency_with_initializer() {
     return bytes;
 }
 
+constexpr std::uint64_t kFixupSlot = kBootstrapRootBase + 0x1000ULL;
+constexpr std::uint64_t kFixupExport = kBootstrapDependencyBase + 0x200ULL;
+
+void put_root_fixup_payload(std::vector<std::byte>& bytes) {
+    constexpr std::size_t payload = 0x3000U;
+    constexpr std::size_t header_size = 28U;
+    constexpr std::size_t starts_size = 12U;
+    constexpr std::size_t segment_size = 24U;
+    constexpr std::size_t imports_offset = header_size + starts_size + segment_size;
+    constexpr std::size_t symbols_offset = imports_offset + 4U;
+
+    put_u32(bytes, payload, 0U);
+    put_u32(bytes, payload + 4U, static_cast<std::uint32_t>(header_size));
+    put_u32(bytes, payload + 8U, static_cast<std::uint32_t>(imports_offset));
+    put_u32(bytes, payload + 12U, static_cast<std::uint32_t>(symbols_offset));
+    put_u32(bytes, payload + 16U, 1U);
+    put_u32(bytes, payload + 20U, macosarm::dyld::kChainedImport);
+    put_u32(bytes, payload + 24U, 0U);
+
+    put_u32(bytes, payload + header_size, 2U);
+    put_u32(bytes, payload + header_size + 4U, 0U);
+    put_u32(bytes, payload + header_size + 8U, static_cast<std::uint32_t>(starts_size));
+
+    const std::size_t segment = payload + header_size + starts_size;
+    put_u32(bytes, segment, static_cast<std::uint32_t>(segment_size));
+    put_u16(bytes, segment + 4U, 0x4000U);
+    put_u16(
+        bytes,
+        segment + 6U,
+        static_cast<std::uint16_t>(macosarm::dyld::ChainedPointerFormat::generic64));
+    put_u64(bytes, segment + 8U, 0U);
+    put_u32(bytes, segment + 16U, 0U);
+    put_u16(bytes, segment + 20U, 1U);
+    put_u16(bytes, segment + 22U, 0x1000U);
+
+    put_u32(bytes, payload + imports_offset, 1U);
+    put_string(bytes, payload + symbols_offset, "_foo");
+}
+
+std::vector<std::byte> executable_with_cross_image_fixup() {
+    constexpr std::uint32_t fixup_payload_size = 73U;
+    std::vector<std::byte> bytes(0x4000, std::byte{0});
+    put_u32(bytes, 0, macosarm::macho::kMhMagic64);
+    put_u32(bytes, 4, static_cast<std::uint32_t>(macosarm::macho::kCpuTypeArm64));
+    put_u32(bytes, 8, static_cast<std::uint32_t>(macosarm::macho::kCpuSubtypeArm64All));
+    put_u32(bytes, 12, macosarm::macho::kMhExecute);
+    put_u32(bytes, 24, 0x00200000U);
+
+    std::size_t command = 32U;
+    put_segment(
+        bytes,
+        command,
+        "__PAGEZERO",
+        0,
+        kBootstrapRootBase,
+        0,
+        0,
+        0,
+        0);
+    command += 72U;
+    put_segment(
+        bytes,
+        command,
+        "__TEXT",
+        kBootstrapRootBase,
+        0x4000ULL,
+        0,
+        0x4000ULL,
+        7U,
+        7U);
+    command += 72U;
+    command += put_dylib_command(
+        bytes,
+        command,
+        macosarm::macho::kLcLoadDylib,
+        kBootstrapDependency);
+    put_u32(bytes, command, macosarm::macho::kLcDyldChainedFixups);
+    put_u32(bytes, command + 4U, 16U);
+    put_u32(bytes, command + 8U, 0x3000U);
+    put_u32(bytes, command + 12U, fixup_payload_size);
+    command += 16U;
+    put_u32(bytes, command, macosarm::macho::kLcMain);
+    put_u32(bytes, command + 4U, 24U);
+    put_u64(bytes, command + 8U, 0x200ULL);
+    command += 24U;
+
+    put_u32(bytes, 16, 5U);
+    put_u32(bytes, 20, static_cast<std::uint32_t>(command - 32U));
+
+    std::size_t code = 0x200U;
+    const std::uint32_t instructions[] = {
+        0xd282000aU, // mov x10, #0x1000
+        0xf2c0002aU, // movk x10, #1, lsl #32 -> 0x100001000
+        0xf940014bU, // ldr x11, [x10] -> graph-fixed _foo pointer
+        0xd63f0160U, // blr x11
+        0xd2800030U, // mov x16, #1 (exit)
+        0xd4001001U, // svc #0x80
+    };
+    for (const std::uint32_t instruction : instructions) {
+        put_u32(bytes, code, instruction);
+        code += 4U;
+    }
+
+    put_u64(bytes, 0x1000U, std::uint64_t{1} << 63U);
+    put_root_fixup_payload(bytes);
+    return bytes;
+}
+
+std::vector<std::byte> dependency_with_cross_image_export() {
+    constexpr std::size_t export_offset = 0x3000U;
+    const std::array<std::byte, 13> export_trie{
+        std::byte{0x00}, std::byte{0x01}, std::byte{'_'}, std::byte{'f'},
+        std::byte{'o'}, std::byte{'o'}, std::byte{0x00}, std::byte{0x08},
+        std::byte{0x03}, std::byte{0x00}, std::byte{0x80}, std::byte{0x04},
+        std::byte{0x00}};
+
+    std::vector<std::byte> bytes(0x4000, std::byte{0});
+    put_u32(bytes, 0, macosarm::macho::kMhMagic64);
+    put_u32(bytes, 4, static_cast<std::uint32_t>(macosarm::macho::kCpuTypeArm64));
+    put_u32(bytes, 8, static_cast<std::uint32_t>(macosarm::macho::kCpuSubtypeArm64All));
+    put_u32(bytes, 12, macosarm::macho::kMhDylib);
+
+    std::size_t command = 32U;
+    put_segment(
+        bytes,
+        command,
+        "__TEXT",
+        kBootstrapDependencyBase,
+        0x4000ULL,
+        0,
+        0x4000ULL,
+        5U,
+        5U);
+    command += 72U;
+    command += put_dylib_command(
+        bytes,
+        command,
+        macosarm::macho::kLcIdDylib,
+        kBootstrapDependency);
+    put_u32(bytes, command, macosarm::macho::kLcDyldExportsTrie);
+    put_u32(bytes, command + 4U, 16U);
+    put_u32(bytes, command + 8U, static_cast<std::uint32_t>(export_offset));
+    put_u32(bytes, command + 12U, static_cast<std::uint32_t>(export_trie.size()));
+    command += 16U;
+
+    put_u32(bytes, 16, 3U);
+    put_u32(bytes, 20, static_cast<std::uint32_t>(command - 32U));
+
+    put_u32(bytes, 0x200U, 0xd2800540U); // mov x0, #42
+    put_u32(bytes, 0x204U, 0xd65f03c0U); // ret
+    std::copy(export_trie.begin(), export_trie.end(), bytes.begin() + export_offset);
+    return bytes;
+}
+
 struct CaptureHost final : macosarm::DarwinHostServices {
     std::vector<std::byte> bytes;
     std::int32_t fd{-1};
@@ -407,6 +567,48 @@ int main() {
         expect(result.final_state.pc == kBootstrapEntry + 20U &&
                    result.final_state.x[0] == 42,
                "real Dynarmic process stops immediately after marker-backed exit SVC");
+    }
+
+    {
+        const auto root = executable_with_cross_image_fixup();
+        const auto dependency = dependency_with_cross_image_export();
+        CaptureHost host;
+        macosarm::DynarmicBackend backend;
+        macosarm::SessionConfig config{};
+        config.instruction_budget = 32;
+        config.dyld.emplace();
+        config.dyld->root_path = kBootstrapExecutable;
+        config.dyld->executable_path = kBootstrapExecutable;
+        config.dyld->image_lookup = [&dependency](std::string_view path) {
+            if (path == kBootstrapDependency) {
+                return macosarm::dyld::ImageLookupResult{
+                    macosarm::dyld::ImageLookupStatus::found,
+                    dependency};
+            }
+            return macosarm::dyld::ImageLookupResult{
+                macosarm::dyld::ImageLookupStatus::not_found,
+                {}};
+        };
+
+        const auto result = macosarm::run_macho_session(root, backend, host, config);
+        expect(static_cast<bool>(result),
+               "real Dynarmic session executes through a graph-applied cross-image bind");
+        expect(result.bootstrap.fixups.fixups_processed == 1,
+               "session bootstrap applies exactly one root chained fixup");
+        expect(result.bootstrap.loading.graph.images.size() == 2 &&
+                   result.bootstrap.loading.graph.images[1].exports.size() == 1 &&
+                   result.bootstrap.loading.graph.images[1].exports.front().name == "_foo",
+               "dependency graph retains the exported _foo symbol used by the bind");
+        expect(result.process.reason == macosarm::ProcessStopReason::exited &&
+                   result.process.exit_status == 42,
+               "real Dynarmic BLR reaches dependency export through the fixed pointer");
+        expect(result.process.instructions_executed == 8,
+               "cross-image bind path executes eight ARM64 instructions including callee");
+        expect(result.final_state.pc == kBootstrapEntry + 24U &&
+                   result.final_state.x[0] == 42 &&
+                   result.final_state.x[11] == kFixupExport,
+               "translated process exposes the resolved dependency target and exit value");
+        (void)kFixupSlot;
     }
 
     if (failures != 0) {
