@@ -37,6 +37,7 @@ enum class SessionError {
     none,
     parse_failure,
     load_failure,
+    commpage_failure,
     stack_failure,
     startup_failure,
     cpu_init_failure,
