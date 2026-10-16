@@ -207,10 +207,75 @@ int main() {
     expect(state.x[0] == macosarm::kMachKernInvalidArgument,
            "invalid task target returns KERN_INVALID_ARGUMENT");
 
+    write_u64(vm, control_base, macosarm::GuestAddressSpace::kPageSize);
+    state.x[0] = context.task_self_port();
+    state.x[1] = control_base;
+    state.x[2] = rounded_two_pages;
+    state.x[3] = 0;
+    state.x[4] = macosarm::kMachVmFlagsAnywhere | macosarm::kMachVmTagOsAllocOnce;
+    state.x[5] = macosarm::kMachVmProtRead | macosarm::kMachVmProtWrite;
     set_trap(state, macosarm::kMachTrapVmMap);
     result = macosarm::dispatch_mach_trap(state, vm, svc(), context);
-    expect(result.error == macosarm::MachTrapDispatchError::unsupported_trap,
-           "mach_vm_map remains explicitly unsupported until object semantics exist");
+    expect(static_cast<bool>(result), "libplatform-style mach_vm_map trap is handled");
+    expect(state.x[0] == macosarm::kMachKernSuccess,
+           "anonymous mach_vm_map returns KERN_SUCCESS");
+    const std::uint64_t mapped = read_u64(vm, control_base);
+    expect(mapped == macosarm::MachContext::kVmAnywhereBase,
+           "tagged VM_FLAGS_ANYWHERE map uses deterministic guest allocation base");
+    expect(has_mapping(
+               vm,
+               mapped,
+               rounded_two_pages,
+               macosarm::Protection::read | macosarm::Protection::write),
+           "libplatform os_alloc_once shape creates a two-page RW mapping");
+    expect(static_cast<bool>(vm.write(mapped, byte)),
+           "mapped os_alloc_once heap is guest-writable");
+
+    state.x[0] = context.task_self_port();
+    state.x[1] = mapped;
+    state.x[2] = rounded_two_pages;
+    set_trap(state, macosarm::kMachTrapVmDeallocate);
+    result = macosarm::dispatch_mach_trap(state, vm, svc(), context);
+    expect(static_cast<bool>(result) && state.x[0] == macosarm::kMachKernSuccess,
+           "anonymous mach_vm_map result can be deallocated");
+
+    const std::size_t mappings_before_bad_map = vm.mappings().size();
+    state.x[0] = context.task_self_port();
+    state.x[1] = control_base;
+    state.x[2] = rounded_two_pages;
+    state.x[3] = 0x3fffU;
+    state.x[4] = macosarm::kMachVmFlagsAnywhere | macosarm::kMachVmTagOsAllocOnce;
+    state.x[5] = macosarm::kMachVmProtRead | macosarm::kMachVmProtWrite;
+    set_trap(state, macosarm::kMachTrapVmMap);
+    result = macosarm::dispatch_mach_trap(state, vm, svc(), context);
+    expect(static_cast<bool>(result) && state.x[0] == macosarm::kMachKernInvalidArgument,
+           "unsupported mach_vm_map alignment mask fails closed");
+    expect(vm.mappings().size() == mappings_before_bad_map,
+           "rejected map mask does not mutate guest VM");
+
+    state.x[0] = context.task_self_port();
+    state.x[1] = control_base;
+    state.x[2] = rounded_two_pages;
+    state.x[3] = 0;
+    state.x[4] = macosarm::kMachVmTagOsAllocOnce;
+    state.x[5] = macosarm::kMachVmProtRead | macosarm::kMachVmProtWrite;
+    set_trap(state, macosarm::kMachTrapVmMap);
+    result = macosarm::dispatch_mach_trap(state, vm, svc(), context);
+    expect(static_cast<bool>(result) && state.x[0] == macosarm::kMachKernInvalidArgument,
+           "fixed-address mach_vm_map remains unsupported until actually reached");
+
+    state.x[0] = context.task_self_port();
+    state.x[1] = 0xdead00000000ULL;
+    state.x[2] = rounded_two_pages;
+    state.x[3] = 0;
+    state.x[4] = macosarm::kMachVmFlagsAnywhere | macosarm::kMachVmTagOsAllocOnce;
+    state.x[5] = macosarm::kMachVmProtRead | macosarm::kMachVmProtWrite;
+    set_trap(state, macosarm::kMachTrapVmMap);
+    result = macosarm::dispatch_mach_trap(state, vm, svc(), context);
+    expect(static_cast<bool>(result) && state.x[0] == macosarm::kMachKernInvalidAddress,
+           "anonymous map bad copyout returns KERN_INVALID_ADDRESS");
+    expect(vm.mappings().size() == mappings_before_bad_map,
+           "anonymous map copyout failure rolls back the new mapping");
 
     constexpr std::int64_t unknown_mach_trap = -999;
     set_trap(state, unknown_mach_trap);
