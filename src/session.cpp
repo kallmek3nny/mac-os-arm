@@ -23,11 +23,24 @@ constexpr std::size_t kProgramVarsArgvOffset = 48U;
 constexpr std::size_t kProgramVarsEnvpOffset = 56U;
 constexpr std::size_t kProgramVarsPrognameOffset = 64U;
 constexpr std::size_t kProgramVarsStorageBytes = 80U;
+constexpr std::size_t kMainThreadTsdSlots = 10U;
+constexpr std::size_t kMainThreadTsdBytes = kMainThreadTsdSlots * sizeof(std::uint64_t);
+constexpr std::size_t kMainThreadSelfStorageBytes = 16U;
+constexpr std::size_t kMainThreadBootstrapBytes =
+    kMainThreadTsdBytes + kMainThreadSelfStorageBytes;
 constexpr std::string_view kMainStackAppleKey = "main_stack=";
 
 struct ProgramVarsMaterializationResult {
     bool success{};
     std::uint64_t address{};
+    VmError vm_error{VmError::none};
+};
+
+struct MainThreadBootstrapMaterializationResult {
+    bool success{};
+    std::uint64_t tsd_base{};
+    std::uint64_t self_address{};
+    ProcessStartupError startup_error{ProcessStartupError::none};
     VmError vm_error{VmError::none};
 };
 
@@ -168,6 +181,51 @@ void encode_u64(
     return result;
 }
 
+[[nodiscard]] MainThreadBootstrapMaterializationResult materialize_main_thread_bootstrap(
+    GuestAddressSpace& address_space,
+    const ProcessStartupLayout& startup,
+    std::uint64_t stack_base) {
+    MainThreadBootstrapMaterializationResult result;
+    constexpr std::uint64_t kProgramVarsBytes =
+        static_cast<std::uint64_t>(kProgramVarsStorageBytes);
+    constexpr std::uint64_t kBootstrapBytes =
+        static_cast<std::uint64_t>(kMainThreadBootstrapBytes);
+    constexpr std::uint64_t kTsdBytes = static_cast<std::uint64_t>(kMainThreadTsdBytes);
+
+    if (stack_base > std::numeric_limits<std::uint64_t>::max() - kProgramVarsBytes) {
+        result.startup_error = ProcessStartupError::address_overflow;
+        return result;
+    }
+    const std::uint64_t tsd_base = stack_base + kProgramVarsBytes;
+    if (tsd_base > std::numeric_limits<std::uint64_t>::max() - kBootstrapBytes) {
+        result.startup_error = ProcessStartupError::address_overflow;
+        return result;
+    }
+    const std::uint64_t bootstrap_end = tsd_base + kBootstrapBytes;
+    if (startup.stack_pointer < bootstrap_end) {
+        result.startup_error = ProcessStartupError::insufficient_stack;
+        return result;
+    }
+
+    const std::uint64_t self_address = tsd_base + kTsdBytes;
+    std::array<std::byte, kMainThreadBootstrapBytes> bytes{};
+    for (std::size_t index = 0; index < sizeof(self_address); ++index) {
+        bytes[index] = static_cast<std::byte>((self_address >> (index * 8U)) & 0xffU);
+    }
+
+    const VmResult written = address_space.write(tsd_base, bytes);
+    if (!written) {
+        result.startup_error = ProcessStartupError::memory_failure;
+        result.vm_error = written.error;
+        return result;
+    }
+
+    result.success = true;
+    result.tsd_base = tsd_base;
+    result.self_address = self_address;
+    return result;
+}
+
 } // namespace
 
 SessionResult run_macho_session(
@@ -177,7 +235,6 @@ SessionResult run_macho_session(
     const SessionConfig& config) {
 
     SessionResult result{};
-
     const macho::ParseResult parsed = macho::parse(file_bytes);
     if (!parsed) {
         result.error = SessionError::parse_failure;
@@ -285,6 +342,24 @@ SessionResult run_macho_session(
             result.program_vars_address = bootstrap_config.program_vars;
         }
 
+        // arm64 libsyscall obtains the TSD base from TPIDRRO_EL0 and libpthread
+        // immediately expects slot zero to contain a non-null pthread-self value.
+        // Materialize only that stable early-bootstrap contract here. The opaque
+        // self storage deliberately does not claim any private pthread_s layout.
+        const MainThreadBootstrapMaterializationResult main_thread =
+            materialize_main_thread_bootstrap(
+                address_space,
+                result.startup.layout,
+                config.stack_base);
+        if (!main_thread.success) {
+            result.error = SessionError::startup_failure;
+            result.startup.error = main_thread.startup_error;
+            result.startup.vm_error = main_thread.vm_error;
+            result.vm_error = main_thread.vm_error;
+            return result;
+        }
+        state.tpidrro_el0 = main_thread.tsd_base;
+
         // The complete session must share one Mach namespace. A nested
         // initializer-only context would reset reply ports before main.
         bootstrap_config.execution.mach_context = &mach_context;
@@ -308,7 +383,9 @@ SessionResult run_macho_session(
 
         // Initializers intentionally leave the CPU at their return sentinel and
         // may mutate every general-purpose register. Restore the executable
-        // entry ABI from durable startup state before translated main begins.
+        // entry ABI from durable startup state before translated main begins,
+        // while preserving the kernel-owned read-only thread pointer register.
+        const std::uint64_t tpidrro_el0 = state.tpidrro_el0;
         const CpuInitResult restored = initialize_cpu(
             state,
             loaded.image,
@@ -318,6 +395,7 @@ SessionResult run_macho_session(
             result.cpu_error = restored.error;
             return result;
         }
+        state.tpidrro_el0 = tpidrro_el0;
     }
 
     result.process = run_process(

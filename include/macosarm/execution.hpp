@@ -22,6 +22,7 @@ struct CpuState {
     std::array<Vector128, 32> vectors{};
     std::uint64_t sp{};
     std::uint64_t pc{};
+    std::uint64_t tpidrro_el0{};
     std::uint32_t pstate{};
     std::uint32_t fpcr{};
     std::uint32_t fpsr{};
