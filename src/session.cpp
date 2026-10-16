@@ -3,11 +3,16 @@
 #include "macosarm/darwin_commpage.hpp"
 
 #include <array>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <span>
+#include <string>
 #include <string_view>
+#include <system_error>
+#include <vector>
 
 namespace macosarm {
 namespace {
@@ -18,6 +23,7 @@ constexpr std::size_t kProgramVarsArgvOffset = 48U;
 constexpr std::size_t kProgramVarsEnvpOffset = 56U;
 constexpr std::size_t kProgramVarsPrognameOffset = 64U;
 constexpr std::size_t kProgramVarsStorageBytes = 80U;
+constexpr std::string_view kMainStackAppleKey = "main_stack=";
 
 struct ProgramVarsMaterializationResult {
     bool success{};
@@ -43,6 +49,56 @@ void encode_u64(
         bytes.at(offset + index) =
             static_cast<std::byte>((value >> (index * 8U)) & 0xffU);
     }
+}
+
+[[nodiscard]] bool has_apple_key(
+    std::span<const std::string_view> apple,
+    std::string_view key) noexcept {
+    for (const std::string_view entry : apple) {
+        if (entry.starts_with(key)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] bool append_hex_u64(std::string& output, std::uint64_t value) {
+    std::array<char, 16U> digits{};
+    const auto converted = std::to_chars(digits.data(), digits.data() + digits.size(), value, 16);
+    if (converted.ec != std::errc{}) {
+        return false;
+    }
+    output.append("0x");
+    output.append(digits.data(), converted.ptr);
+    return true;
+}
+
+[[nodiscard]] std::optional<std::string> make_main_stack_apple_entry(
+    std::uint64_t stack_base,
+    std::uint64_t stack_size) {
+    if (stack_size > std::numeric_limits<std::uint64_t>::max() - stack_base) {
+        return std::nullopt;
+    }
+
+    const std::uint64_t stack_top = stack_base + stack_size;
+    std::string entry{kMainStackAppleKey};
+    entry.reserve(96U);
+    if (!append_hex_u64(entry, stack_top)) {
+        return std::nullopt;
+    }
+    entry.push_back(',');
+    if (!append_hex_u64(entry, stack_size)) {
+        return std::nullopt;
+    }
+    entry.push_back(',');
+    if (!append_hex_u64(entry, stack_base)) {
+        return std::nullopt;
+    }
+    entry.push_back(',');
+    if (!append_hex_u64(entry, stack_size)) {
+        return std::nullopt;
+    }
+    return entry;
 }
 
 [[nodiscard]] ProgramVarsMaterializationResult materialize_program_vars(
@@ -156,11 +212,30 @@ SessionResult run_macho_session(
         return result;
     }
 
+    ProcessStartupConfig startup_config = config.startup;
+    std::string generated_main_stack;
+    std::vector<std::string_view> augmented_apple;
+    if (config.dyld.has_value() &&
+        !has_apple_key(config.startup.apple, kMainStackAppleKey)) {
+        const std::optional<std::string> main_stack = make_main_stack_apple_entry(
+            config.stack_base,
+            config.stack_size);
+        if (!main_stack.has_value()) {
+            result.error = SessionError::startup_failure;
+            result.startup.error = ProcessStartupError::address_overflow;
+            return result;
+        }
+        generated_main_stack = *main_stack;
+        augmented_apple.assign(config.startup.apple.begin(), config.startup.apple.end());
+        augmented_apple.emplace_back(generated_main_stack);
+        startup_config.apple = augmented_apple;
+    }
+
     result.startup = build_process_startup(
         address_space,
         config.stack_base,
         config.stack_size,
-        config.startup);
+        startup_config);
     if (!result.startup) {
         result.error = SessionError::startup_failure;
         result.vm_error = result.startup.vm_error;
@@ -196,7 +271,7 @@ SessionResult run_macho_session(
             const ProgramVarsMaterializationResult program_vars = materialize_program_vars(
                 address_space,
                 result.startup.layout,
-                config.startup,
+                startup_config,
                 loaded.image,
                 config.stack_base);
             if (!program_vars.success) {
