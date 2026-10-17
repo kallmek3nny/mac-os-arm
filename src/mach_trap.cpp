@@ -55,6 +55,16 @@ void write_u32_le(
     }
 }
 
+[[nodiscard]] VmResult write_guest_u32(
+    GuestAddressSpace& address_space,
+    std::uint64_t address,
+    std::uint32_t value) {
+
+    std::array<std::byte, 4> bytes{};
+    write_u32_le(bytes, 0, value);
+    return address_space.write(address, bytes);
+}
+
 [[nodiscard]] VmResult read_guest_u64(
     const GuestAddressSpace& address_space,
     std::uint64_t address,
@@ -270,6 +280,60 @@ void write_u32_le(
         return guest_mach_return(state, trap_number, kMachKernInvalidName);
     }
     return guest_mach_return(state, trap_number, kMachKernSuccess);
+}
+
+[[nodiscard]] MachTrapDispatchResult dispatch_port_construct(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    MachContext& context,
+    std::int64_t trap_number) {
+
+    if (!valid_task_target(state, context)) {
+        return guest_mach_return(state, trap_number, kMachSendInvalidDest);
+    }
+
+    std::array<std::byte, kMachPortOptionsSize> options{};
+    const VmResult copyin = address_space.read(state.x[1], options);
+    if (!copyin) {
+        return guest_mach_return(state, trap_number, kMachKernInvalidAddress);
+    }
+
+    const std::span<const std::byte> option_bytes{options};
+    if (read_u32_le(option_bytes, 0) != kMachPortOptionsReplyPort || state.x[2] != 0) {
+        return guest_mach_return(state, trap_number, kMachKernInvalidArgument);
+    }
+    for (std::size_t index = sizeof(std::uint32_t); index < options.size(); ++index) {
+        if (options[index] != std::byte{0}) {
+            return guest_mach_return(state, trap_number, kMachKernInvalidArgument);
+        }
+    }
+
+    // Validate copyout before consuming a synthetic namespace entry. The
+    // guest VM is single-threaded here, so writing the original bytes back is
+    // a side-effect-free writability check before allocation.
+    std::array<std::byte, sizeof(std::uint32_t)> original_name{};
+    const VmResult name_read = address_space.read(state.x[3], original_name);
+    if (!name_read) {
+        return guest_mach_return(state, trap_number, kMachKernInvalidAddress);
+    }
+    const VmResult name_write_preflight = address_space.write(state.x[3], original_name);
+    if (!name_write_preflight) {
+        return guest_mach_return(state, trap_number, kMachKernInvalidAddress);
+    }
+
+    const auto allocated = context.allocate_reply_port();
+    if (!allocated.has_value()) {
+        return guest_mach_return(state, trap_number, kMachKernResourceShortage);
+    }
+
+    const VmResult copyout = write_guest_u32(address_space, state.x[3], *allocated);
+    if (!copyout) {
+        (void)context.rollback_reply_port_allocation(*allocated);
+        return guest_mach_return(state, trap_number, kMachKernInvalidAddress);
+    }
+
+    state.x[0] = kMachKernSuccess;
+    return {MachTrapDispatchError::none, trap_number, *allocated};
 }
 
 void normalize_simple_message_for_receive(std::vector<std::byte>& message) noexcept {
@@ -489,6 +553,19 @@ std::optional<std::uint32_t> MachContext::allocate_reply_port() {
     return port;
 }
 
+bool MachContext::rollback_reply_port_allocation(std::uint32_t port) noexcept {
+    if (next_reply_port_ != port + 1U) {
+        return false;
+    }
+    const auto it = receive_queues_.find(port);
+    if (it == receive_queues_.end() || !it->second.empty()) {
+        return false;
+    }
+    receive_queues_.erase(it);
+    next_reply_port_ = port;
+    return true;
+}
+
 bool MachContext::is_receive_port(std::uint32_t port) const noexcept {
     return receive_queues_.find(port) != receive_queues_.end();
 }
@@ -555,6 +632,8 @@ MachTrapDispatchResult dispatch_mach_trap(
         return dispatch_vm_protect(state, address_space, context, trap_number);
     case kMachTrapPortDeallocate:
         return dispatch_port_deallocate(state, context, trap_number);
+    case kMachTrapPortConstruct:
+        return dispatch_port_construct(state, address_space, context, trap_number);
     case kMachTrapReplyPort: {
         const auto allocated = context.allocate_reply_port();
         if (!allocated.has_value()) {
