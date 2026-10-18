@@ -217,6 +217,10 @@ int dynarmic_pthread_main_thread_init_main() {
     pthread_main_put_u32(registration_data, 24U, 224U); // tsd_offset
     pthread_main_put_u32(registration_data, 28U, 40U);  // return_to_kernel_offset
     pthread_main_put_u32(registration_data, 32U, 24U);  // mach_thread_self_offset
+    // On LP64 ARM64, tl_policy is byte 48 and tl_joinable occupies bit 0
+    // of byte 49 (libpthread/src/types_internal.h, pthread_s). Apple sends
+    // CHAR_BIT * (offsetof(tl_policy) + 1) to __bsdthread_register.
+    pthread_main_put_u32(registration_data, 48U, 392U); // joinable_offset_bits
     pthread_main_put_u32(registration_data, 52U, 960U); // wq_quantum_expiry_offset
     if (!vm.load_bytes(registration_address, registration_data)) {
         std::cerr << "FAIL: pthread registration boundary data load\n";
@@ -405,6 +409,91 @@ int dynarmic_pthread_main_thread_init_main() {
         }
     }
 
-    std::cout << "Dynarmic pthread main-thread registration and thread_selfid bootstrap passed\n";
+    {
+        // libpthread's _pthread_struct_init and _pthread_main_thread_init
+        // perform these guest-side writes before bsdthread registration:
+        // cleanup_stack = NULL at +8, tl_join_ctx = NULL at +32,
+        // tl_exit_gate = MACH_PORT_NULL at +52, and tl_joinable bit 0
+        // at +49. The other joinable byte bits must not be overwritten.
+        // Keep this additional translated program separately budgeted.
+        constexpr std::uint64_t bookkeeping_code = code_base + 0x2000ULL;
+        std::array<std::byte, 8> stale_pointer{};
+        stale_pointer.fill(std::byte{0xff});
+        std::array<std::byte, 4> stale_gate{};
+        stale_gate.fill(std::byte{0xff});
+        constexpr std::array<std::byte, 1> joinable_seed{std::byte{0xa6}};
+        if (!vm.load_bytes(pthread_base + 8U, stale_pointer) ||
+            !vm.load_bytes(pthread_base + 32U, stale_pointer) ||
+            !vm.load_bytes(pthread_base + 52U, stale_gate) ||
+            !vm.load_bytes(pthread_base + 49U, joinable_seed)) {
+            std::cerr << "FAIL: translated pthread bookkeeping sentinels load\n";
+            return EXIT_FAILURE;
+        }
+
+        constexpr std::array<std::uint32_t, 26> bookkeeping_instructions{
+            0xd53bd069U, // mrs x9, TPIDRRO_EL0
+            0xd103812aU, // sub x10, x9, #224 -> pthread_self
+            0xf900055fU, // str xzr, [x10, #8] -> cleanup_stack
+            0xf900115fU, // str xzr, [x10, #32] -> tl_join_ctx
+            0xb900355fU, // str wzr, [x10, #52] -> tl_exit_gate
+            0x3940c54bU, // ldrb w11, [x10, #49] -> joinable flags
+            0x3200016bU, // orr w11, w11, #1 -> set joinable only
+            0x3900c54bU, // strb w11, [x10, #49]
+            0x3940c54cU, // ldrb w12, [x10, #49]
+            0x7200019fU, // tst w12, #1
+            0x540001a0U, // b.eq failure
+            0xf940054dU, // ldr x13, [x10, #8]
+            0xb500016dU, // cbnz x13, failure
+            0xf940114eU, // ldr x14, [x10, #32]
+            0xb500012eU, // cbnz x14, failure
+            0xb940354fU, // ldr w15, [x10, #52]
+            0x350000efU, // cbnz w15, failure
+            0xb9403271U, // ldr w17, [x19, #48] -> registration.joinable_offset_bits
+            0x7106223fU, // cmp w17, #392 -> bit immediately after tl_policy
+            0x54000081U, // b.ne failure
+            0xd2800000U, // mov x0, #0
+            0xd2800030U, // mov x16, #1 -> BSD exit
+            0xd4001001U, // svc #0x80
+            0xd2800c60U, // failure: mov x0, #99
+            0xd2800030U, // mov x16, #1 -> BSD exit
+            0xd4001001U, // svc #0x80
+        };
+        std::array<std::byte, bookkeeping_instructions.size() * 4U> bookkeeping_bytes{};
+        for (std::size_t index = 0; index < bookkeeping_instructions.size(); ++index) {
+            for (std::size_t byte = 0; byte < 4U; ++byte) {
+                bookkeeping_bytes[index * 4U + byte] = static_cast<std::byte>(
+                    (bookkeeping_instructions[index] >> (byte * 8U)) & 0xffU);
+            }
+        }
+        if (!vm.load_bytes(bookkeeping_code, bookkeeping_bytes)) {
+            std::cerr << "FAIL: translated pthread bookkeeping code loads\n";
+            return EXIT_FAILURE;
+        }
+
+        CpuState bookkeeping_state{};
+        bookkeeping_state.pc = bookkeeping_code;
+        bookkeeping_state.sp = state.sp;
+        bookkeeping_state.tpidrro_el0 = pthread_tsd;
+        bookkeeping_state.x[19] = registration_address;
+        DynarmicBackend bookkeeping_backend;
+        const auto bookkeeping_result = macosarm::run_process(
+            bookkeeping_state, vm, bookkeeping_backend, host, context, 32U);
+        std::array<std::byte, 1> joinable_after{};
+        if (bookkeeping_result.reason != macosarm::ProcessStopReason::exited ||
+            bookkeeping_result.exit_status != 0 ||
+            bookkeeping_result.instructions_executed != 23U ||
+            pthread_main_read_u64(vm, pthread_base + 8U) != 0U ||
+            pthread_main_read_u64(vm, pthread_base + 32U) != 0U ||
+            pthread_main_read_u32(vm, pthread_base + 52U) != 0U ||
+            !vm.read(pthread_base + 49U, joinable_after) ||
+            joinable_after[0] != std::byte{0xa7} ||
+            pthread_main_read_u32(vm, registration_address + 48U) != 392U ||
+            pthread_main_read_u64(vm, pthread_tsd - 8U) != context.thread_id()) {
+            std::cerr << "FAIL: translated pthread main-thread bookkeeping and joinable metadata\n";
+            return EXIT_FAILURE;
+        }
+    }
+
+    std::cout << "Dynarmic pthread main-thread structure and registration layout passed\n";
     return EXIT_SUCCESS;
 }
