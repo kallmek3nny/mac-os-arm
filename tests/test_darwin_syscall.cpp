@@ -238,6 +238,63 @@ int main() {
     }
 
     {
+        // XNU syscalls.master #20: getpid is a successful 32-bit BSD return,
+        // independent of host pid and stable across a process's syscalls.
+        macosarm::GuestAddressSpace vm;
+        CaptureHost host;
+        macosarm::MachContext first_process;
+        macosarm::MachContext second_process;
+        macosarm::CpuState state{};
+        state.x[0] = UINT64_MAX;
+        state.x[16] = macosarm::kDarwinSysGetpid;
+        state.pstate = macosarm::kA64PstateCarry;
+        const auto first = macosarm::dispatch_darwin_syscall(
+            state, vm, svc(), host, first_process);
+        const std::uint64_t pid = state.x[0];
+        expect(static_cast<bool>(first) &&
+                   first.syscall_number == macosarm::kDarwinSysGetpid &&
+                   first.action == macosarm::SyscallAction::resume,
+               "getpid is dispatched as BSD syscall 20");
+        expect(pid == first_process.process_id() && pid >=
+                   macosarm::MachContext::kFirstSyntheticProcessId &&
+                   pid <= INT32_MAX,
+               "getpid returns a bounded synthetic POSIX pid");
+        expect(!carry_is_set(state), "successful getpid clears stale carry");
+
+        state.x[0] = 0;
+        state.pstate = macosarm::kA64PstateCarry;
+        const auto repeated = macosarm::dispatch_darwin_syscall(
+            state, vm, svc(), host, first_process);
+        expect(static_cast<bool>(repeated) && state.x[0] == pid && !carry_is_set(state),
+               "repeated getpid keeps process identity stable");
+
+        state.pstate = macosarm::kA64PstateCarry;
+        const auto isolated = macosarm::dispatch_darwin_syscall(
+            state, vm, svc(), host, second_process);
+        expect(static_cast<bool>(isolated) &&
+                   state.x[0] == second_process.process_id() &&
+                   state.x[0] != pid && !carry_is_set(state),
+               "independent Mach contexts have isolated process ids");
+
+        state.x[16] = macosarm::kDarwinSysBsdthreadRegister;
+        state.x[2] = 16384;
+        state.x[3] = 0;
+        state.x[4] = 0;
+        const auto unsupported = macosarm::dispatch_darwin_syscall(
+            state, vm, svc(), host, first_process);
+        expect(static_cast<bool>(unsupported) &&
+                   state.x[0] == macosarm::kDarwinErrnoEnosys && carry_is_set(state),
+               "unsupported pthread registration still fails closed");
+        state.x[16] = macosarm::kDarwinSysGetpid;
+        const auto after_rejection = macosarm::dispatch_darwin_syscall(
+            state, vm, svc(), host, first_process);
+        expect(static_cast<bool>(after_rejection) &&
+                   state.x[0] == pid && !carry_is_set(state),
+               "failed registration leaves process pid unchanged");
+        expect(host.fds.empty(), "identity calls never invoke host writes");
+    }
+
+    {
         macosarm::GuestAddressSpace vm;
         CaptureHost host;
         macosarm::MachContext context;

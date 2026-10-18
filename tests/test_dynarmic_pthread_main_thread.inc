@@ -494,6 +494,74 @@ int dynarmic_pthread_main_thread_init_main() {
         }
     }
 
+    {
+        // A separate bounded real Dynarmic entry checks BSD getpid -> thread_selfid
+        // -> getpid through the exact shared MachContext. The same ARM64 program
+        // also verifies that an independent context has a distinct POSIX pid.
+        // Neither the original 64-instruction bootstrap nor its budgets change.
+        constexpr std::uint64_t process_id_code = code_base + 0x3000ULL;
+        constexpr std::array<std::uint32_t, 12> process_id_instructions{
+            0xd2800290U, // mov x16, #20 -> BSD getpid
+            0xd4001001U, // svc #0x80
+            0xaa0003f3U, // mov x19, x0 -> first pid
+            0xd2802e90U, // mov x16, #372 -> BSD thread_selfid
+            0xd4001001U, // svc #0x80
+            0xaa0003f4U, // mov x20, x0 -> thread id
+            0xd2800290U, // mov x16, #20 -> BSD getpid again
+            0xd4001001U, // svc #0x80
+            0xaa0003f5U, // mov x21, x0 -> repeated pid
+            0xd2800000U, // mov x0, #0
+            0xd2800030U, // mov x16, #1 -> BSD exit
+            0xd4001001U, // svc #0x80
+        };
+        std::array<std::byte, process_id_instructions.size() * 4U> process_id_bytes{};
+        for (std::size_t index = 0; index < process_id_instructions.size(); ++index) {
+            for (std::size_t byte = 0; byte < 4U; ++byte) {
+                process_id_bytes[index * 4U + byte] = static_cast<std::byte>(
+                    (process_id_instructions[index] >> (byte * 8U)) & 0xffU);
+            }
+        }
+        if (!vm.load_bytes(process_id_code, process_id_bytes)) {
+            std::cerr << "FAIL: translated getpid probe code loads\n";
+            return EXIT_FAILURE;
+        }
+
+        CpuState process_id_state{};
+        process_id_state.pc = process_id_code;
+        process_id_state.sp = state.sp;
+        DynarmicBackend process_id_backend;
+        const auto process_id_result = macosarm::run_process(
+            process_id_state, vm, process_id_backend, host, context, 16U);
+        if (process_id_result.reason != macosarm::ProcessStopReason::exited ||
+            process_id_result.exit_status != 0 ||
+            process_id_result.instructions_executed != 12U ||
+            process_id_state.x[19] != context.process_id() ||
+            process_id_state.x[20] != context.thread_id() ||
+            process_id_state.x[21] != context.process_id() ||
+            (process_id_state.pstate & macosarm::kA64PstateCarry) != 0U) {
+            std::cerr << "FAIL: translated getpid identity across BSD syscalls\n";
+            return EXIT_FAILURE;
+        }
+
+        MachContext other_context;
+        CpuState other_state{};
+        other_state.pc = process_id_code;
+        other_state.sp = state.sp;
+        DynarmicBackend other_backend;
+        const auto other_result = macosarm::run_process(
+            other_state, vm, other_backend, host, other_context, 16U);
+        if (other_result.reason != macosarm::ProcessStopReason::exited ||
+            other_result.exit_status != 0 ||
+            other_result.instructions_executed != 12U ||
+            other_context.process_id() == context.process_id() ||
+            other_state.x[19] != other_context.process_id() ||
+            other_state.x[21] != other_context.process_id() ||
+            other_state.x[20] != other_context.thread_id()) {
+            std::cerr << "FAIL: translated getpid isolated between process contexts\n";
+            return EXIT_FAILURE;
+        }
+    }
+
     std::cout << "Dynarmic pthread main-thread structure and registration layout passed\n";
     return EXIT_SUCCESS;
 }

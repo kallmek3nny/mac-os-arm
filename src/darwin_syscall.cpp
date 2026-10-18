@@ -165,6 +165,11 @@ SyscallDispatchResult dispatch_darwin_syscall(
         };
     case kDarwinSysWrite:
         return dispatch_write(state, address_space, host, syscall_number);
+    case kDarwinSysGetpid:
+        // XNU bsd/kern/syscalls.master: BSD #20, int getpid(void).
+        // Process identity belongs to the shared context, never to the host.
+        set_success(state, context.process_id());
+        return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
     case kDarwinSysBsdthreadRegister:
         return dispatch_bsdthread_register_preflight(state, address_space, syscall_number);
     case kDarwinSysThreadSelfid:

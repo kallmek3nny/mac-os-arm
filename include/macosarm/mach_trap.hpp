@@ -74,6 +74,9 @@ constexpr std::size_t kMachMsgMaxQueueDepth = 64;
 
 class MachContext {
 public:
+    // Synthetic POSIX pid namespace: one stable pid per translated process
+    // context, not the host pid or a promise of fork/exec support.
+    static constexpr std::uint32_t kFirstSyntheticProcessId = 0x10000;
     static constexpr std::uint32_t kDefaultTaskSelfPort = 0x101;
     static constexpr std::uint32_t kDefaultThreadSelfPort = 0x102;
     // Single translated main-thread identity, scoped to a MachContext.
@@ -84,6 +87,9 @@ public:
     static constexpr std::size_t kMaxReplyPorts = 4096;
     static constexpr std::uint64_t kVmAnywhereBase = 0x1000000000ULL;
 
+    MachContext();
+
+    [[nodiscard]] std::uint32_t process_id() const noexcept { return process_id_; }
     [[nodiscard]] std::uint32_t task_self_port() const noexcept { return task_self_port_; }
     [[nodiscard]] std::uint32_t thread_self_port() const noexcept { return thread_self_port_; }
     [[nodiscard]] std::uint64_t thread_id() const noexcept { return thread_id_; }
@@ -102,6 +108,7 @@ public:
     [[nodiscard]] std::size_t queued_message_count(std::uint32_t port) const noexcept;
 
 private:
+    std::uint32_t process_id_{};
     std::uint32_t task_self_port_{kDefaultTaskSelfPort};
     std::uint32_t thread_self_port_{kDefaultThreadSelfPort};
     std::uint64_t thread_id_{kSyntheticMainThreadId};
