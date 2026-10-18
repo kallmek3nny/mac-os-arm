@@ -137,6 +137,72 @@ int main() {
     expect(received[24] == std::byte{'j'} && received[27] == std::byte{'!'},
            "JIT Mach transport preserves inline payload");
 
+    {
+        // Verify the same write-only Mach copyout from translated AArch64.
+        constexpr std::uint64_t options_base = message_base + GuestAddressSpace::kPageSize;
+        constexpr std::uint64_t name_base = options_base + GuestAddressSpace::kPageSize;
+        GuestAddressSpace construct_vm;
+        expect(static_cast<bool>(construct_vm.map(
+                   code_base, GuestAddressSpace::kPageSize,
+                   Protection::read | Protection::execute)), "JIT construct code maps");
+        expect(static_cast<bool>(construct_vm.map(
+                   options_base, GuestAddressSpace::kPageSize, Protection::read)),
+               "JIT construct options map");
+        expect(static_cast<bool>(construct_vm.map(
+                   name_base, GuestAddressSpace::kPageSize, Protection::write)),
+               "JIT construct write-only output maps");
+        std::array<std::byte, GuestAddressSpace::kPageSize> construct_code{};
+        constexpr std::array<std::uint32_t, 10> instructions{
+            0xaa1303e0U, // mov x0, x19 -> task self
+            0xaa1603e1U, // mov x1, x22 -> options
+            0xd2800002U, // mov x2, #0 -> context
+            0xaa1703e3U, // mov x3, x23 -> output name
+            0x928002f0U, // mov x16, #-24 -> mach_port_construct
+            0xd4001001U, // svc #0x80
+            0xaa0003f5U, // mov x21, x0 -> Mach return
+            0xd2800000U, // mov x0, #0
+            0xd2800030U, // mov x16, #1 -> exit
+            0xd4001001U, // svc #0x80
+        };
+        for (std::size_t i = 0; i < instructions.size(); ++i) {
+            put_instruction(construct_code, i * 4U, instructions[i]);
+        }
+        expect(static_cast<bool>(construct_vm.load_bytes(code_base, construct_code)),
+               "JIT construct program loads");
+        std::array<std::byte, macosarm::kMachPortOptionsSize> options{};
+        put_u32(options, 0U, macosarm::kMachPortOptionsReplyPort);
+        expect(static_cast<bool>(construct_vm.load_bytes(options_base, options)),
+               "JIT construct options load");
+
+        macosarm::MachContext construct_context;
+        macosarm::CpuState construct_state{};
+        construct_state.pc = code_base;
+        construct_state.sp = 0x700000000ULL;
+        construct_state.x[19] = construct_context.task_self_port();
+        construct_state.x[22] = options_base;
+        construct_state.x[23] = name_base;
+        macosarm::DynarmicBackend construct_backend;
+        const auto constructed = macosarm::run_process(
+            construct_state, construct_vm, construct_backend, host, construct_context, 32U);
+        expect(constructed.reason == macosarm::ProcessStopReason::exited &&
+                   constructed.exit_status == 0 && constructed.instructions_executed == 10U,
+               "translated construct exits within bounded instruction budget");
+        expect(construct_state.x[21] == macosarm::kMachKernSuccess,
+               "translated construct accepts write-only copyout");
+        std::array<std::byte, 4> name_bytes{};
+        expect(construct_vm.read(name_base, name_bytes).error == macosarm::VmError::protection,
+               "translated output remains write-only");
+        expect(static_cast<bool>(construct_vm.protect(
+                   name_base, GuestAddressSpace::kPageSize, Protection::read)),
+               "translated output becomes readable for verification");
+        expect(static_cast<bool>(construct_vm.read(name_base, name_bytes)),
+               "translated reply port name reads after protection change");
+        const std::uint32_t name = get_u32(name_bytes, 0U);
+        expect(name == macosarm::MachContext::kFirstReplyPort &&
+                   construct_context.is_receive_port(name),
+               "translated write-only copyout creates live reply port");
+    }
+
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return EXIT_FAILURE;
