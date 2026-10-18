@@ -323,6 +323,65 @@ int main() {
     }
 
     {
+        // XNU's _bsdthread_create checks proc_get_register(p) before using
+        // thread entry points. Every translated process is unregistered
+        // until full bsdthread_register and thread support is implemented.
+        macosarm::GuestAddressSpace vm;
+        CaptureHost host;
+        macosarm::MachContext context;
+        macosarm::CpuState state{};
+        const auto check_create = [&](std::uint64_t threadstart,
+                                      std::uint64_t pthread,
+                                      const std::string& label) {
+            state = {};
+            state.x[0] = threadstart;
+            state.x[1] = 0x1000U;
+            state.x[2] = 0x2000U;
+            state.x[3] = pthread;
+            state.x[4] = 0x01000000U; // PTHREAD_START_CUSTOM
+            state.x[16] = macosarm::kDarwinSysBsdthreadCreate;
+            const auto result = macosarm::dispatch_darwin_syscall(
+                state, vm, svc(), host, context);
+            expect(static_cast<bool>(result) &&
+                       result.action == macosarm::SyscallAction::resume &&
+                       result.syscall_number == macosarm::kDarwinSysBsdthreadCreate &&
+                       state.x[0] == macosarm::kDarwinErrnoEinval &&
+                       carry_is_set(state),
+                   label + " is rejected as unregistered with EINVAL and carry");
+        };
+        check_create(0U, 0U, "missing thread entry and pthread");
+        check_create(0x100000000ULL, 0x200000000ULL,
+                     "apparently valid thread entry and pthread");
+        check_create(UINT64_MAX, UINT64_MAX,
+                     "invalid pointers still hit the early registration guard");
+
+        // A correctly formed registration currently returns ENOSYS. That
+        // failure must not accidentally enable later bsdthread_create calls.
+        std::array<std::byte, 56> registration{};
+        registration[0] = std::byte{56};
+        load_readable(vm, buffer_base, registration);
+        state = {};
+        state.x[2] = 16384U;
+        state.x[3] = buffer_base;
+        state.x[4] = registration.size();
+        state.x[16] = macosarm::kDarwinSysBsdthreadRegister;
+        const auto registration_result = macosarm::dispatch_darwin_syscall(
+            state, vm, svc(), host, context);
+        expect(static_cast<bool>(registration_result) &&
+                   state.x[0] == macosarm::kDarwinErrnoEnosys &&
+                   carry_is_set(state),
+               "unimplemented valid registration still fails closed");
+        check_create(0x100000000ULL, 0x200000000ULL,
+                     "thread creation after failed registration");
+
+        std::array<std::byte, 56> unchanged{};
+        expect(static_cast<bool>(vm.read(buffer_base, unchanged)) &&
+                   unchanged == registration,
+               "thread creation and failed registration preserve guest memory");
+        expect(host.fds.empty(), "thread creation never calls host write");
+    }
+
+    {
         macosarm::GuestAddressSpace vm;
         CaptureHost host;
         macosarm::CpuState state{};
