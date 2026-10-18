@@ -105,9 +105,9 @@ int dynarmic_pthread_main_thread_init_main() {
     }
 
     std::array<std::byte, GuestAddressSpace::kPageSize> code{};
-    const std::array<std::uint32_t, 49> instructions{
+    const std::array<std::uint32_t, 51> instructions{
         0xd53bd069U, // mrs x9, TPIDRRO_EL0
-        0xb40005a9U, // cbz x9, failure
+        0xb40005e9U, // cbz x9, failure
         0xd103812aU, // sub x10, x9, #224 -> pthread_self
         0xf900012aU, // str x10, [x9] -> PTHREAD_SELF slot 0
         0x9102b14bU, // add x11, x10, #172 -> &pthread->err_no
@@ -116,23 +116,23 @@ int dynarmic_pthread_main_thread_init_main() {
         0xf9001d35U, // str x21, [x9, #56] -> PTR_MUNGE slot 7
         0xf940012cU, // ldr x12, [x9]
         0xeb0a019fU, // cmp x12, x10
-        0x54000481U, // b.ne failure
+        0x540004c1U, // b.ne failure
         0xf940052cU, // ldr x12, [x9, #8]
         0xeb0b019fU, // cmp x12, x11
-        0x54000421U, // b.ne failure
+        0x54000461U, // b.ne failure
         0xf940112cU, // ldr x12, [x9, #32]
         0xeb14019fU, // cmp x12, x20
-        0x540003c1U, // b.ne failure
+        0x54000401U, // b.ne failure
         0xf9401d2cU, // ldr x12, [x9, #56]
         0xeb15019fU, // cmp x12, x21
-        0x54000361U, // b.ne failure
+        0x540003a1U, // b.ne failure
         0x92800350U, // mov x16, #-27 -> thread_self_trap
         0xd4001001U, // svc #0x80
-        0xb4000300U, // cbz x0, failure
+        0xb4000340U, // cbz x0, failure
         0xf9000d20U, // str x0, [x9, #24] -> MACH_THREAD_SELF slot 3
         0xf9400d32U, // ldr x18, [x9, #24]
         0xeb00025fU, // cmp x18, x0
-        0x54000281U, // b.ne failure
+        0x540002c1U, // b.ne failure
         0x92800370U, // mov x16, #-28 -> task_self_trap
         0xd4001001U, // svc #0x80
         0xaa0003f3U, // mov x19, x0
@@ -142,13 +142,17 @@ int dynarmic_pthread_main_thread_init_main() {
         0xaa1703e3U, // mov x3, x23 -> mach_port_name_t*
         0x928002f0U, // mov x16, #-24 -> mach_port_construct fast trap
         0xd4001001U, // svc #0x80
-        0xb5000140U, // cbnz x0, failure
+        0xb5000180U, // cbnz x0, failure
         0xb94002f8U, // ldr w24, [x23] -> constructed reply port
-        0x34000118U, // cbz w24, failure
+        0x34000158U, // cbz w24, failure
         0xf9000938U, // str x24, [x9, #16] -> MIG_REPLY slot 2
         0xf9400939U, // ldr x25, [x9, #16]
         0xeb18033fU, // cmp x25, x24
-        0x54000081U, // b.ne failure
+        0x540000c1U, // b.ne failure
+        // Apple's _pthread_main_thread_init clears the two Mach-related cache
+        // slots after publishing MIG_REPLY; these are slots 8 and 9.
+        0xf900213fU, // str xzr, [x9, #64] -> MACH_SPECIAL_REPLY slot 8
+        0xf900253fU, // str xzr, [x9, #72] -> SEMAPHORE_CACHE slot 9
         0xd2800000U, // mov x0, #0
         0xd2800030U, // mov x16, #1 -> exit
         0xd4001001U, // svc #0x80
@@ -171,6 +175,15 @@ int dynarmic_pthread_main_thread_init_main() {
         return EXIT_FAILURE;
     }
 
+    // Seed the direct slots with nonzero stale values so translated zeroing
+    // is observable rather than passing on an initially zero guest page.
+    std::array<std::byte, 16> stale_slots{};
+    stale_slots.fill(std::byte{0xff});
+    if (!vm.load_bytes(pthread_tsd + 64U, stale_slots)) {
+        std::cerr << "FAIL: pthread main-thread stale cache TSD seed\n";
+        return EXIT_FAILURE;
+    }
+
     CpuState state{};
     state.pc = code_base;
     state.sp = 0x700000000ULL;
@@ -188,7 +201,7 @@ int dynarmic_pthread_main_thread_init_main() {
         std::cerr << "FAIL: translated pthread main-thread bootstrap reaches clean exit\n";
         return EXIT_FAILURE;
     }
-    if (process.instructions_executed != 46U) {
+    if (process.instructions_executed != 48U) {
         std::cerr << "FAIL: pthread main-thread proof executes exact source-order path\n";
         return EXIT_FAILURE;
     }
@@ -203,8 +216,10 @@ int dynarmic_pthread_main_thread_init_main() {
         pthread_main_read_u64(vm, pthread_tsd + 16U) != reply_port ||
         pthread_main_read_u64(vm, pthread_tsd + 24U) != context.thread_self_port() ||
         pthread_main_read_u64(vm, pthread_tsd + 32U) != fixture_qos ||
-        pthread_main_read_u64(vm, pthread_tsd + 56U) != fixture_ptr_munge) {
-        std::cerr << "FAIL: translated _pthread_struct_init/main-thread TSD sequence persists all direct slots\n";
+        pthread_main_read_u64(vm, pthread_tsd + 56U) != fixture_ptr_munge ||
+        pthread_main_read_u64(vm, pthread_tsd + 64U) != 0U ||
+        pthread_main_read_u64(vm, pthread_tsd + 72U) != 0U) {
+        std::cerr << "FAIL: translated _pthread_main_thread_init clears Mach special-reply and semaphore slots\n";
         return EXIT_FAILURE;
     }
 
