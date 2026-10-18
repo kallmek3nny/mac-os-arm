@@ -33,6 +33,7 @@ struct Mapping {
     std::uint64_t base{};
     std::uint64_t size{};
     Protection protection{Protection::none};
+    Protection maximum_protection{Protection::none};
 };
 
 enum class VmError {
@@ -59,12 +60,18 @@ public:
     static constexpr std::uint64_t kPageSize = 0x4000;
 
     [[nodiscard]] VmResult map(std::uint64_t base, std::uint64_t size, Protection protection);
+    [[nodiscard]] VmResult map(std::uint64_t base, std::uint64_t size,
+                               Protection protection, Protection maximum_protection);
     [[nodiscard]] VmResult unmap(std::uint64_t base, std::uint64_t size);
     // Range removal for Darwin munmap: accepts page-aligned subranges,
     // splits surviving mappings, and treats holes as already unmapped.
     // Unlike unmap(), this is not an exact-mapping operation.
     [[nodiscard]] VmResult unmap_range(std::uint64_t base, std::uint64_t size);
     [[nodiscard]] VmResult protect(std::uint64_t base, std::uint64_t size, Protection protection);
+    // Transactional subrange permissions for BSD mprotect; reject holes
+    // or requests beyond the original mapping maximum before mutation.
+    [[nodiscard]] VmResult protect_range(std::uint64_t base, std::uint64_t size,
+                                         Protection protection);
 
     // Loader-only population path. This intentionally ignores guest write permission
     // but still requires the complete destination range to already be mapped.

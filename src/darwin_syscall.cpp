@@ -190,11 +190,67 @@ void set_error(CpuState& state, std::uint32_t error) noexcept {
     if ((prot & 2U) != 0U) {
         protection = protection | Protection::write;
     }
-    if (!address_space.map(*address, rounded_size, protection)) {
+    if (!address_space.map(*address, rounded_size, protection,
+                           Protection::read | Protection::write)) {
         return reject(kDarwinErrnoEnomem);
     }
 
     set_success(state, *address);
+    return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+}
+
+[[nodiscard]] SyscallDispatchResult dispatch_mprotect(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    std::uint64_t syscall_number) {
+
+    // XNU bsd/kern/kern_mman.c: mprotect_sanitize checks alignment and
+    // rounded range; mach_vm_protect returns ENOMEM for unmapped gaps and
+    // EACCES when requested permissions exceed maximum map protections.
+    const auto reject = [&](std::uint32_t error) {
+        set_error(state, error);
+        return SyscallDispatchResult{
+            SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    };
+    constexpr std::uint64_t page_size = GuestAddressSpace::kPageSize;
+    const std::uint64_t address = state.x[0];
+    const std::uint64_t length = state.x[1];
+    // XNU's BSD protection sanitizer masks unknown bits.
+    const std::uint32_t bits = static_cast<std::uint32_t>(state.x[2]) & 7U;
+    if ((address % page_size) != 0U ||
+        length > std::numeric_limits<std::uint64_t>::max() - (page_size - 1U)) {
+        return reject(kDarwinErrnoEinval);
+    }
+    if (length == 0) {
+        // XNU explicitly allows SIZE_ZERO_FALLTHROUGH.
+        set_success(state, 0);
+        return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    }
+    const std::uint64_t rounded_size =
+        (length + page_size - 1U) & ~(page_size - 1U);
+    if (rounded_size > std::numeric_limits<std::uint64_t>::max() - address) {
+        return reject(kDarwinErrnoEinval);
+    }
+
+    Protection protection = Protection::none;
+    if ((bits & 1U) != 0U) {
+        protection = protection | Protection::read;
+    }
+    if ((bits & 2U) != 0U) {
+        protection = protection | Protection::write;
+    }
+    if ((bits & 4U) != 0U) {
+        protection = protection | Protection::execute;
+    }
+
+    const VmResult result = address_space.protect_range(
+        address, rounded_size, protection);
+    if (!result) {
+        return reject(result.error == VmError::unmapped ? kDarwinErrnoEnomem :
+                      result.error == VmError::protection ? kDarwinErrnoEacces :
+                      kDarwinErrnoEinval);
+    }
+    set_success(state, 0);
     return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
 }
 
@@ -312,6 +368,8 @@ SyscallDispatchResult dispatch_darwin_syscall(
         return dispatch_write(state, address_space, host, syscall_number);
     case kDarwinSysMmap:
         return dispatch_mmap(state, address_space, syscall_number);
+    case kDarwinSysMprotect:
+        return dispatch_mprotect(state, address_space, syscall_number);
     case kDarwinSysMunmap:
         return dispatch_munmap(state, address_space, syscall_number);
     case kDarwinSysGetpid:

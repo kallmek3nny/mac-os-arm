@@ -17,6 +17,11 @@ namespace {
 } // namespace
 
 VmResult GuestAddressSpace::map(std::uint64_t base, std::uint64_t size, Protection protection) {
+    return map(base, size, protection, protection);
+}
+
+VmResult GuestAddressSpace::map(std::uint64_t base, std::uint64_t size,
+                                Protection protection, Protection maximum_protection) {
     if (size == 0) {
         return {VmError::zero_size};
     }
@@ -39,7 +44,10 @@ VmResult GuestAddressSpace::map(std::uint64_t base, std::uint64_t size, Protecti
         }
     }
 
-    mappings_.emplace(base, Mapping{base, size, protection});
+    if (!has_protection(maximum_protection, protection)) {
+        return {VmError::protection};
+    }
+    mappings_.emplace(base, Mapping{base, size, protection, maximum_protection});
     return {};
 }
 
@@ -94,12 +102,14 @@ VmResult GuestAddressSpace::unmap_range(std::uint64_t base, std::uint64_t size) 
         if (current.base < base) {
             mappings_.emplace(
                 current.base,
-                Mapping{current.base, base - current.base, current.protection});
+                Mapping{current.base, base - current.base,
+                        current.protection, current.maximum_protection});
         }
         if (current_end > end) {
             mappings_.emplace(
                 end,
-                Mapping{end, current_end - end, current.protection});
+                Mapping{end, current_end - end,
+                        current.protection, current.maximum_protection});
             break;
         }
     }
@@ -121,6 +131,72 @@ VmResult GuestAddressSpace::protect(std::uint64_t base, std::uint64_t size, Prot
         return {VmError::not_exact_mapping};
     }
     mapping->protection = protection;
+    return {};
+}
+
+VmResult GuestAddressSpace::protect_range(
+    std::uint64_t base, std::uint64_t size, Protection protection) {
+
+    if (size == 0) {
+        return {VmError::zero_size};
+    }
+    if ((base % kPageSize) != 0 || (size % kPageSize) != 0) {
+        return {VmError::unaligned};
+    }
+    if (range_overflows(base, size)) {
+        return {VmError::address_overflow};
+    }
+    const std::uint64_t end = base + size;
+
+    // Validate complete coverage and maximum rights before changing any
+    // existing mappings or resident guest pages. This includes gaps between
+    // individually mapped regions.
+    std::uint64_t cursor = base;
+    auto it = mappings_.upper_bound(base);
+    if (it != mappings_.begin()) {
+        --it;
+    }
+    while (cursor < end) {
+        while (it != mappings_.end() &&
+               it->second.base + it->second.size <= cursor) {
+            ++it;
+        }
+        if (it == mappings_.end() || it->second.base > cursor) {
+            return {VmError::unmapped};
+        }
+        if (!has_protection(it->second.maximum_protection, protection)) {
+            return {VmError::protection};
+        }
+        cursor = std::min(end, it->second.base + it->second.size);
+        ++it;
+    }
+
+    // Copy/split into a temporary map, then publish atomically: even an
+    // allocation exception cannot leave partially changed VM protections.
+    auto updated = mappings_;
+    for (const auto& [key, mapping] : mappings_) {
+        const std::uint64_t mapping_end = mapping.base + mapping.size;
+        if (mapping_end <= base || mapping.base >= end) {
+            continue;
+        }
+        const std::uint64_t change_start = std::max(base, mapping.base);
+        const std::uint64_t change_end = std::min(end, mapping_end);
+        updated.erase(key);
+        if (mapping.base < change_start) {
+            updated.emplace(mapping.base, Mapping{
+                mapping.base, change_start - mapping.base,
+                mapping.protection, mapping.maximum_protection});
+        }
+        updated.emplace(change_start, Mapping{
+            change_start, change_end - change_start,
+            protection, mapping.maximum_protection});
+        if (change_end < mapping_end) {
+            updated.emplace(change_end, Mapping{
+                change_end, mapping_end - change_end,
+                mapping.protection, mapping.maximum_protection});
+        }
+    }
+    mappings_.swap(updated);
     return {};
 }
 
