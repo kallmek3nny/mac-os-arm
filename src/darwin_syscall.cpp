@@ -165,6 +165,21 @@ SyscallDispatchResult dispatch_darwin_syscall(
         };
     case kDarwinSysWrite:
         return dispatch_write(state, address_space, host, syscall_number);
+    case kDarwinSysGetpid:
+        // XNU bsd/kern/kern_prot.c returns the current process's p_pid.
+        // Do not leak the rehost's host PID or return an exhausted identity.
+        if (context.process_id() == 0) {
+            set_error(state, kDarwinErrnoEnosys);
+        } else {
+            set_success(state, context.process_id());
+        }
+        return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    case kDarwinSysBsdthreadCreate:
+        // libpthread/kern/kern_support.c rejects creation before any thread
+        // allocation when proc_get_register(p) == 0. Registration still
+        // fails closed here, so no process can create a pthread yet.
+        set_error(state, kDarwinErrnoEinval);
+        return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
     case kDarwinSysBsdthreadRegister:
         return dispatch_bsdthread_register_preflight(state, address_space, syscall_number);
     case kDarwinSysThreadSelfid:

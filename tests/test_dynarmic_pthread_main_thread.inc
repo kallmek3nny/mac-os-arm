@@ -494,6 +494,63 @@ int dynarmic_pthread_main_thread_init_main() {
         }
     }
 
+
+    {
+        // A separate bounded real-Dynarmic program verifies that getpid
+        // succeeds repeatedly in the caller-owned process context, while
+        // unregistered bsdthread_create fails with Darwin EINVAL + carry.
+        // Keep the prior pthread bootstrap and bookkeeping budgets intact.
+        constexpr std::uint64_t process_id_code = code_base + 0x3000ULL;
+        constexpr std::array<std::uint32_t, 19> process_id_instructions{
+            0xd2800290U, // mov x16, #20 -> getpid
+            0xd4001001U, // svc #0x80
+            0xaa0003f3U, // mov x19, x0 -> save first process identity
+            0xd2802d10U, // mov x16, #360 -> bsdthread_create
+            0xd4001001U, // svc #0x80
+            0x54000163U, // b.cc failure -> create must set carry
+            0x7100581fU, // cmp w0, #22 -> Darwin EINVAL
+            0x54000121U, // b.ne failure
+            0xaa0003f4U, // mov x20, x0 -> preserve rejection
+            0xd2800290U, // mov x16, #20 -> getpid
+            0xd4001001U, // svc #0x80 -> must clear carry
+            0xeb13001fU, // cmp x0, x19 -> same process ID
+            0x54000081U, // b.ne failure
+            0xd2800000U, // mov x0, #0 -> success exit
+            0xd2800030U, // mov x16, #1 -> exit
+            0xd4001001U, // svc #0x80
+            0xd2800c60U, // failure: mov x0, #99
+            0xd2800030U, // mov x16, #1 -> exit
+            0xd4001001U, // svc #0x80
+        };
+        std::array<std::byte, process_id_instructions.size() * 4U> process_id_bytes{};
+        for (std::size_t index = 0; index < process_id_instructions.size(); ++index) {
+            for (std::size_t byte = 0; byte < 4U; ++byte) {
+                process_id_bytes[index * 4U + byte] = static_cast<std::byte>(
+                    (process_id_instructions[index] >> (byte * 8U)) & 0xffU);
+            }
+        }
+        if (!vm.load_bytes(process_id_code, process_id_bytes)) {
+            std::cerr << "FAIL: translated getpid and bsdthread_create code loads\n";
+            return EXIT_FAILURE;
+        }
+
+        CpuState process_id_state{};
+        process_id_state.pc = process_id_code;
+        process_id_state.sp = state.sp;
+        DynarmicBackend process_id_backend;
+        const auto process_id_result = macosarm::run_process(
+            process_id_state, vm, process_id_backend, host, context, 24U);
+        if (process_id_result.reason != macosarm::ProcessStopReason::exited ||
+            process_id_result.exit_status != 0 ||
+            process_id_result.instructions_executed != 16U ||
+            process_id_state.x[19] != context.process_id() ||
+            process_id_state.x[20] != macosarm::kDarwinErrnoEinval ||
+            context.process_id() == 0U) {
+            std::cerr << "FAIL: translated BSD process identity and unregistered thread boundary\n";
+            return EXIT_FAILURE;
+        }
+    }
+
     std::cout << "Dynarmic pthread main-thread structure and registration layout passed\n";
     return EXIT_SUCCESS;
 }

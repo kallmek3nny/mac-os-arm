@@ -3,6 +3,7 @@
 #include "macosarm/darwin_syscall.hpp"
 
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -14,6 +15,18 @@
 
 namespace macosarm {
 namespace {
+
+// XNU's getpid reports a positive pid_t from the process, not the host
+// rehost process. Reserve a distinct, bounded synthetic PID per MachContext.
+// A nonzero exhausted ID is never recycled while this runtime is alive.
+[[nodiscard]] std::uint32_t allocate_synthetic_process_id() noexcept {
+    static std::atomic<std::uint64_t> next_process_id{1000U};
+    const auto id = next_process_id.fetch_add(1U, std::memory_order_relaxed);
+    if (id > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+        return 0;
+    }
+    return static_cast<std::uint32_t>(id);
+}
 
 [[nodiscard]] std::optional<std::uint64_t> round_up_guest_page(std::uint64_t size) noexcept {
     if (size == 0) {
@@ -518,6 +531,8 @@ constexpr std::array<std::uint32_t, kHostPriorityInfoCount> kHostPriorityInfoVal
 }
 
 } // namespace
+
+MachContext::MachContext() noexcept : process_id_(allocate_synthetic_process_id()) {}
 
 bool MachContext::acquire_host_self_send_right() noexcept {
     if (host_self_send_refs_ == std::numeric_limits<std::uint32_t>::max()) {

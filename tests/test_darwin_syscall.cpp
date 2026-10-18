@@ -237,6 +237,65 @@ int main() {
                "registration preflight does not mutate guest data");
     }
 
+
+    {
+        // XNU getpid (BSD #20) returns a pid_t tied to the process rather
+        // than to a Mach thread port. All requests in a context agree; a
+        // second context must not inherit the first process's identity.
+        macosarm::GuestAddressSpace vm;
+        CaptureHost host;
+        macosarm::MachContext first_context;
+        macosarm::MachContext second_context;
+        macosarm::CpuState state{};
+        const auto getpid = [&](const macosarm::MachContext& context) {
+            state = {};
+            state.x[16] = macosarm::kDarwinSysGetpid;
+            state.pstate = macosarm::kA64PstateCarry;
+            const auto result = macosarm::dispatch_darwin_syscall(
+                state, vm, svc(), host, context);
+            expect(static_cast<bool>(result) &&
+                       result.action == macosarm::SyscallAction::resume &&
+                       result.syscall_number == macosarm::kDarwinSysGetpid,
+                   "getpid dispatch returns through the BSD path");
+            expect(!carry_is_set(state), "getpid clears a stale carry flag");
+            return state.x[0];
+        };
+
+        const auto first_pid = getpid(first_context);
+        expect(first_pid == first_context.process_id() &&
+                   first_pid > 0 && first_pid <= INT32_MAX,
+               "getpid returns a valid positive 32-bit process identity");
+        expect(getpid(first_context) == first_pid,
+               "repeated getpid preserves process identity");
+        const auto second_pid = getpid(second_context);
+        expect(second_pid == second_context.process_id() &&
+                   second_pid != first_pid,
+               "independent contexts have isolated process identities");
+
+        // bsdthread_create (BSD #360) first rejects a process with no
+        // successful bsdthread_register. Even superficially valid arguments
+        // cannot create threads while that registration is unavailable.
+        for (const std::uint64_t threadstart : {0ULL, 0x100000000ULL}) {
+            state = {};
+            state.x[0] = threadstart;
+            state.x[1] = 0x300000000ULL;
+            state.x[2] = 0x400000000ULL;
+            state.x[3] = 0x500000000ULL;
+            state.x[4] = 0x01000000ULL;
+            state.x[16] = macosarm::kDarwinSysBsdthreadCreate;
+            const auto result = macosarm::dispatch_darwin_syscall(
+                state, vm, svc(), host, first_context);
+            expect(static_cast<bool>(result) &&
+                       result.action == macosarm::SyscallAction::resume &&
+                       state.x[0] == macosarm::kDarwinErrnoEinval &&
+                       carry_is_set(state),
+                   "unregistered bsdthread_create fails EINVAL without starting threads");
+            expect(getpid(first_context) == first_pid,
+                   "failed thread creation never changes process identity");
+        }
+        expect(host.fds.empty(), "identity and thread-create syscalls do not call host write");
+    }
+
     {
         macosarm::GuestAddressSpace vm;
         CaptureHost host;
