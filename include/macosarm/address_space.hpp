@@ -70,6 +70,8 @@ public:
     // Instruction fetch requires execute permission, not ordinary read permission.
     [[nodiscard]] VmResult fetch_code(std::uint64_t address, std::span<std::byte> out) const;
     [[nodiscard]] VmResult write(std::uint64_t address, std::span<const std::byte> bytes);
+    // Side-effect-free permission and range check for kernel-style guest copyout.
+    [[nodiscard]] VmResult probe_write(std::uint64_t address, std::size_t size) const;
 
     [[nodiscard]] std::vector<Mapping> mappings() const;
     [[nodiscard]] std::size_t resident_page_count() const noexcept { return pages_.size(); }

@@ -122,6 +122,20 @@ VmResult GuestAddressSpace::write(std::uint64_t address, std::span<const std::by
     return copy_into(address, bytes);
 }
 
+VmResult GuestAddressSpace::probe_write(std::uint64_t address, std::size_t size) const {
+    if (size == 0) {
+        return {};
+    }
+    const Mapping* mapping = find_mapping(address, size);
+    if (mapping == nullptr) {
+        return {VmError::unmapped};
+    }
+    if (!has_protection(mapping->protection, Protection::write)) {
+        return {VmError::protection};
+    }
+    return {};
+}
+
 std::vector<Mapping> GuestAddressSpace::mappings() const {
     std::vector<Mapping> result;
     result.reserve(mappings_.size());

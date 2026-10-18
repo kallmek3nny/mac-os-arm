@@ -212,6 +212,44 @@ int main() {
     expect(result.error == macosarm::MachTrapDispatchError::unsupported_trap,
            "mach_vm_map remains explicitly unsupported until object semantics exist");
 
+    {
+        // A write-only guest page is a valid Mach port name output target.
+        macosarm::GuestAddressSpace copyout_vm;
+        macosarm::MachContext copyout_context;
+        constexpr std::uint64_t options_base = 0x310000000ULL;
+        constexpr std::uint64_t name_base = options_base + macosarm::GuestAddressSpace::kPageSize;
+        expect(static_cast<bool>(copyout_vm.map(
+                   options_base, macosarm::GuestAddressSpace::kPageSize,
+                   macosarm::Protection::read)), "construct options page maps");
+        expect(static_cast<bool>(copyout_vm.map(
+                   name_base, macosarm::GuestAddressSpace::kPageSize,
+                   macosarm::Protection::write)), "construct write-only output maps");
+        std::array<std::byte, macosarm::kMachPortOptionsSize> options{};
+        options[1] = std::byte{0x10}; // MPO_REPLY_PORT (0x1000), little-endian.
+        expect(static_cast<bool>(copyout_vm.load_bytes(options_base, options)),
+               "construct reply-port options load");
+
+        macosarm::CpuState copyout{};
+        copyout.x[0] = copyout_context.task_self_port();
+        copyout.x[1] = options_base;
+        copyout.x[3] = name_base;
+        set_trap(copyout, macosarm::kMachTrapPortConstruct);
+        const auto constructed = macosarm::dispatch_mach_trap(
+            copyout, copyout_vm, svc(), copyout_context);
+        expect(static_cast<bool>(constructed) && copyout.x[0] == macosarm::kMachKernSuccess,
+               "mach_port_construct accepts write-only output");
+        std::array<std::byte, 4> name_bytes{};
+        expect(copyout_vm.read(name_base, name_bytes).error == macosarm::VmError::protection,
+               "construct copyout does not grant guest read access");
+        expect(static_cast<bool>(copyout_vm.protect(
+                   name_base, macosarm::GuestAddressSpace::kPageSize,
+                   macosarm::Protection::read)), "output page becomes readable for verification");
+        const std::uint32_t name = static_cast<std::uint32_t>(read_u64(copyout_vm, name_base));
+        expect(name == macosarm::MachContext::kFirstReplyPort &&
+                   copyout_context.is_receive_port(name),
+               "write-only copyout publishes live reply receive port");
+    }
+
     constexpr std::int64_t unknown_mach_trap = -999;
     set_trap(state, unknown_mach_trap);
     result = macosarm::dispatch_mach_trap(state, vm, svc(), context);

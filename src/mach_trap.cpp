@@ -308,15 +308,10 @@ void write_u32_le(
         }
     }
 
-    // Validate copyout before consuming a synthetic namespace entry. The
-    // guest VM is single-threaded here, so writing the original bytes back is
-    // a side-effect-free writability check before allocation.
-    std::array<std::byte, sizeof(std::uint32_t)> original_name{};
-    const VmResult name_read = address_space.read(state.x[3], original_name);
-    if (!name_read) {
-        return guest_mach_return(state, trap_number, kMachKernInvalidAddress);
-    }
-    const VmResult name_write_preflight = address_space.write(state.x[3], original_name);
+    // Kernel-style copyout requires write access, not read access. Probe
+    // without touching guest memory or consuming a port name.
+    const VmResult name_write_preflight =
+        address_space.probe_write(state.x[3], sizeof(std::uint32_t));
     if (!name_write_preflight) {
         return guest_mach_return(state, trap_number, kMachKernInvalidAddress);
     }
