@@ -61,6 +61,60 @@ VmResult GuestAddressSpace::unmap(std::uint64_t base, std::uint64_t size) {
     return {};
 }
 
+VmResult GuestAddressSpace::unmap_range(std::uint64_t base, std::uint64_t size) {
+    // Validate the entire range before changing any mappings or resident
+    // pages. BSD munmap performs page rounding before reaching this API.
+    if (size == 0) {
+        return {VmError::zero_size};
+    }
+    if ((base % kPageSize) != 0 || (size % kPageSize) != 0) {
+        return {VmError::unaligned};
+    }
+    if (range_overflows(base, size)) {
+        return {VmError::address_overflow};
+    }
+
+    const std::uint64_t end = base + size;
+    auto it = mappings_.lower_bound(base);
+    if (it != mappings_.begin()) {
+        --it; // The preceding mapping can straddle the removal start.
+    }
+
+    while (it != mappings_.end() && it->second.base < end) {
+        const Mapping current = it->second;
+        const std::uint64_t current_end = current.base + current.size;
+        if (current_end <= base) {
+            ++it;
+            continue;
+        }
+
+        // map::erase invalidates only the erased iterator. Untouched left and
+        // right fragments retain their existing protection and resident data.
+        it = mappings_.erase(it);
+        if (current.base < base) {
+            mappings_.emplace(
+                current.base,
+                Mapping{current.base, base - current.base, current.protection});
+        }
+        if (current_end > end) {
+            mappings_.emplace(
+                end,
+                Mapping{end, current_end - end, current.protection});
+            break;
+        }
+    }
+
+    for (auto page = pages_.begin(); page != pages_.end();) {
+        if (page->first >= base && page->first < end) {
+            page = pages_.erase(page);
+        } else {
+            ++page;
+        }
+    }
+    // vm_map_remove(..., VM_MAP_REMOVE_NO_FLAGS) tolerates holes.
+    return {};
+}
+
 VmResult GuestAddressSpace::protect(std::uint64_t base, std::uint64_t size, Protection protection) {
     Mapping* mapping = find_exact_mapping(base, size);
     if (mapping == nullptr) {

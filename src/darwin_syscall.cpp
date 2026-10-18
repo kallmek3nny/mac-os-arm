@@ -87,6 +87,40 @@ void set_error(CpuState& state, std::uint32_t error) noexcept {
     return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
 }
 
+[[nodiscard]] SyscallDispatchResult dispatch_munmap(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    std::uint64_t syscall_number) {
+
+    // XNU bsd/kern/kern_mman.c: munmap validates page alignment, nonzero
+    // length and arithmetic range before calling mach_vm_deallocate().
+    // mach_vm_deallocate rounds the length to the task's page size.
+    const std::uint64_t base = state.x[0];
+    const std::uint64_t size = state.x[1];
+    constexpr std::uint64_t page_size = GuestAddressSpace::kPageSize;
+    const std::uint64_t remainder = size % page_size;
+
+    if ((base % page_size) != 0 || size == 0 ||
+        size > std::numeric_limits<std::uint64_t>::max() - base) {
+        set_error(state, kDarwinErrnoEinval);
+        return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    }
+
+    const std::uint64_t padding = remainder == 0 ? 0 : page_size - remainder;
+    if (size > std::numeric_limits<std::uint64_t>::max() - padding) {
+        set_error(state, kDarwinErrnoEinval);
+        return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    }
+    const std::uint64_t rounded_size = size + padding;
+    if (rounded_size > std::numeric_limits<std::uint64_t>::max() - base ||
+        !address_space.unmap_range(base, rounded_size)) {
+        set_error(state, kDarwinErrnoEinval);
+    } else {
+        set_success(state, 0);
+    }
+    return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+}
+
 // Model only XNU's early registration rejection paths. Successful pthread
 // registration requires thread, workqueue and QoS behavior we do not provide;
 // valid calls remain ENOSYS instead of advertising fake kernel capabilities.
@@ -165,6 +199,8 @@ SyscallDispatchResult dispatch_darwin_syscall(
         };
     case kDarwinSysWrite:
         return dispatch_write(state, address_space, host, syscall_number);
+    case kDarwinSysMunmap:
+        return dispatch_munmap(state, address_space, syscall_number);
     case kDarwinSysGetpid:
         // XNU bsd/kern/syscalls.master: BSD #20, int getpid(void).
         // Process identity belongs to the shared context, never to the host.

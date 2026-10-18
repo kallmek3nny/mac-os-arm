@@ -129,6 +129,69 @@ int main() {
         expect(vm.resident_page_count() == 0, "failed crossing write allocates nothing");
     }
 
+
+    {
+        // BSD munmap needs split/removal of ordinary VM subranges without
+        // disturbing the exact-mapping unmap contract used by the loader.
+        GuestAddressSpace vm;
+        constexpr std::uint64_t base = 0x500000000ULL;
+        constexpr std::uint64_t page = GuestAddressSpace::kPageSize;
+        const auto rw = Protection::read | Protection::write;
+        expect(static_cast<bool>(vm.map(base, 4U * page, rw)),
+               "partial-unmap fixture maps four pages");
+        const std::array<std::byte, 1> marker{std::byte{0x5a}};
+        for (std::uint64_t n = 0; n < 4U; ++n) {
+            expect(static_cast<bool>(vm.write(base + n * page, marker)),
+                   "partial-unmap fixture initializes each resident page");
+        }
+        const auto resident_before = vm.resident_page_count();
+        const auto mappings_before = vm.mappings();
+        expect(vm.unmap_range(base + 1U, page).error == VmError::unaligned,
+               "partial-unmap rejects an unaligned start without mutation");
+        expect(vm.unmap_range(base, 0).error == VmError::zero_size,
+               "partial-unmap rejects zero length without mutation");
+        expect(vm.unmap_range(base, page - 1U).error == VmError::unaligned,
+               "partial-unmap rejects unrounded length");
+        expect(vm.unmap_range(0xffffffffffffc000ULL, 2U * page).error ==
+                   VmError::address_overflow,
+               "partial-unmap rejects wrapping virtual ranges");
+        expect(vm.resident_page_count() == resident_before &&
+                   vm.mappings().size() == mappings_before.size(),
+               "failed partial-unmap requests preserve mapping and page counts");
+
+        expect(static_cast<bool>(vm.unmap_range(base + page, 2U * page)),
+               "interior partial-unmap removes two pages");
+        const auto split = vm.mappings();
+        expect(split.size() == 2 &&
+                   split[0].base == base && split[0].size == page &&
+                   split[1].base == base + 3U * page && split[1].size == page &&
+                   split[0].protection == rw && split[1].protection == rw,
+               "interior removal retains both protected fragments");
+        std::array<std::byte, 1> readback{};
+        expect(vm.read(base + page, readback).error == VmError::unmapped &&
+                   vm.read(base + 2U * page, readback).error == VmError::unmapped,
+               "removed interior is inaccessible");
+        expect(static_cast<bool>(vm.read(base, readback)) &&
+                   readback == marker &&
+                   static_cast<bool>(vm.read(base + 3U * page, readback)) &&
+                   readback == marker &&
+                   vm.resident_page_count() == 2U,
+               "surviving fragments retain resident page data");
+        expect(vm.unmap(base, 4U * page).error == VmError::not_exact_mapping,
+               "old exact-unmap contract remains strict after splitting");
+        expect(static_cast<bool>(vm.unmap_range(base + page, 2U * page)) &&
+                   vm.resident_page_count() == 2U,
+               "repeated unmap on an existing hole is idempotent");
+        expect(static_cast<bool>(vm.map(base + page, 2U * page, rw)),
+               "removed interior may be mapped again");
+        expect(static_cast<bool>(vm.read(base + page, readback)) &&
+                   readback[0] == std::byte{0},
+               "remapped pages contain zero rather than stale resident data");
+        expect(static_cast<bool>(vm.unmap_range(base, 4U * page)) &&
+                   vm.mappings().empty() && vm.resident_page_count() == 0U,
+               "range unmap spans split mappings and deallocates all resident pages");
+    }
+
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return EXIT_FAILURE;
