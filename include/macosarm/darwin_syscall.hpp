@@ -13,7 +13,9 @@ namespace macosarm {
 constexpr std::uint32_t kDarwinSvcImmediate = 0x80;
 constexpr std::uint64_t kDarwinSysExit = 1;
 constexpr std::uint64_t kDarwinSysWrite = 4;
+constexpr std::uint64_t kDarwinSysBsdthreadRegister = 366;
 constexpr std::uint32_t kDarwinErrnoEio = 5;
+constexpr std::uint32_t kDarwinErrnoEinval = 22;
 constexpr std::uint32_t kDarwinErrnoEfault = 14;
 constexpr std::uint32_t kDarwinErrnoEnosys = 78;
 constexpr std::uint32_t kA64PstateCarry = 1u << 29;

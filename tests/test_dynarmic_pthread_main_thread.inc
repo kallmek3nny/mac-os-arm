@@ -105,9 +105,9 @@ int dynarmic_pthread_main_thread_init_main() {
     }
 
     std::array<std::byte, GuestAddressSpace::kPageSize> code{};
-    const std::array<std::uint32_t, 62> instructions{
+    const std::array<std::uint32_t, 67> instructions{
         0xd53bd069U, // mrs x9, TPIDRRO_EL0
-        0xb4000749U, // cbz x9, failure
+        0xb40007e9U, // cbz x9, failure
         0xd103812aU, // sub x10, x9, #224 -> pthread_self
         0xf900012aU, // str x10, [x9] -> PTHREAD_SELF slot 0
         0x9102b14bU, // add x11, x10, #172 -> &pthread->err_no
@@ -116,23 +116,23 @@ int dynarmic_pthread_main_thread_init_main() {
         0xf9001d35U, // str x21, [x9, #56] -> PTR_MUNGE slot 7
         0xf940012cU, // ldr x12, [x9]
         0xeb0a019fU, // cmp x12, x10
-        0x54000621U, // b.ne failure
+        0x540006c1U, // b.ne failure
         0xf940052cU, // ldr x12, [x9, #8]
         0xeb0b019fU, // cmp x12, x11
-        0x540005c1U, // b.ne failure
+        0x54000661U, // b.ne failure
         0xf940112cU, // ldr x12, [x9, #32]
         0xeb14019fU, // cmp x12, x20
-        0x54000561U, // b.ne failure
+        0x54000601U, // b.ne failure
         0xf9401d2cU, // ldr x12, [x9, #56]
         0xeb15019fU, // cmp x12, x21
-        0x54000501U, // b.ne failure
+        0x540005a1U, // b.ne failure
         0x92800350U, // mov x16, #-27 -> thread_self_trap
         0xd4001001U, // svc #0x80
-        0xb40004a0U, // cbz x0, failure
+        0xb4000540U, // cbz x0, failure
         0xf9000d20U, // str x0, [x9, #24] -> MACH_THREAD_SELF slot 3
         0xf9400d32U, // ldr x18, [x9, #24]
         0xeb00025fU, // cmp x18, x0
-        0x54000421U, // b.ne failure
+        0x540004c1U, // b.ne failure
         0x92800370U, // mov x16, #-28 -> task_self_trap
         0xd4001001U, // svc #0x80
         0xaa0003f3U, // mov x19, x0
@@ -142,13 +142,13 @@ int dynarmic_pthread_main_thread_init_main() {
         0xaa1703e3U, // mov x3, x23 -> mach_port_name_t*
         0x928002f0U, // mov x16, #-24 -> mach_port_construct fast trap
         0xd4001001U, // svc #0x80
-        0xb50002e0U, // cbnz x0, failure
+        0xb5000380U, // cbnz x0, failure
         0xb94002f8U, // ldr w24, [x23] -> constructed reply port
-        0x340002b8U, // cbz w24, failure
+        0x34000358U, // cbz w24, failure
         0xf9000938U, // str x24, [x9, #16] -> MIG_REPLY slot 2
         0xf9400939U, // ldr x25, [x9, #16]
         0xeb18033fU, // cmp x25, x24
-        0x54000221U, // b.ne failure
+        0x540002c1U, // b.ne failure
         // Apple's _pthread_main_thread_init clears the two Mach-related cache
         // slots after publishing MIG_REPLY; these are slots 8 and 9.
         0xf900213fU, // str xzr, [x9, #64] -> MACH_SPECIAL_REPLY slot 8
@@ -165,8 +165,15 @@ int dynarmic_pthread_main_thread_init_main() {
         0xd2801405U, // mov x5, #160 -> dispatch queue TSD offset
         0xd2802dd0U, // mov x16, #366 -> bsdthread_register
         0xd4001001U, // svc #0x80
-        0x540000c3U, // b.cc failure -> unsupported syscall must set carry
+        0x54000163U, // b.cc failure -> unsupported syscall must set carry
         0x7101381fU, // cmp w0, #78 -> Darwin ENOSYS
+        0x54000121U, // b.ne failure
+        // Prove that the immediately following malformed registration also
+        // receives the XNU size-preflight EINVAL without claiming support.
+        0xd28000e4U, // mov x4, #7 -> version field cannot fit
+        0xd4001001U, // svc #0x80, x16 still BSD #366
+        0x540000c3U, // b.cc failure -> EINVAL must set carry
+        0x7100581fU, // cmp w0, #22 -> Darwin EINVAL
         0x54000081U, // b.ne failure
         0xd2800000U, // mov x0, #0
         0xd2800030U, // mov x16, #1 -> exit
@@ -235,7 +242,7 @@ int dynarmic_pthread_main_thread_init_main() {
         std::cerr << "FAIL: translated pthread main-thread syscall boundary reaches clean exit\n";
         return EXIT_FAILURE;
     }
-    if (process.instructions_executed != 59U) {
+    if (process.instructions_executed != 64U) {
         std::cerr << "FAIL: pthread main-thread proof executes exact source-order path\n";
         return EXIT_FAILURE;
     }
@@ -335,6 +342,6 @@ int dynarmic_pthread_main_thread_init_main() {
         }
     }
 
-    std::cout << "Dynarmic pthread main-thread cache TSD and bsdthread_register ENOSYS boundary passed\n";
+    std::cout << "Dynarmic pthread main-thread register ENOSYS and EINVAL preflight passed\n";
     return EXIT_SUCCESS;
 }

@@ -1,6 +1,7 @@
 #include "macosarm/darwin_syscall.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -180,6 +181,59 @@ int main() {
         expect(host.fds.size() == 2, "large write is split into bounded chunks");
         expect(host.largest_request <= 64 * 1024, "host write chunk is capped at 64 KiB");
         expect(host.captured == large, "chunked write preserves guest bytes");
+    }
+
+    {
+        // XNU _bsdthread_register performs validation/copyin before
+        // registration. A valid request must still fail closed with ENOSYS.
+        macosarm::GuestAddressSpace vm;
+        std::array<std::byte, 56> record{};
+        record[0] = std::byte{56}; // packed registration version (u64)
+        record[8] = std::byte{160}; // dispatch_queue_offset (u64)
+        load_readable(vm, buffer_base, record);
+        CaptureHost host;
+        macosarm::CpuState state{};
+        const auto check = [&](std::uint64_t pthread_size,
+                               std::uint64_t record_address,
+                               std::uint64_t record_size,
+                               std::uint32_t expected_errno,
+                               const std::string& label) {
+            state = {};
+            state.x[0] = buffer_base;
+            state.x[1] = buffer_base;
+            state.x[2] = pthread_size;
+            state.x[3] = record_address;
+            state.x[4] = record_size;
+            state.x[5] = 160;
+            state.x[16] = macosarm::kDarwinSysBsdthreadRegister;
+            const auto result = macosarm::dispatch_darwin_syscall(state, vm, svc(), host);
+            expect(static_cast<bool>(result) && result.action == macosarm::SyscallAction::resume,
+                   label + " is handled without registration");
+            expect(state.x[0] == expected_errno && carry_is_set(state),
+                   label + " returns Darwin error and sets carry");
+        };
+
+        check(16384, buffer_base, record.size(), macosarm::kDarwinErrnoEnosys,
+              "valid pthread registration stays unsupported");
+        check(0xffffffffU, buffer_base, record.size(), macosarm::kDarwinErrnoEinval,
+              "negative signed pthread allocation size");
+        check(65537, buffer_base, record.size(), macosarm::kDarwinErrnoEinval,
+              "oversized pthread allocation");
+        check(16384, buffer_base, 7, macosarm::kDarwinErrnoEinval,
+              "registration shorter than version field");
+        check(16384, 0xdead00000000ULL, record.size(), macosarm::kDarwinErrnoEfault,
+              "invalid registration copyin");
+        check(16384, buffer_base, record.size() - 1U, macosarm::kDarwinErrnoEinval,
+              "registration version mismatch");
+        check(16384, buffer_base + macosarm::GuestAddressSpace::kPageSize - 4U,
+              record.size(), macosarm::kDarwinErrnoEfault,
+              "registration copyin crossing unmapped page");
+        check(16384, 0, 0, macosarm::kDarwinErrnoEnosys,
+              "legacy registration without record stays unsupported");
+        expect(host.fds.empty(), "registration preflight never calls host write");
+        std::array<std::byte, 56> unchanged{};
+        expect(static_cast<bool>(vm.read(buffer_base, unchanged)) && unchanged == record,
+               "registration preflight does not mutate guest data");
     }
 
     {

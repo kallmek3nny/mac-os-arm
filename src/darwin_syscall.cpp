@@ -86,6 +86,57 @@ void set_error(CpuState& state, std::uint32_t error) noexcept {
     return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
 }
 
+// Model only XNU's early registration rejection paths. Successful pthread
+// registration requires thread, workqueue and QoS behavior we do not provide;
+// valid calls remain ENOSYS instead of advertising fake kernel capabilities.
+[[nodiscard]] SyscallDispatchResult dispatch_bsdthread_register_preflight(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    std::uint64_t syscall_number) {
+
+    const auto reject = [&](std::uint32_t error) {
+        set_error(state, error);
+        return SyscallDispatchResult{
+            SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    };
+
+    // XNU's register shim passes uint32_t flags to its signed pthread size.
+    const auto pthread_size = static_cast<std::int32_t>(
+        static_cast<std::uint32_t>(state.x[2]));
+    if (pthread_size < 0 || pthread_size > 64 * 1024) {
+        return reject(kDarwinErrnoEinval);
+    }
+
+    const std::uint64_t data_address = state.x[3];
+    const std::uint64_t data_size = state.x[4];
+    if (data_address != 0) {
+        constexpr std::size_t kRegistrationSize = 56;
+        constexpr std::size_t kVersionSize = sizeof(std::uint64_t);
+        if (data_size < kVersionSize) {
+            return reject(kDarwinErrnoEinval);
+        }
+
+        // libpthread/kern/kern_internal.h uses a packed 56-byte record;
+        // _bsdthread_register copyins min(sizeof(record), supplied_size).
+        std::array<std::byte, kRegistrationSize> record{};
+        const auto copy_size = static_cast<std::size_t>(
+            std::min<std::uint64_t>(data_size, record.size()));
+        if (!address_space.read(data_address, std::span<std::byte>(record).first(copy_size))) {
+            return reject(kDarwinErrnoEfault);
+        }
+        std::uint64_t version = 0;
+        for (std::size_t i = 0; i < kVersionSize; ++i) {
+            version |= static_cast<std::uint64_t>(
+                std::to_integer<unsigned char>(record[i])) << (8U * i);
+        }
+        if (version != data_size) {
+            return reject(kDarwinErrnoEinval);
+        }
+    }
+
+    return reject(kDarwinErrnoEnosys);
+}
+
 } // namespace
 
 SyscallDispatchResult dispatch_darwin_syscall(
@@ -112,6 +163,8 @@ SyscallDispatchResult dispatch_darwin_syscall(
         };
     case kDarwinSysWrite:
         return dispatch_write(state, address_space, host, syscall_number);
+    case kDarwinSysBsdthreadRegister:
+        return dispatch_bsdthread_register_preflight(state, address_space, syscall_number);
     default:
         set_error(state, kDarwinErrnoEnosys);
         return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
