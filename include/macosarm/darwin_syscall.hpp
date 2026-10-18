@@ -15,14 +15,23 @@ constexpr std::uint64_t kDarwinSysExit = 1;
 constexpr std::uint64_t kDarwinSysWrite = 4;
 constexpr std::uint64_t kDarwinSysGetpid = 20;
 constexpr std::uint64_t kDarwinSysMunmap = 73;
+constexpr std::uint64_t kDarwinSysMmap = 197;
 constexpr std::uint64_t kDarwinSysBsdthreadCreate = 360;
 constexpr std::uint64_t kDarwinSysBsdthreadRegister = 366;
 constexpr std::uint64_t kDarwinSysThreadSelfid = 372;
 constexpr std::uint32_t kDarwinErrnoEio = 5;
+constexpr std::uint32_t kDarwinErrnoEnomem = 12;
 constexpr std::uint32_t kDarwinErrnoEinval = 22;
 constexpr std::uint32_t kDarwinErrnoEfault = 14;
 constexpr std::uint32_t kDarwinErrnoEnosys = 78;
 constexpr std::uint32_t kA64PstateCarry = 1u << 29;
+
+// XNU bsd/sys/mman.h, kept separate from host OS mmap flags.
+constexpr std::uint32_t kDarwinMapPrivate = 0x0002;
+constexpr std::uint32_t kDarwinMapFixed = 0x0010;
+constexpr std::uint32_t kDarwinMapJit = 0x0800;
+constexpr std::uint32_t kDarwinMapAnonymous = 0x1000;
+constexpr std::uint32_t kDarwinMapUnix03 = 0x40000;
 
 class MachContext;
 

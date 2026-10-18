@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 
 namespace macosarm {
 namespace {
@@ -84,6 +85,116 @@ void set_error(CpuState& state, std::uint32_t error) noexcept {
     }
 
     set_success(state, total_written);
+    return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+}
+
+// The narrow anonymous mmap contract used by guest malloc and libsystem.
+// XNU bsd/kern/kern_mman.c uses mach_vm_map_kernel for MAP_ANON and
+// treats non-fixed addr as a start hint. We currently have neither vnode
+// pagers nor atomic MAP_FIXED replacement, MAP_JIT entitlements, shared VM,
+// or executable-memory code-signing. Those requests remain unsupported.
+[[nodiscard]] SyscallDispatchResult dispatch_mmap(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    std::uint64_t syscall_number) {
+
+    const auto reject = [&](std::uint32_t error) {
+        set_error(state, error);
+        return SyscallDispatchResult{
+            SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    };
+
+    constexpr std::uint64_t page_size = GuestAddressSpace::kPageSize;
+    constexpr std::uint64_t allocation_base = 0x2000000000ULL;
+    constexpr std::uint64_t max_allocation_size = 256ULL * 1024ULL * 1024ULL;
+    constexpr std::size_t max_mappings = 4096;
+    constexpr std::uint32_t prot_mask = 7U;
+    constexpr std::uint32_t valid_flags =
+        kDarwinMapPrivate | kDarwinMapFixed | kDarwinMapJit |
+        kDarwinMapAnonymous | kDarwinMapUnix03 | 1U; // MAP_SHARED
+
+    const std::uint64_t length = state.x[1];
+    const std::uint32_t prot = static_cast<std::uint32_t>(state.x[2]);
+    const std::uint32_t flags = static_cast<std::uint32_t>(state.x[3]);
+    const std::int32_t fd = static_cast<std::int32_t>(
+        static_cast<std::uint32_t>(state.x[4]));
+    const std::uint64_t position = state.x[5];
+
+    if (length == 0 || (flags & ~valid_flags) != 0 ||
+        (prot & ~prot_mask) != 0) {
+        return reject(kDarwinErrnoEinval);
+    }
+    if (length > std::numeric_limits<std::uint64_t>::max() - (page_size - 1U)) {
+        return reject(kDarwinErrnoEinval);
+    }
+    const std::uint64_t rounded_size =
+        (length + page_size - 1U) & ~(page_size - 1U);
+    if (rounded_size > max_allocation_size) {
+        return reject(kDarwinErrnoEnomem);
+    }
+
+    // Only private, anonymous, non-fixed, non-JIT read/write regions
+    // have an implemented backing and protection contract.
+    if ((flags & ~kDarwinMapUnix03) !=
+            (kDarwinMapPrivate | kDarwinMapAnonymous) ||
+        (prot & 4U) != 0U || fd != -1 || position != 0U) {
+        return reject(kDarwinErrnoEnosys);
+    }
+    const auto mappings = address_space.mappings();
+    if (mappings.size() >= max_mappings) {
+        return reject(kDarwinErrnoEnomem);
+    }
+
+    // Scan a finite snapshot of existing mappings to find a full hole.
+    // Preserve caller-owned images and PAGEZERO without touching host VM.
+    const auto free_region = [&](std::uint64_t start) -> std::optional<std::uint64_t> {
+        std::uint64_t candidate = start;
+        for (const Mapping& mapped : mappings) {
+            const std::uint64_t end = mapped.base + mapped.size;
+            if (end <= candidate) {
+                continue;
+            }
+            if (mapped.base > candidate &&
+                mapped.base - candidate >= rounded_size) {
+                return candidate;
+            }
+            candidate = end;
+            if (candidate > std::numeric_limits<std::uint64_t>::max() - rounded_size) {
+                return std::nullopt;
+            }
+        }
+        if (candidate > std::numeric_limits<std::uint64_t>::max() - rounded_size) {
+            return std::nullopt;
+        }
+        return candidate;
+    };
+
+    const std::uint64_t hint = state.x[0];
+    const std::uint64_t start =
+        hint == 0U ||
+        hint > std::numeric_limits<std::uint64_t>::max() - (page_size - 1U)
+            ? allocation_base
+            : (hint + page_size - 1U) & ~(page_size - 1U);
+    auto address = free_region(start);
+    if (!address.has_value() && start != allocation_base) {
+        address = free_region(allocation_base);
+    }
+    if (!address.has_value()) {
+        return reject(kDarwinErrnoEnomem);
+    }
+
+    Protection protection = Protection::none;
+    if ((prot & 1U) != 0U) {
+        protection = protection | Protection::read;
+    }
+    if ((prot & 2U) != 0U) {
+        protection = protection | Protection::write;
+    }
+    if (!address_space.map(*address, rounded_size, protection)) {
+        return reject(kDarwinErrnoEnomem);
+    }
+
+    set_success(state, *address);
     return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
 }
 
@@ -199,6 +310,8 @@ SyscallDispatchResult dispatch_darwin_syscall(
         };
     case kDarwinSysWrite:
         return dispatch_write(state, address_space, host, syscall_number);
+    case kDarwinSysMmap:
+        return dispatch_mmap(state, address_space, syscall_number);
     case kDarwinSysMunmap:
         return dispatch_munmap(state, address_space, syscall_number);
     case kDarwinSysGetpid:

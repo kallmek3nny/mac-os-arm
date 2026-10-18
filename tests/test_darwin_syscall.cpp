@@ -446,6 +446,116 @@ int main() {
                "bsd munmap finishes without host writes or leaked guest pages");
     }
 
+
+    {
+        // XNU BSD #197: support bounded zero-fill private anonymous memory.
+        // Valid but unavailable MAP_FIXED, MAP_JIT, file and shared requests
+        // fail closed; none must change guest mappings.
+        macosarm::GuestAddressSpace vm;
+        CaptureHost host;
+        constexpr std::uint64_t page = macosarm::GuestAddressSpace::kPageSize;
+        macosarm::CpuState state{};
+        const auto request = [&](std::uint64_t hint, std::uint64_t size,
+                                 std::uint32_t prot, std::uint32_t flags,
+                                 std::int64_t fd, std::uint64_t position) {
+            state = {};
+            state.pstate = macosarm::kA64PstateCarry;
+            state.x[0] = hint;
+            state.x[1] = size;
+            state.x[2] = prot;
+            state.x[3] = flags;
+            state.x[4] = static_cast<std::uint64_t>(fd);
+            state.x[5] = position;
+            state.x[16] = macosarm::kDarwinSysMmap;
+            const auto result = macosarm::dispatch_darwin_syscall(
+                state, vm, svc(), host);
+            expect(static_cast<bool>(result) &&
+                       result.action == macosarm::SyscallAction::resume &&
+                       result.syscall_number == macosarm::kDarwinSysMmap,
+                   "anonymous mmap dispatch resumes translated process");
+            return state.x[0];
+        };
+        constexpr std::uint32_t flags =
+            macosarm::kDarwinMapPrivate | macosarm::kDarwinMapAnonymous;
+        const auto first = request(0, 1U, 3U, flags, -1, 0);
+        expect(!carry_is_set(state) && first >= 0x100000000ULL &&
+                   first % page == 0 && vm.mappings().size() == 1U &&
+                   vm.mappings()[0].size == page && vm.resident_page_count() == 0,
+               "mmap returns a rounded, lazy private anonymous guest page");
+        std::array<std::byte, 1> readback{};
+        expect(static_cast<bool>(vm.read(first, readback)) &&
+                   readback[0] == std::byte{0},
+               "fresh anonymous guest memory reads as zero");
+        constexpr std::array<std::byte, 1> marker{std::byte{0x6a}};
+        expect(static_cast<bool>(vm.write(first, marker)) &&
+                   static_cast<bool>(vm.read(first, readback)) &&
+                   readback == marker,
+               "private anonymous guest mapping is writable and persistent");
+        const auto second = request(first, page + 1U, 1U,
+                                    flags | macosarm::kDarwinMapUnix03, -1, 0);
+        expect(!carry_is_set(state) && second != first &&
+                   second % page == 0 && vm.mappings().size() == 2U &&
+                   vm.resident_page_count() == 1U,
+               "mmap rounds a multi-page length and avoids an occupied hint");
+        expect(vm.write(second, marker).error == macosarm::VmError::protection &&
+                   static_cast<bool>(vm.read(second, readback)) &&
+                   readback[0] == std::byte{0},
+               "read-only anonymous mappings prohibit guest writes");
+
+        const auto before_failures = vm.mappings().size();
+        const auto check_error = [&](std::uint64_t size, std::uint32_t prot,
+                                     std::uint32_t request_flags, std::int64_t fd,
+                                     std::uint64_t position, std::uint32_t error,
+                                     const std::string& label) {
+            expect(request(0, size, prot, request_flags, fd, position) == error &&
+                       carry_is_set(state) &&
+                       vm.mappings().size() == before_failures &&
+                       vm.resident_page_count() == 1U,
+                   label + " fails atomically with Darwin errno");
+        };
+        check_error(0, 3, flags, -1, 0, macosarm::kDarwinErrnoEinval,
+                    "empty allocation");
+        check_error(UINT64_MAX, 3, flags, -1, 0, macosarm::kDarwinErrnoEinval,
+                    "overflowing allocation");
+        check_error(256ULL * 1024ULL * 1024ULL + 1ULL, 3, flags, -1, 0,
+                    macosarm::kDarwinErrnoEnomem, "bounded guest VM allocation");
+        check_error(page, 8, flags, -1, 0, macosarm::kDarwinErrnoEinval,
+                    "invalid protection bits");
+        check_error(page, 3, flags | 0x80000000U, -1, 0,
+                    macosarm::kDarwinErrnoEinval, "unknown mmap flags");
+        check_error(page, 3, flags | macosarm::kDarwinMapFixed, -1, 0,
+                    macosarm::kDarwinErrnoEnosys, "atomic MAP_FIXED overwrite");
+        check_error(page, 3, flags | macosarm::kDarwinMapJit, -1, 0,
+                    macosarm::kDarwinErrnoEnosys, "unimplemented MAP_JIT");
+        check_error(page, 4, flags, -1, 0, macosarm::kDarwinErrnoEnosys,
+                    "unimplemented executable mapping and code-signing");
+        check_error(page, 3, macosarm::kDarwinMapAnonymous | 1U, -1, 0,
+                    macosarm::kDarwinErrnoEnosys, "unimplemented MAP_SHARED");
+        check_error(page, 3, macosarm::kDarwinMapPrivate, 3, 0,
+                    macosarm::kDarwinErrnoEnosys, "unimplemented file mapping");
+        check_error(page, 3, flags, 7, 0, macosarm::kDarwinErrnoEnosys,
+                    "unimplemented anonymous fd alias");
+        check_error(page, 3, flags, -1, 1, macosarm::kDarwinErrnoEnosys,
+                    "unimplemented nonzero anonymous position");
+
+        state = {};
+        state.x[0] = first;
+        state.x[1] = 1U;
+        state.x[16] = macosarm::kDarwinSysMunmap;
+        const auto unmapped = macosarm::dispatch_darwin_syscall(
+            state, vm, svc(), host);
+        expect(static_cast<bool>(unmapped) && state.x[0] == 0 &&
+                   !carry_is_set(state) &&
+                   vm.read(first, readback).error == macosarm::VmError::unmapped,
+               "munmap deallocates a dynamically mapped anonymous guest page");
+        const auto remapped = request(first, 1U, 3U, flags, -1, 0);
+        expect(!carry_is_set(state) && remapped == first &&
+                   static_cast<bool>(vm.read(remapped, readback)) &&
+                   readback[0] == std::byte{0},
+               "mmap reuses freed hint but does not leak stale page contents");
+        expect(host.fds.empty(), "mmap and munmap never invoke host write");
+    }
+
     {
         macosarm::GuestAddressSpace vm;
         CaptureHost host;
