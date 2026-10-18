@@ -192,6 +192,78 @@ int main() {
                "range unmap spans split mappings and deallocates all resident pages");
     }
 
+
+    {
+        // Independent maximum permissions allow anonymous memory to start
+        // inaccessible and later become readable/writable through mprotect.
+        GuestAddressSpace vm;
+        constexpr std::uint64_t base = 0x700000000ULL;
+        constexpr std::uint64_t page = GuestAddressSpace::kPageSize;
+        const auto rw = Protection::read | Protection::write;
+        expect(static_cast<bool>(vm.map(base, 4U * page, rw)),
+               "mprotect fixture maps a maximum-read-write region");
+        const std::array<std::byte, 1> marker{std::byte{0x78}};
+        expect(static_cast<bool>(vm.write(base, marker)) &&
+                   static_cast<bool>(vm.write(base + page, marker)) &&
+                   static_cast<bool>(vm.write(base + 3U * page, marker)),
+               "mprotect fixture initializes guest memory");
+        const auto resident_before = vm.resident_page_count();
+        expect(vm.protect_range(base + 1U, page, Protection::read).error ==
+                   VmError::unaligned &&
+                   vm.protect_range(base, 0U, Protection::read).error == VmError::zero_size &&
+                   vm.protect_range(UINT64_MAX - (page - 1U), 2U * page, rw).error ==
+                       VmError::address_overflow &&
+                   vm.mappings().size() == 1U &&
+                   vm.resident_page_count() == resident_before,
+               "invalid ranges preserve original mapping and resident pages");
+
+        expect(static_cast<bool>(vm.protect_range(
+                   base + page, 2U * page, Protection::read)),
+               "mprotect splits a two-page interior region");
+        const auto split = vm.mappings();
+        expect(split.size() == 3U &&
+                   split[0].base == base && split[0].size == page &&
+                   split[0].protection == rw &&
+                   split[1].base == base + page && split[1].size == 2U * page &&
+                   split[1].protection == Protection::read &&
+                   split[1].maximum_protection == rw &&
+                   split[2].base == base + 3U * page && split[2].size == page &&
+                   split[2].protection == rw,
+               "middle permissions change without affecting either neighboring fragment");
+        expect(vm.write(base + page, marker).error == VmError::protection &&
+                   static_cast<bool>(vm.write(base, marker)) &&
+                   static_cast<bool>(vm.write(base + 3U * page, marker)),
+               "mprotect denies writes only in the downgraded range");
+        expect(vm.protect_range(base, 3U * page, Protection::execute).error ==
+                   VmError::protection &&
+                   vm.mappings()[1].protection == Protection::read,
+               "protection beyond original maximum fails atomically");
+
+        expect(static_cast<bool>(vm.unmap_range(base + 2U * page, page)),
+               "mprotect hole fixture removes an interior page");
+        const auto before_hole = vm.mappings();
+        expect(vm.protect_range(base + page, 3U * page, rw).error ==
+                   VmError::unmapped &&
+                   vm.mappings().size() == before_hole.size() &&
+                   vm.mappings()[1].protection == Protection::read,
+               "gap across a multi-entry mprotect range leaves earlier rights unchanged");
+        expect(static_cast<bool>(vm.protect_range(base + page, page, rw)) &&
+                   static_cast<bool>(vm.write(base + page, marker)),
+               "mprotect restores rights within the saved maximum");
+        GuestAddressSpace anonymous;
+        expect(static_cast<bool>(anonymous.map(base, page, Protection::none, rw)),
+               "anonymous mapping tracks separate current and maximum permissions");
+        std::array<std::byte, 1> readback{};
+        expect(anonymous.read(base, readback).error == VmError::protection,
+               "PROT_NONE prevents reading");
+        expect(static_cast<bool>(anonymous.protect_range(base, page, rw)) &&
+                   static_cast<bool>(anonymous.write(base, marker)),
+               "PROT_NONE can be promoted within the declared maximum");
+        expect(anonymous.map(base + page, page, rw, Protection::read).error ==
+                   VmError::protection,
+               "new mappings cannot request initial protection above maximum");
+    }
+
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return EXIT_FAILURE;

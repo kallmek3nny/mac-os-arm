@@ -41,6 +41,7 @@
 #include "test_dynarmic_pthread_main_thread.inc"
 #include "test_dynarmic_munmap.inc"
 #include "test_dynarmic_anonymous_mmap.inc"
+#include "test_dynarmic_mprotect.inc"
 
 int main() {
     const int legacy_result = legacy_dynarmic_main();
@@ -50,13 +51,15 @@ int main() {
     const int pthread_main_thread_result = dynarmic_pthread_main_thread_init_main();
     const int munmap_result = dynarmic_munmap_main();
     const int anonymous_mmap_result = dynarmic_anonymous_mmap_main();
+    const int mprotect_result = dynarmic_mprotect_main();
     return legacy_result == EXIT_SUCCESS &&
                    pauth_result == EXIT_SUCCESS &&
                    initializer_result == EXIT_SUCCESS &&
                    authenticated_initializer_result == EXIT_SUCCESS &&
                    pthread_main_thread_result == EXIT_SUCCESS &&
                    munmap_result == EXIT_SUCCESS &&
-                   anonymous_mmap_result == EXIT_SUCCESS
+                   anonymous_mmap_result == EXIT_SUCCESS &&
+                   mprotect_result == EXIT_SUCCESS
                ? EXIT_SUCCESS
                : EXIT_FAILURE;
 }

@@ -556,6 +556,90 @@ int main() {
         expect(host.fds.empty(), "mmap and munmap never invoke host write");
     }
 
+
+    {
+        // XNU BSD #74 mprotect translates Mach VM protection failures into
+        // EACCES and unmapped ranges into ENOMEM, preserving adjacent data.
+        macosarm::GuestAddressSpace vm;
+        CaptureHost host;
+        constexpr std::uint64_t base = 0x700000000ULL;
+        constexpr std::uint64_t page = macosarm::GuestAddressSpace::kPageSize;
+        const auto rw = macosarm::Protection::read | macosarm::Protection::write;
+        expect(static_cast<bool>(vm.map(base, 3U * page, rw)),
+               "BSD mprotect test maps three pages");
+        const auto call = [&](std::uint64_t addr, std::uint64_t length,
+                              std::uint32_t prot, std::uint32_t error,
+                              const std::string& label) {
+            macosarm::CpuState state{};
+            state.x[0] = addr;
+            state.x[1] = length;
+            state.x[2] = prot;
+            state.x[16] = macosarm::kDarwinSysMprotect;
+            state.pstate = macosarm::kA64PstateCarry;
+            const auto result = macosarm::dispatch_darwin_syscall(
+                state, vm, svc(), host);
+            expect(static_cast<bool>(result) &&
+                       result.action == macosarm::SyscallAction::resume &&
+                       result.syscall_number == macosarm::kDarwinSysMprotect &&
+                       state.x[0] == error &&
+                       carry_is_set(state) == (error != 0U),
+                   label + " returns source-defined Darwin errno and carry");
+        };
+        call(base + 1U, page, 1U, macosarm::kDarwinErrnoEinval,
+             "unaligned mprotect");
+        call(UINT64_MAX - page + 1U, page + 1U, 1U,
+             macosarm::kDarwinErrnoEinval, "overflowing mprotect");
+        call(base, 0U, 1U, 0U, "zero-size mprotect no-op");
+        call(base + page, 1U, 1U, 0U, "page-rounded mprotect downgrade");
+        constexpr std::array<std::byte, 1> marker{std::byte{0x5e}};
+        std::array<std::byte, 1> readback{};
+        expect(vm.write(base + page, marker).error == macosarm::VmError::protection &&
+                   static_cast<bool>(vm.read(base + page, readback)) &&
+                   static_cast<bool>(vm.write(base, marker)),
+               "mprotect enforces only requested guest-page permissions");
+        call(base, 3U * page, 4U, macosarm::kDarwinErrnoEacces,
+             "mprotect cannot escalate above maximum execute rights");
+        expect(vm.write(base + page, marker).error == macosarm::VmError::protection,
+               "failed EACCES leaves original read-only fragment unchanged");
+        expect(static_cast<bool>(vm.unmap_range(base + 2U * page, page)),
+               "mprotect gap fixture removes last page");
+        call(base + page, 2U * page, 3U, macosarm::kDarwinErrnoEnomem,
+             "mprotect missing guest range");
+        expect(vm.write(base + page, marker).error == macosarm::VmError::protection,
+               "failed ENOMEM does not partially restore earlier permissions");
+        call(base + page, page, 3U, 0U, "mprotect restore maximum-supported write");
+        expect(static_cast<bool>(vm.write(base + page, marker)) && host.fds.empty(),
+               "restored write works without host I/O");
+
+        // BSD mmap (MAP_ANON) supplies RW maximum even if initially READ;
+        // the subsequent BSD mprotect can promote it to RW.
+        macosarm::GuestAddressSpace anon_vm;
+        macosarm::CpuState state{};
+        state.x[1] = page;
+        state.x[2] = 1U;
+        state.x[3] = macosarm::kDarwinMapPrivate | macosarm::kDarwinMapAnonymous;
+        state.x[4] = UINT64_MAX;
+        state.x[16] = macosarm::kDarwinSysMmap;
+        const auto mapped = macosarm::dispatch_darwin_syscall(
+            state, anon_vm, svc(), host);
+        const auto addr = state.x[0];
+        expect(static_cast<bool>(mapped) &&
+                   (state.pstate & macosarm::kA64PstateCarry) == 0 &&
+                   anon_vm.write(addr, marker).error == macosarm::VmError::protection,
+               "anonymous mmap begins read-only");
+        state = {};
+        state.x[0] = addr;
+        state.x[1] = page;
+        state.x[2] = 3U;
+        state.x[16] = macosarm::kDarwinSysMprotect;
+        const auto modified = macosarm::dispatch_darwin_syscall(
+            state, anon_vm, svc(), host);
+        expect(static_cast<bool>(modified) && state.x[0] == 0 &&
+                   !carry_is_set(state) &&
+                   static_cast<bool>(anon_vm.write(addr, marker)),
+               "translated process may promote anonymous memory within its declared maximum");
+    }
+
     {
         macosarm::GuestAddressSpace vm;
         CaptureHost host;
