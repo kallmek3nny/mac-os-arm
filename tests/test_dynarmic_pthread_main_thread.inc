@@ -342,6 +342,69 @@ int dynarmic_pthread_main_thread_init_main() {
         }
     }
 
-    std::cout << "Dynarmic pthread main-thread register ENOSYS and EINVAL preflight passed\n";
+    {
+        // libpthread/src/pthread.c (_pthread_set_self_dyld and
+        // _pthread_set_self_internal) stores BSD thread_selfid into the
+        // arm64 pthread_s::thread_id cell, 8 bytes before the TSD base.
+        // Reuse the same guest VM and MachContext as the full bootstrap above.
+        // This is a separate bounded translated entry, not a larger budget
+        // for the existing 64-instruction main-thread probe.
+        constexpr std::uint64_t id_code = code_base + 0x1000ULL;
+        std::array<std::byte, 8> stale_id{};
+        stale_id.fill(std::byte{0xff});
+        if (!vm.load_bytes(pthread_tsd - 8U, stale_id)) {
+            std::cerr << "FAIL: translated pthread thread_id sentinel load\n";
+            return EXIT_FAILURE;
+        }
+
+        constexpr std::array<std::uint32_t, 16> thread_id_instructions{
+            0xd53bd069U, // mrs x9, TPIDRRO_EL0 -> pthread TSD
+            0xd2802e90U, // mov x16, #372 -> BSD thread_selfid
+            0xd4001001U, // svc #0x80
+            0xd100212aU, // sub x10, x9, #8 -> pthread_s::thread_id
+            0xf9000140U, // str x0, [x10] -> persist complete 64-bit ID
+            0xf940014bU, // ldr x11, [x10] -> compare with second syscall
+            0xd2802e90U, // mov x16, #372 -> BSD thread_selfid
+            0xd4001001U, // svc #0x80
+            0xeb0b001fU, // cmp x0, x11
+            0x54000081U, // b.ne failure
+            0xd2800000U, // mov x0, #0
+            0xd2800030U, // mov x16, #1 -> BSD exit
+            0xd4001001U, // svc #0x80
+            0xd2800c60U, // failure: mov x0, #99
+            0xd2800030U, // mov x16, #1 -> BSD exit
+            0xd4001001U, // svc #0x80
+        };
+        std::array<std::byte, thread_id_instructions.size() * 4U> thread_id_code{};
+        for (std::size_t index = 0; index < thread_id_instructions.size(); ++index) {
+            for (std::size_t byte = 0; byte < 4U; ++byte) {
+                thread_id_code[index * 4U + byte] = static_cast<std::byte>(
+                    (thread_id_instructions[index] >> (byte * 8U)) & 0xffU);
+            }
+        }
+        if (!vm.load_bytes(id_code, thread_id_code)) {
+            std::cerr << "FAIL: translated pthread thread_selfid code load\n";
+            return EXIT_FAILURE;
+        }
+
+        CpuState id_state{};
+        id_state.pc = id_code;
+        id_state.sp = state.sp;
+        id_state.tpidrro_el0 = pthread_tsd;
+        macosarm::DynarmicBackend id_backend;
+        const auto id_result =
+            macosarm::run_process(id_state, vm, id_backend, host, context, 32U);
+        if (id_result.reason != macosarm::ProcessStopReason::exited ||
+            id_result.exit_status != 0 || id_result.instructions_executed != 13U ||
+            id_state.x[11] != context.thread_id() ||
+            pthread_main_read_u64(vm, pthread_tsd - 8U) != context.thread_id() ||
+            context.thread_id() == context.thread_self_port() ||
+            context.thread_id() <= 0xffffffffULL) {
+            std::cerr << "FAIL: translated BSD thread_selfid persists the stable 64-bit pthread ID\n";
+            return EXIT_FAILURE;
+        }
+    }
+
+    std::cout << "Dynarmic pthread main-thread registration and thread_selfid bootstrap passed\n";
     return EXIT_SUCCESS;
 }

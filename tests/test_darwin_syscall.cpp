@@ -1,4 +1,5 @@
 #include "macosarm/darwin_syscall.hpp"
+#include "macosarm/mach_trap.hpp"
 
 #include <algorithm>
 #include <array>
@@ -234,6 +235,34 @@ int main() {
         std::array<std::byte, 56> unchanged{};
         expect(static_cast<bool>(vm.read(buffer_base, unchanged)) && unchanged == record,
                "registration preflight does not mutate guest data");
+    }
+
+    {
+        macosarm::GuestAddressSpace vm;
+        CaptureHost host;
+        macosarm::MachContext context;
+        macosarm::CpuState state{};
+        state.x[16] = macosarm::kDarwinSysThreadSelfid;
+        state.pstate = macosarm::kA64PstateCarry;
+        const auto first = macosarm::dispatch_darwin_syscall(
+            state, vm, svc(), host, context);
+        const std::uint64_t id = state.x[0];
+        expect(static_cast<bool>(first) &&
+                   first.syscall_number == macosarm::kDarwinSysThreadSelfid &&
+                   first.action == macosarm::SyscallAction::resume,
+               "thread_selfid returns through normal BSD syscall dispatch");
+        expect(id == context.thread_id() && id != 0 && id != UINT64_MAX &&
+                   id != context.thread_self_port() && id > UINT32_MAX,
+               "thread_selfid is a stable full-width synthetic thread ID, not a port");
+        expect(!carry_is_set(state), "thread_selfid clears stale BSD carry flag");
+
+        state.x[0] = 0;
+        state.pstate = macosarm::kA64PstateCarry;
+        const auto repeated = macosarm::dispatch_darwin_syscall(
+            state, vm, svc(), host, context);
+        expect(static_cast<bool>(repeated) && state.x[0] == id && !carry_is_set(state),
+               "thread_selfid preserves identity across repeated calls");
+        expect(host.fds.empty(), "thread_selfid never calls host write");
     }
 
     {

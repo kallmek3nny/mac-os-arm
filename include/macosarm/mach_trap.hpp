@@ -76,6 +76,9 @@ class MachContext {
 public:
     static constexpr std::uint32_t kDefaultTaskSelfPort = 0x101;
     static constexpr std::uint32_t kDefaultThreadSelfPort = 0x102;
+    // Single translated main-thread identity, scoped to a MachContext.
+    // This is a userspace rehosting value, not an Apple kernel thread ID.
+    static constexpr std::uint64_t kSyntheticMainThreadId = 0x100000001ULL;
     static constexpr std::uint32_t kDefaultHostSelfPort = 0x103;
     static constexpr std::uint32_t kFirstReplyPort = 0x2000;
     static constexpr std::size_t kMaxReplyPorts = 4096;
@@ -83,6 +86,7 @@ public:
 
     [[nodiscard]] std::uint32_t task_self_port() const noexcept { return task_self_port_; }
     [[nodiscard]] std::uint32_t thread_self_port() const noexcept { return thread_self_port_; }
+    [[nodiscard]] std::uint64_t thread_id() const noexcept { return thread_id_; }
     [[nodiscard]] std::uint32_t host_self_port() const noexcept { return host_self_port_; }
     [[nodiscard]] bool acquire_host_self_send_right() noexcept;
     [[nodiscard]] bool has_host_self_send_right() const noexcept {
@@ -100,6 +104,7 @@ public:
 private:
     std::uint32_t task_self_port_{kDefaultTaskSelfPort};
     std::uint32_t thread_self_port_{kDefaultThreadSelfPort};
+    std::uint64_t thread_id_{kSyntheticMainThreadId};
     std::uint32_t host_self_port_{kDefaultHostSelfPort};
     std::uint32_t host_self_send_refs_{0};
     std::uint32_t next_reply_port_{kFirstReplyPort};
