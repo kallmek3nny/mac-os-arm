@@ -3,17 +3,35 @@
 #include "macosarm/darwin_syscall.hpp"
 
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
 namespace macosarm {
 namespace {
+
+// The rehost models one main thread per context. Give independently created
+// contexts distinct POSIX process IDs without exposing host process identity.
+// Retire the namespace instead of wrapping into a recycled pid.
+std::atomic<std::uint64_t> next_synthetic_process_id{
+    MachContext::kFirstSyntheticProcessId};
+
+[[nodiscard]] std::uint32_t allocate_synthetic_process_id() {
+    const std::uint64_t candidate =
+        next_synthetic_process_id.fetch_add(1U, std::memory_order_relaxed);
+    if (candidate > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+        throw std::overflow_error("synthetic process pid namespace exhausted");
+    }
+    return static_cast<std::uint32_t>(candidate);
+}
+
 
 [[nodiscard]] std::optional<std::uint64_t> round_up_guest_page(std::uint64_t size) noexcept {
     if (size == 0) {
@@ -518,6 +536,8 @@ constexpr std::array<std::uint32_t, kHostPriorityInfoCount> kHostPriorityInfoVal
 }
 
 } // namespace
+
+MachContext::MachContext() : process_id_(allocate_synthetic_process_id()) {}
 
 bool MachContext::acquire_host_self_send_right() noexcept {
     if (host_self_send_refs_ == std::numeric_limits<std::uint32_t>::max()) {
