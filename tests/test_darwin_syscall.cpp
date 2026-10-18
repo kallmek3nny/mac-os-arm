@@ -381,6 +381,71 @@ int main() {
         expect(host.fds.empty(), "thread creation never calls host write");
     }
 
+
+    {
+        // XNU BSD #73 munmap -> mach_vm_deallocate. The address must be
+        // page-aligned, length nonzero, and range nonwrapping. Lengths
+        // within a page round up before changing guest page mappings.
+        macosarm::GuestAddressSpace vm;
+        CaptureHost host;
+        constexpr std::uint64_t page = macosarm::GuestAddressSpace::kPageSize;
+        constexpr std::uint64_t base = 0x500000000ULL;
+        const auto rw = macosarm::Protection::read | macosarm::Protection::write;
+        expect(static_cast<bool>(vm.map(base, 3U * page, rw)),
+               "bsd munmap test maps three guest pages");
+        std::array<std::byte, 1> marker{std::byte{0x4b}};
+        expect(static_cast<bool>(vm.write(base, marker)) &&
+                   static_cast<bool>(vm.write(base + page, marker)) &&
+                   static_cast<bool>(vm.write(base + 2U * page, marker)),
+               "bsd munmap fixture writes each guest page");
+
+        macosarm::CpuState state{};
+        const auto call = [&](std::uint64_t address,
+                              std::uint64_t length,
+                              std::uint32_t expected_errno,
+                              const std::string& label) {
+            state = {};
+            state.pstate = macosarm::kA64PstateCarry;
+            state.x[0] = address;
+            state.x[1] = length;
+            state.x[16] = macosarm::kDarwinSysMunmap;
+            const auto result = macosarm::dispatch_darwin_syscall(state, vm, svc(), host);
+            expect(static_cast<bool>(result) &&
+                       result.syscall_number == macosarm::kDarwinSysMunmap &&
+                       result.action == macosarm::SyscallAction::resume &&
+                       state.x[0] == expected_errno &&
+                       carry_is_set(state) == (expected_errno != 0U),
+                   label + " returns Darwin errno and carry");
+        };
+
+        call(base + 1U, page, macosarm::kDarwinErrnoEinval,
+             "unaligned munmap start");
+        call(base + page, 0U, macosarm::kDarwinErrnoEinval,
+             "zero-length munmap");
+        call(UINT64_MAX - 1U, 4U, macosarm::kDarwinErrnoEinval,
+             "wrapping munmap range");
+        call(0xffffffffffffc000ULL, page + 1U, macosarm::kDarwinErrnoEinval,
+             "rounded munmap end overflow");
+        expect(vm.mappings().size() == 1U && vm.resident_page_count() == 3U,
+               "invalid munmap preserves original mapping and resident pages");
+
+        call(base + page, 1U, 0U, "subpage length rounds to guest page");
+        std::array<std::byte, 1> readback{};
+        expect(vm.read(base + page, readback).error == macosarm::VmError::unmapped,
+               "bsd munmap removes rounded guest page");
+        expect(static_cast<bool>(vm.read(base, readback)) &&
+                   readback == marker &&
+                   static_cast<bool>(vm.read(base + 2U * page, readback)) &&
+                   readback == marker &&
+                   vm.resident_page_count() == 2U,
+               "bsd munmap leaves adjacent resident pages untouched");
+        call(base + page, 1U, 0U, "repeat munmap over an existing hole");
+        call(base, 3U * page, 0U, "munmap spans fragmented mapping and hole");
+        expect(vm.mappings().empty() && vm.resident_page_count() == 0U &&
+                   host.fds.empty(),
+               "bsd munmap finishes without host writes or leaked guest pages");
+    }
+
     {
         macosarm::GuestAddressSpace vm;
         CaptureHost host;

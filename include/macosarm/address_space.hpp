@@ -60,6 +60,10 @@ public:
 
     [[nodiscard]] VmResult map(std::uint64_t base, std::uint64_t size, Protection protection);
     [[nodiscard]] VmResult unmap(std::uint64_t base, std::uint64_t size);
+    // Range removal for Darwin munmap: accepts page-aligned subranges,
+    // splits surviving mappings, and treats holes as already unmapped.
+    // Unlike unmap(), this is not an exact-mapping operation.
+    [[nodiscard]] VmResult unmap_range(std::uint64_t base, std::uint64_t size);
     [[nodiscard]] VmResult protect(std::uint64_t base, std::uint64_t size, Protection protection);
 
     // Loader-only population path. This intentionally ignores guest write permission
