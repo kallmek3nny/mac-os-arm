@@ -204,8 +204,9 @@ VmResult GuestAddressSpace::load_bytes(std::uint64_t address, std::span<const st
     if (bytes.empty()) {
         return {};
     }
-    if (find_mapping(address, bytes.size()) == nullptr) {
-        return {VmError::unmapped};
+    const VmResult validation = validate_range(address, bytes.size(), Protection::none);
+    if (!validation) {
+        return validation;
     }
     return copy_into(address, bytes);
 }
@@ -214,12 +215,9 @@ VmResult GuestAddressSpace::read(std::uint64_t address, std::span<std::byte> out
     if (out.empty()) {
         return {};
     }
-    const Mapping* mapping = find_mapping(address, out.size());
-    if (mapping == nullptr) {
-        return {VmError::unmapped};
-    }
-    if (!has_protection(mapping->protection, Protection::read)) {
-        return {VmError::protection};
+    const VmResult validation = validate_range(address, out.size(), Protection::read);
+    if (!validation) {
+        return validation;
     }
     return copy_out(address, out);
 }
@@ -228,12 +226,9 @@ VmResult GuestAddressSpace::fetch_code(std::uint64_t address, std::span<std::byt
     if (out.empty()) {
         return {};
     }
-    const Mapping* mapping = find_mapping(address, out.size());
-    if (mapping == nullptr) {
-        return {VmError::unmapped};
-    }
-    if (!has_protection(mapping->protection, Protection::execute)) {
-        return {VmError::protection};
+    const VmResult validation = validate_range(address, out.size(), Protection::execute);
+    if (!validation) {
+        return validation;
     }
     return copy_out(address, out);
 }
@@ -242,12 +237,9 @@ VmResult GuestAddressSpace::write(std::uint64_t address, std::span<const std::by
     if (bytes.empty()) {
         return {};
     }
-    const Mapping* mapping = find_mapping(address, bytes.size());
-    if (mapping == nullptr) {
-        return {VmError::unmapped};
-    }
-    if (!has_protection(mapping->protection, Protection::write)) {
-        return {VmError::protection};
+    const VmResult validation = validate_range(address, bytes.size(), Protection::write);
+    if (!validation) {
+        return validation;
     }
     return copy_into(address, bytes);
 }
@@ -256,14 +248,7 @@ VmResult GuestAddressSpace::probe_write(std::uint64_t address, std::size_t size)
     if (size == 0) {
         return {};
     }
-    const Mapping* mapping = find_mapping(address, size);
-    if (mapping == nullptr) {
-        return {VmError::unmapped};
-    }
-    if (!has_protection(mapping->protection, Protection::write)) {
-        return {VmError::protection};
-    }
-    return {};
+    return validate_range(address, size, Protection::write);
 }
 
 std::vector<Mapping> GuestAddressSpace::mappings() const {
@@ -276,24 +261,40 @@ std::vector<Mapping> GuestAddressSpace::mappings() const {
     return result;
 }
 
-const Mapping* GuestAddressSpace::find_mapping(std::uint64_t address, std::uint64_t size) const {
-    if (size == 0 || range_overflows(address, size)) {
-        return nullptr;
+VmResult GuestAddressSpace::validate_range(
+    std::uint64_t address, std::uint64_t size, Protection required) const noexcept {
+    if (size == 0) {
+        return {};
+    }
+    if (range_overflows(address, size)) {
+        return {VmError::unmapped};
     }
 
-    auto next = mappings_.upper_bound(address);
-    if (next == mappings_.begin()) {
-        return nullptr;
+    const std::uint64_t end = address + size;
+    std::uint64_t cursor = address;
+    auto it = mappings_.upper_bound(address);
+    if (it != mappings_.begin()) {
+        --it;
     }
-    --next;
 
-    const Mapping& mapping = next->second;
-    const std::uint64_t request_end = address + size;
-    const std::uint64_t mapping_end = mapping.base + mapping.size;
-    if (address < mapping.base || request_end > mapping_end) {
-        return nullptr;
+    // A contiguous VM span may contain several mapping records after a
+    // page-granular mprotect or an adjacent independent map. Validate the
+    // entire span before copying any data, including mixed-rights pages.
+    while (cursor < end) {
+        while (it != mappings_.end() &&
+               it->second.base + it->second.size <= cursor) {
+            ++it;
+        }
+        if (it == mappings_.end() || it->second.base > cursor) {
+            return {VmError::unmapped};
+        }
+        if (!has_protection(it->second.protection, required)) {
+            return {VmError::protection};
+        }
+        cursor = std::min(end, it->second.base + it->second.size);
+        ++it;
     }
-    return &mapping;
+    return {};
 }
 
 Mapping* GuestAddressSpace::find_exact_mapping(std::uint64_t base, std::uint64_t size) {

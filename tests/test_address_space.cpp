@@ -264,6 +264,75 @@ int main() {
                "new mappings cannot request initial protection above maximum");
     }
 
+
+    {
+        // An mprotect split must not break ordinary access that spans two
+        // contiguous VM records. Validate every page before any copyout.
+        GuestAddressSpace vm;
+        constexpr std::uint64_t base = 0x800000000ULL;
+        constexpr std::uint64_t page = GuestAddressSpace::kPageSize;
+        constexpr std::uint64_t crossing = base + page - 3U;
+        const auto rw = Protection::read | Protection::write;
+        const std::array<std::byte, 6> original{
+            std::byte{0x11}, std::byte{0x22}, std::byte{0x33},
+            std::byte{0x44}, std::byte{0x55}, std::byte{0x66}};
+        const std::array<std::byte, 6> replacement{
+            std::byte{0x81}, std::byte{0x82}, std::byte{0x83},
+            std::byte{0x84}, std::byte{0x85}, std::byte{0x86}};
+        std::array<std::byte, 6> readback{};
+        expect(static_cast<bool>(vm.map(base, 2U * page, rw)) &&
+                   static_cast<bool>(vm.protect_range(
+                       base + page, page, Protection::read)),
+               "cross-fragment fixture creates a protected interior boundary");
+        expect(static_cast<bool>(vm.load_bytes(crossing, original)) &&
+                   static_cast<bool>(vm.read(crossing, readback)) &&
+                   readback == original,
+               "loader and reader span adjacent mapping records");
+        expect(vm.probe_write(crossing, replacement.size()).error ==
+                   VmError::protection &&
+                   vm.write(crossing, replacement).error == VmError::protection,
+               "later read-only fragment rejects the entire guest write");
+        expect(static_cast<bool>(vm.read(crossing, readback)) &&
+                   readback == original,
+               "failed cross-fragment write preserves the earlier writable page");
+        expect(static_cast<bool>(vm.protect_range(base + page, page, rw)) &&
+                   static_cast<bool>(vm.probe_write(crossing, replacement.size())) &&
+                   static_cast<bool>(vm.write(crossing, replacement)) &&
+                   static_cast<bool>(vm.read(crossing, readback)) &&
+                   readback == replacement,
+               "restored rights permit atomic cross-fragment copyin and copyout");
+        expect(static_cast<bool>(vm.map(base + 2U * page, page, rw)) &&
+                   static_cast<bool>(vm.write(base + 2U * page - 3U, original)),
+               "cross-fragment access spans separately created adjacent mappings");
+        expect(static_cast<bool>(vm.unmap_range(base + page, page)) &&
+                   vm.probe_write(crossing, replacement.size()).error == VmError::unmapped &&
+                   vm.write(crossing, replacement).error == VmError::unmapped,
+               "a true hole is still rejected even when the first page is mapped");
+        std::array<std::byte, 3> surviving{};
+        expect(static_cast<bool>(vm.read(base + page - 3U, surviving)) &&
+                   surviving[0] == replacement[0] && surviving[1] == replacement[1] &&
+                   surviving[2] == replacement[2],
+               "failed write through a hole preserves the resident prefix");
+        expect(vm.read(UINT64_MAX - 2U, readback).error == VmError::unmapped,
+               "wrapping cross-fragment reads fail without overflow");
+
+        GuestAddressSpace executable;
+        const auto rx = Protection::read | Protection::execute;
+        expect(static_cast<bool>(executable.map(base, 2U * page, rx)) &&
+                   static_cast<bool>(executable.load_bytes(crossing, original)) &&
+                   static_cast<bool>(executable.protect_range(
+                       base + page, page, Protection::read)),
+               "instruction-fetch fixture has adjacent pages with different rights");
+        readback.fill(std::byte{0xfe});
+        expect(executable.fetch_code(crossing, readback).error == VmError::protection &&
+                   readback[0] == std::byte{0xfe},
+               "cross-boundary fetch rejects a non-executable suffix without copying");
+        expect(static_cast<bool>(executable.protect_range(base + page, page, rx)) &&
+                   static_cast<bool>(executable.fetch_code(crossing, readback)) &&
+                   readback == original,
+               "instruction fetch spans adjacent executable mapping fragments");
+    }
+
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return EXIT_FAILURE;
