@@ -172,6 +172,13 @@ SyscallDispatchResult dispatch_darwin_syscall(
         return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
     case kDarwinSysBsdthreadRegister:
         return dispatch_bsdthread_register_preflight(state, address_space, syscall_number);
+    case kDarwinSysBsdthreadCreate:
+        // libpthread/kern/kern_support.c: _bsdthread_create rejects a
+        // process before allocating a thread when proc_get_register(p) == 0.
+        // Our bsdthread_register cannot succeed yet; remain unregistered and
+        // reject creation with XNU's EINVAL, without claiming thread support.
+        set_error(state, kDarwinErrnoEinval);
+        return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
     case kDarwinSysThreadSelfid:
         // _thread_selfid reports a 64-bit thread ID, not the Mach port name.
         // The rehost currently models exactly one main thread per context.

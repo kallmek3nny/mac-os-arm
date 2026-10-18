@@ -14,6 +14,7 @@ constexpr std::uint32_t kDarwinSvcImmediate = 0x80;
 constexpr std::uint64_t kDarwinSysExit = 1;
 constexpr std::uint64_t kDarwinSysWrite = 4;
 constexpr std::uint64_t kDarwinSysGetpid = 20;
+constexpr std::uint64_t kDarwinSysBsdthreadCreate = 360;
 constexpr std::uint64_t kDarwinSysBsdthreadRegister = 366;
 constexpr std::uint64_t kDarwinSysThreadSelfid = 372;
 constexpr std::uint32_t kDarwinErrnoEio = 5;
