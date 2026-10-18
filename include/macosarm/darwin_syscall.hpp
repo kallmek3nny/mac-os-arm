@@ -14,11 +14,14 @@ constexpr std::uint32_t kDarwinSvcImmediate = 0x80;
 constexpr std::uint64_t kDarwinSysExit = 1;
 constexpr std::uint64_t kDarwinSysWrite = 4;
 constexpr std::uint64_t kDarwinSysBsdthreadRegister = 366;
+constexpr std::uint64_t kDarwinSysThreadSelfid = 372;
 constexpr std::uint32_t kDarwinErrnoEio = 5;
 constexpr std::uint32_t kDarwinErrnoEinval = 22;
 constexpr std::uint32_t kDarwinErrnoEfault = 14;
 constexpr std::uint32_t kDarwinErrnoEnosys = 78;
 constexpr std::uint32_t kA64PstateCarry = 1u << 29;
+
+class MachContext;
 
 struct HostWriteResult {
     std::uint64_t bytes_written{};
@@ -66,6 +69,15 @@ struct SyscallDispatchResult {
     GuestAddressSpace& address_space,
     const ExecutionResult& execution,
     DarwinHostServices& host);
+
+// Process execution passes its shared Mach context, keeping BSD thread IDs
+// consistent across translated initializers, main, and Mach traps.
+[[nodiscard]] SyscallDispatchResult dispatch_darwin_syscall(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    const ExecutionResult& execution,
+    DarwinHostServices& host,
+    const MachContext& context);
 
 [[nodiscard]] std::string_view syscall_dispatch_error_name(SyscallDispatchError error) noexcept;
 

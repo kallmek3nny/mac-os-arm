@@ -1,4 +1,5 @@
 #include "macosarm/darwin_syscall.hpp"
+#include "macosarm/mach_trap.hpp"
 
 #include <algorithm>
 #include <array>
@@ -143,7 +144,8 @@ SyscallDispatchResult dispatch_darwin_syscall(
     CpuState& state,
     GuestAddressSpace& address_space,
     const ExecutionResult& execution,
-    DarwinHostServices& host) {
+    DarwinHostServices& host,
+    const MachContext& context) {
 
     if (execution.reason != StopReason::supervisor_call) {
         return {SyscallDispatchError::not_supervisor_call, SyscallAction::resume, 0, 0};
@@ -165,10 +167,24 @@ SyscallDispatchResult dispatch_darwin_syscall(
         return dispatch_write(state, address_space, host, syscall_number);
     case kDarwinSysBsdthreadRegister:
         return dispatch_bsdthread_register_preflight(state, address_space, syscall_number);
+    case kDarwinSysThreadSelfid:
+        // _thread_selfid reports a 64-bit thread ID, not the Mach port name.
+        // The rehost currently models exactly one main thread per context.
+        set_success(state, context.thread_id());
+        return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
     default:
         set_error(state, kDarwinErrnoEnosys);
         return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
     }
+}
+
+SyscallDispatchResult dispatch_darwin_syscall(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    const ExecutionResult& execution,
+    DarwinHostServices& host) {
+    MachContext context;
+    return dispatch_darwin_syscall(state, address_space, execution, host, context);
 }
 
 std::string_view syscall_dispatch_error_name(SyscallDispatchError error) noexcept {

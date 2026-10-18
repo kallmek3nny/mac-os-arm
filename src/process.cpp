@@ -78,7 +78,7 @@ ProcessResult run_process(
                 }
             } else {
                 const SyscallDispatchResult dispatch =
-                    dispatch_darwin_syscall(state, address_space, execution, host);
+                    dispatch_darwin_syscall(state, address_space, execution, host, mach_context);
                 if (!dispatch) {
                     return {
                         ProcessStopReason::syscall_error,
