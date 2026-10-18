@@ -310,8 +310,8 @@ int main() {
                "a true hole is still rejected even when the first page is mapped");
         std::array<std::byte, 3> surviving{};
         expect(static_cast<bool>(vm.read(base + page - 3U, surviving)) &&
-                   surviving[0] == original[0] && surviving[1] == original[1] &&
-                   surviving[2] == original[2],
+                   surviving[0] == replacement[0] && surviving[1] == replacement[1] &&
+                   surviving[2] == replacement[2],
                "failed write through a hole preserves the resident prefix");
         expect(vm.read(UINT64_MAX - 2U, readback).error == VmError::unmapped,
                "wrapping cross-fragment reads fail without overflow");
