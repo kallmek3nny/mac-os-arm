@@ -90,7 +90,10 @@ public:
 private:
     using Page = std::array<std::byte, kPageSize>;
 
-    [[nodiscard]] const Mapping* find_mapping(std::uint64_t address, std::uint64_t size) const;
+    // Check every contiguous fragment before a guest operation; protection
+    // splits do not turn neighboring virtual pages into holes.
+    [[nodiscard]] VmResult validate_range(std::uint64_t address, std::uint64_t size,
+                                          Protection required) const noexcept;
     [[nodiscard]] Mapping* find_exact_mapping(std::uint64_t base, std::uint64_t size);
     [[nodiscard]] VmResult copy_out(std::uint64_t address, std::span<std::byte> out) const;
     [[nodiscard]] VmResult copy_into(std::uint64_t address, std::span<const std::byte> bytes);
