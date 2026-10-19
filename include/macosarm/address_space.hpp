@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <unordered_map>
@@ -34,6 +35,8 @@ struct Mapping {
     std::uint64_t size{};
     Protection protection{Protection::none};
     Protection maximum_protection{Protection::none};
+    // Stable backing allocation identity, preserved through mprotect splits.
+    std::uint64_t allocation_id{};
 };
 
 enum class VmError {
@@ -45,6 +48,7 @@ enum class VmError {
     unmapped,
     protection,
     not_exact_mapping,
+    resource_exhausted,
 };
 
 struct VmResult {
@@ -67,6 +71,12 @@ public:
     // splits surviving mappings, and treats holes as already unmapped.
     // Unlike unmap(), this is not an exact-mapping operation.
     [[nodiscard]] VmResult unmap_range(std::uint64_t base, std::uint64_t size);
+    // Reclaim only if *every* page still belongs to the original map call.
+    // Reject guest-replaced mappings without touching any of their pages.
+    [[nodiscard]] VmResult unmap_allocation(
+        std::uint64_t base, std::uint64_t size, std::uint64_t allocation_id);
+    [[nodiscard]] std::optional<std::uint64_t> allocation_id_at(
+        std::uint64_t address) const noexcept;
     [[nodiscard]] VmResult protect(std::uint64_t base, std::uint64_t size, Protection protection);
     // Transactional subrange permissions for BSD mprotect; reject holes
     // or requests beyond the original mapping maximum before mutation.
@@ -100,6 +110,7 @@ private:
     [[nodiscard]] Page& page_for_write(std::uint64_t page_base);
 
     std::map<std::uint64_t, Mapping> mappings_;
+    std::uint64_t next_allocation_id_{1};
     std::unordered_map<std::uint64_t, std::unique_ptr<Page>> pages_;
 };
 

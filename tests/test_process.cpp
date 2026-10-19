@@ -100,6 +100,7 @@ void load_message(
 } // namespace
 
 #include "test_guest_threads_direct.inc"
+#include "test_owned_guest_stacks.inc"
 
 int main() {
     constexpr std::uint64_t data_base = 0x200000000ULL;
@@ -256,6 +257,7 @@ int main() {
     }
 
     test_guest_threads_direct();
+    test_owned_guest_stacks();
 
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";

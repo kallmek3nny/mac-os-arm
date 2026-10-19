@@ -47,7 +47,12 @@ VmResult GuestAddressSpace::map(std::uint64_t base, std::uint64_t size,
     if (!has_protection(maximum_protection, protection)) {
         return {VmError::protection};
     }
-    mappings_.emplace(base, Mapping{base, size, protection, maximum_protection});
+    if (next_allocation_id_ == std::numeric_limits<std::uint64_t>::max()) {
+        return {VmError::resource_exhausted};
+    }
+    mappings_.emplace(base, Mapping{
+        base, size, protection, maximum_protection, next_allocation_id_});
+    ++next_allocation_id_;
     return {};
 }
 
@@ -103,13 +108,15 @@ VmResult GuestAddressSpace::unmap_range(std::uint64_t base, std::uint64_t size) 
             mappings_.emplace(
                 current.base,
                 Mapping{current.base, base - current.base,
-                        current.protection, current.maximum_protection});
+                        current.protection, current.maximum_protection,
+                        current.allocation_id});
         }
         if (current_end > end) {
             mappings_.emplace(
                 end,
                 Mapping{end, current_end - end,
-                        current.protection, current.maximum_protection});
+                        current.protection, current.maximum_protection,
+                        current.allocation_id});
             break;
         }
     }
@@ -123,6 +130,41 @@ VmResult GuestAddressSpace::unmap_range(std::uint64_t base, std::uint64_t size) 
     }
     // vm_map_remove(..., VM_MAP_REMOVE_NO_FLAGS) tolerates holes.
     return {};
+}
+
+std::optional<std::uint64_t> GuestAddressSpace::allocation_id_at(
+    std::uint64_t address) const noexcept {
+    auto it = mappings_.upper_bound(address);
+    if (it == mappings_.begin()) return std::nullopt;
+    --it;
+    if (address >= it->second.base + it->second.size) return std::nullopt;
+    return it->second.allocation_id;
+}
+
+VmResult GuestAddressSpace::unmap_allocation(
+    std::uint64_t base, std::uint64_t size, std::uint64_t allocation_id) {
+    if (size == 0) return {VmError::zero_size};
+    if ((base % kPageSize) != 0 || (size % kPageSize) != 0) {
+        return {VmError::unaligned};
+    }
+    if (range_overflows(base, size)) return {VmError::address_overflow};
+    if (allocation_id == 0) return {VmError::not_exact_mapping};
+
+    const std::uint64_t end = base + size;
+    std::uint64_t cursor = base;
+    auto it = mappings_.upper_bound(base);
+    if (it != mappings_.begin()) --it;
+    while (cursor < end) {
+        while (it != mappings_.end() &&
+               it->second.base + it->second.size <= cursor) ++it;
+        if (it == mappings_.end() || it->second.base > cursor ||
+            it->second.allocation_id != allocation_id) {
+            return {VmError::not_exact_mapping};
+        }
+        cursor = std::min(end, it->second.base + it->second.size);
+        ++it;
+    }
+    return unmap_range(base, size);
 }
 
 VmResult GuestAddressSpace::protect(std::uint64_t base, std::uint64_t size, Protection protection) {
@@ -185,15 +227,18 @@ VmResult GuestAddressSpace::protect_range(
         if (mapping.base < change_start) {
             updated.emplace(mapping.base, Mapping{
                 mapping.base, change_start - mapping.base,
-                mapping.protection, mapping.maximum_protection});
+                mapping.protection, mapping.maximum_protection,
+                mapping.allocation_id});
         }
         updated.emplace(change_start, Mapping{
             change_start, change_end - change_start,
-            protection, mapping.maximum_protection});
+            protection, mapping.maximum_protection,
+            mapping.allocation_id});
         if (change_end < mapping_end) {
             updated.emplace(change_end, Mapping{
                 change_end, mapping_end - change_end,
-                mapping.protection, mapping.maximum_protection});
+                mapping.protection, mapping.maximum_protection,
+                mapping.allocation_id});
         }
     }
     mappings_.swap(updated);
@@ -358,6 +403,7 @@ std::string_view vm_error_name(VmError error) noexcept {
     case VmError::unmapped: return "unmapped";
     case VmError::protection: return "protection";
     case VmError::not_exact_mapping: return "not_exact_mapping";
+    case VmError::resource_exhausted: return "resource_exhausted";
     }
     return "unknown";
 }
