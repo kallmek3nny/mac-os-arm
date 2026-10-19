@@ -276,7 +276,9 @@ void write_u32_le(
     const Protection protection = decode_vm_protection(static_cast<std::uint32_t>(raw_protection));
     const VmResult result = address_space.protect(address, *rounded_size, protection);
     if (!result) {
-        return guest_mach_return(state, trap_number, kMachKernInvalidAddress);
+        return guest_mach_return(state, trap_number,
+            result.error == VmError::protection
+                ? kMachKernProtectionFailure : kMachKernInvalidAddress);
     }
     return guest_mach_return(state, trap_number, kMachKernSuccess);
 }

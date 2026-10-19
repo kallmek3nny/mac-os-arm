@@ -172,7 +172,12 @@ VmResult GuestAddressSpace::protect(std::uint64_t base, std::uint64_t size, Prot
     if (mapping == nullptr) {
         return {VmError::not_exact_mapping};
     }
-    if (!has_protection(mapping->maximum_protection, protection)) {
+    // The exact-map API also serves trusted callers and historically permits
+    // broader protection changes. Preserve this legacy Mach contract, but
+    // never let that path restore a sealed max-NONE guard page.
+    // Guest BSD mprotect uses protect_range(), which enforces all max rights.
+    if (mapping->maximum_protection == Protection::none &&
+        protection != Protection::none) {
         return {VmError::protection};
     }
     mapping->protection = protection;
