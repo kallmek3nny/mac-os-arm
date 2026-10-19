@@ -539,6 +539,13 @@ constexpr std::array<std::uint32_t, kHostPriorityInfoCount> kHostPriorityInfoVal
 
 MachContext::MachContext() : process_id_(allocate_synthetic_process_id()) {}
 
+std::optional<MachThreadIdentity> MachContext::allocate_worker_thread_identity() noexcept {
+    if (allocated_worker_threads_ >= kMaxGuestThreads - 1U) return std::nullopt;
+    const std::uint32_t index = allocated_worker_threads_++;
+    return MachThreadIdentity{
+        kSyntheticMainThreadId + 1U + index, kFirstWorkerThreadPort + index};
+}
+
 bool MachContext::acquire_host_self_send_right() noexcept {
     if (host_self_send_refs_ == std::numeric_limits<std::uint32_t>::max()) {
         return false;
@@ -624,7 +631,8 @@ MachTrapDispatchResult dispatch_mach_trap(
     CpuState& state,
     GuestAddressSpace& address_space,
     const ExecutionResult& execution,
-    MachContext& context) {
+    MachContext& context,
+    const MachThreadIdentity* current_thread) {
 
     if (execution.reason != StopReason::supervisor_call) {
         return {MachTrapDispatchError::not_supervisor_call, 0, 0};
@@ -657,9 +665,13 @@ MachTrapDispatchResult dispatch_mach_trap(
         state.x[0] = *allocated;
         return {MachTrapDispatchError::none, trap_number, *allocated};
     }
-    case kMachTrapThreadSelf:
-        state.x[0] = context.thread_self_port();
-        return {MachTrapDispatchError::none, trap_number, context.thread_self_port()};
+    case kMachTrapThreadSelf: {
+        const std::uint32_t port = current_thread != nullptr
+                                       ? current_thread->thread_self_port
+                                       : context.thread_self_port();
+        state.x[0] = port;
+        return {MachTrapDispatchError::none, trap_number, port};
+    }
     case kMachTrapTaskSelf:
         state.x[0] = context.task_self_port();
         return {MachTrapDispatchError::none, trap_number, context.task_self_port()};
@@ -675,6 +687,14 @@ MachTrapDispatchResult dispatch_mach_trap(
     default:
         return {MachTrapDispatchError::unsupported_trap, trap_number, 0};
     }
+}
+
+MachTrapDispatchResult dispatch_mach_trap(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    const ExecutionResult& execution,
+    MachContext& context) {
+    return dispatch_mach_trap(state, address_space, execution, context, nullptr);
 }
 
 std::string_view mach_trap_dispatch_error_name(MachTrapDispatchError error) noexcept {

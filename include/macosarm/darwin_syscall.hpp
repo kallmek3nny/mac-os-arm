@@ -36,6 +36,7 @@ constexpr std::uint32_t kDarwinMapAnonymous = 0x1000;
 constexpr std::uint32_t kDarwinMapUnix03 = 0x40000;
 
 class MachContext;
+struct MachThreadIdentity;
 
 struct HostWriteResult {
     std::uint64_t bytes_written{};
@@ -92,6 +93,14 @@ struct SyscallDispatchResult {
     const ExecutionResult& execution,
     DarwinHostServices& host,
     const MachContext& context);
+
+[[nodiscard]] SyscallDispatchResult dispatch_darwin_syscall(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    const ExecutionResult& execution,
+    DarwinHostServices& host,
+    const MachContext& context,
+    const MachThreadIdentity* current_thread);
 
 [[nodiscard]] std::string_view syscall_dispatch_error_name(SyscallDispatchError error) noexcept;
 

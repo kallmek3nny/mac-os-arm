@@ -72,6 +72,12 @@ constexpr std::size_t kMachMsgHeaderSize = 24;
 constexpr std::size_t kMachMsgMaxInlineSize = 1024 * 1024;
 constexpr std::size_t kMachMsgMaxQueueDepth = 64;
 
+// Per-context identity for a translated guest thread, not a host pthread.
+struct MachThreadIdentity {
+    std::uint64_t thread_id{};
+    std::uint32_t thread_self_port{};
+};
+
 class MachContext {
 public:
     // Synthetic POSIX pid namespace: one stable pid per translated process
@@ -82,6 +88,8 @@ public:
     // Single translated main-thread identity, scoped to a MachContext.
     // This is a userspace rehosting value, not an Apple kernel thread ID.
     static constexpr std::uint64_t kSyntheticMainThreadId = 0x100000001ULL;
+    static constexpr std::uint32_t kFirstWorkerThreadPort = 0x10000;
+    static constexpr std::size_t kMaxGuestThreads = 64;
     static constexpr std::uint32_t kDefaultHostSelfPort = 0x103;
     static constexpr std::uint32_t kFirstReplyPort = 0x2000;
     static constexpr std::size_t kMaxReplyPorts = 4096;
@@ -94,6 +102,10 @@ public:
     [[nodiscard]] std::uint32_t thread_self_port() const noexcept { return thread_self_port_; }
     [[nodiscard]] std::uint64_t thread_id() const noexcept { return thread_id_; }
     [[nodiscard]] std::uint32_t host_self_port() const noexcept { return host_self_port_; }
+    [[nodiscard]] MachThreadIdentity main_thread_identity() const noexcept {
+        return {thread_id_, thread_self_port_};
+    }
+    [[nodiscard]] std::optional<MachThreadIdentity> allocate_worker_thread_identity() noexcept;
     [[nodiscard]] bool acquire_host_self_send_right() noexcept;
     [[nodiscard]] bool has_host_self_send_right() const noexcept {
         return host_self_send_refs_ != 0;
@@ -115,6 +127,7 @@ private:
     std::uint32_t host_self_port_{kDefaultHostSelfPort};
     std::uint32_t host_self_send_refs_{0};
     std::uint32_t next_reply_port_{kFirstReplyPort};
+    std::uint32_t allocated_worker_threads_{0};
     std::unordered_map<std::uint32_t, std::deque<std::vector<std::byte>>> receive_queues_;
 };
 
@@ -144,6 +157,13 @@ struct MachTrapDispatchResult {
     GuestAddressSpace& address_space,
     const ExecutionResult& execution,
     MachContext& context);
+
+[[nodiscard]] MachTrapDispatchResult dispatch_mach_trap(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    const ExecutionResult& execution,
+    MachContext& context,
+    const MachThreadIdentity* current_thread);
 
 [[nodiscard]] std::string_view mach_trap_dispatch_error_name(MachTrapDispatchError error) noexcept;
 

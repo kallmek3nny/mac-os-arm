@@ -1,5 +1,6 @@
 #include "macosarm/dynarmic_backend.hpp"
 #include "macosarm/process.hpp"
+#include "macosarm/guest_threads.hpp"
 
 #include <array>
 #include <cstddef>
@@ -42,6 +43,7 @@
 #include "test_dynarmic_munmap.inc"
 #include "test_dynarmic_anonymous_mmap.inc"
 #include "test_dynarmic_mprotect.inc"
+#include "test_dynarmic_cooperative_threads.inc"
 #include "test_dynarmic_cross_mapping_memory.inc"
 
 int main() {
@@ -53,6 +55,7 @@ int main() {
     const int munmap_result = dynarmic_munmap_main();
     const int anonymous_mmap_result = dynarmic_anonymous_mmap_main();
     const int mprotect_result = dynarmic_mprotect_main();
+    const int thread_group_result = dynarmic_cooperative_threads_main();
     const int cross_mapping_result = dynarmic_cross_mapping_memory_main();
     return legacy_result == EXIT_SUCCESS &&
                    pauth_result == EXIT_SUCCESS &&
@@ -62,6 +65,7 @@ int main() {
                    munmap_result == EXIT_SUCCESS &&
                    anonymous_mmap_result == EXIT_SUCCESS &&
                    mprotect_result == EXIT_SUCCESS &&
+                   thread_group_result == EXIT_SUCCESS &&
                    cross_mapping_result == EXIT_SUCCESS
                ? EXIT_SUCCESS
                : EXIT_FAILURE;

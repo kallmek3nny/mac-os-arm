@@ -43,6 +43,16 @@ struct ProcessResult {
     DarwinHostServices& host,
     std::uint64_t instruction_budget);
 
+// Alternate explicit guest thread identity for cooperative translated contexts.
+[[nodiscard]] ProcessResult run_process(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    ExecutionBackend& backend,
+    DarwinHostServices& host,
+    MachContext& mach_context,
+    std::uint64_t instruction_budget,
+    const MachThreadIdentity* current_thread);
+
 [[nodiscard]] std::string_view process_stop_reason_name(ProcessStopReason reason) noexcept;
 
 } // namespace macosarm

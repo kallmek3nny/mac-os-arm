@@ -22,7 +22,8 @@ ProcessResult run_process(
     ExecutionBackend& backend,
     DarwinHostServices& host,
     MachContext& mach_context,
-    std::uint64_t instruction_budget) {
+    std::uint64_t instruction_budget,
+    const MachThreadIdentity* current_thread) {
 
     if (instruction_budget == 0) {
         return {
@@ -65,7 +66,8 @@ ProcessResult run_process(
 
             if (decode_darwin_trap_number(state) < 0) {
                 const MachTrapDispatchResult mach_dispatch =
-                    dispatch_mach_trap(state, address_space, execution, mach_context);
+                    dispatch_mach_trap(state, address_space, execution, mach_context,
+                                       current_thread);
                 if (!mach_dispatch) {
                     return {
                         ProcessStopReason::mach_trap_error,
@@ -78,7 +80,8 @@ ProcessResult run_process(
                 }
             } else {
                 const SyscallDispatchResult dispatch =
-                    dispatch_darwin_syscall(state, address_space, execution, host, mach_context);
+                    dispatch_darwin_syscall(state, address_space, execution, host,
+                                            mach_context, current_thread);
                 if (!dispatch) {
                     return {
                         ProcessStopReason::syscall_error,
@@ -147,6 +150,17 @@ ProcessResult run_process(
         SyscallDispatchError::none,
         MachTrapDispatchError::none,
     };
+}
+
+ProcessResult run_process(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    ExecutionBackend& backend,
+    DarwinHostServices& host,
+    MachContext& mach_context,
+    std::uint64_t instruction_budget) {
+    return run_process(state, address_space, backend, host, mach_context,
+                       instruction_budget, nullptr);
 }
 
 ProcessResult run_process(
