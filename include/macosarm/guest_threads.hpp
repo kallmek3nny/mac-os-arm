@@ -116,7 +116,7 @@ public:
     }
 
     // Allocate a worker's stack in a bounded synthetic guest VA arena.
-    // A non-accessible page guards the lower bound, with stack growing down
+    // A permanently non-accessible page guards the lower bound, with stack growing down
     // from the top of the contiguous writable pages. This does not create
     // a real Darwin pthread or initialize Apple libpthread TLS.
     [[nodiscard]] GuestThreadAddResult add_owned_worker(
@@ -150,7 +150,10 @@ public:
                 return {GuestThreadAddError::allocation_failed, 0};
             }
             const auto allocation_id = vm_.allocation_id_at(base);
-            if (!allocation_id || !vm_.protect_range(base, page, Protection::none)) {
+            if (!allocation_id ||
+                !vm_.protect_range(base, page, Protection::none) ||
+                !vm_.restrict_maximum_protection_range(
+                    base, page, Protection::none)) {
                 (void)vm_.unmap_range(base, reservation);
                 return {GuestThreadAddError::allocation_failed, 0};
             }
