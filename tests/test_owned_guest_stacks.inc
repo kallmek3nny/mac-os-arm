@@ -34,6 +34,15 @@ void test_owned_guest_stacks() {
         const std::uint64_t expected_top =
             GuestThreadGroup::kStackArenaBase + 3U * page;
         const auto token = vm.allocation_id_at(GuestThreadGroup::kStackArenaBase);
+        const auto guarded_base = GuestThreadGroup::kStackArenaBase;
+        const auto restore_via_range = vm.protect_range(guarded_base, page, rw);
+        const auto restore_via_exact = vm.protect(guarded_base, page, rw);
+        expect(restore_via_range.error == VmError::protection &&
+                   restore_via_exact.error == VmError::protection &&
+                   vm.probe_write(guarded_base, 1U).error == VmError::protection &&
+                   static_cast<bool>(vm.probe_write(expected_top - 16U, 16U)) &&
+                   token == vm.allocation_id_at(guarded_base + page),
+               "owned stack guard cannot be made writable through either protect API");
         expect(static_cast<bool>(main_id) &&
                    missing_size.error == GuestThreadAddError::invalid_stack_size &&
                    bad_alignment.error == GuestThreadAddError::invalid_stack_size &&

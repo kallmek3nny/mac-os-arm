@@ -82,6 +82,11 @@ public:
     // or requests beyond the original mapping maximum before mutation.
     [[nodiscard]] VmResult protect_range(std::uint64_t base, std::uint64_t size,
                                          Protection protection);
+    // Host-only tightening of maximum protection. Cannot grant new rights or
+    // remove rights required by current protection. Transactional across
+    // contiguous fragments; preserves original allocation IDs for reaping.
+    [[nodiscard]] VmResult restrict_maximum_protection_range(
+        std::uint64_t base, std::uint64_t size, Protection maximum_protection);
 
     // Loader-only population path. This intentionally ignores guest write permission
     // but still requires the complete destination range to already be mapped.

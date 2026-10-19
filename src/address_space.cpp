@@ -172,6 +172,9 @@ VmResult GuestAddressSpace::protect(std::uint64_t base, std::uint64_t size, Prot
     if (mapping == nullptr) {
         return {VmError::not_exact_mapping};
     }
+    if (!has_protection(mapping->maximum_protection, protection)) {
+        return {VmError::protection};
+    }
     mapping->protection = protection;
     return {};
 }
@@ -239,6 +242,60 @@ VmResult GuestAddressSpace::protect_range(
                 change_end, mapping_end - change_end,
                 mapping.protection, mapping.maximum_protection,
                 mapping.allocation_id});
+        }
+    }
+    mappings_.swap(updated);
+    return {};
+}
+
+
+VmResult GuestAddressSpace::restrict_maximum_protection_range(
+    std::uint64_t base, std::uint64_t size, Protection maximum_protection) {
+    if (size == 0) return {VmError::zero_size};
+    if ((base % kPageSize) != 0 || (size % kPageSize) != 0) {
+        return {VmError::unaligned};
+    }
+    if (range_overflows(base, size)) return {VmError::address_overflow};
+
+    // Reject holes, rights escalation, and restrictions that would revoke
+    // currently active rights before making any mapping changes.
+    const std::uint64_t end = base + size;
+    std::uint64_t cursor = base;
+    auto it = mappings_.upper_bound(base);
+    if (it != mappings_.begin()) --it;
+    while (cursor < end) {
+        while (it != mappings_.end() &&
+               it->second.base + it->second.size <= cursor) ++it;
+        if (it == mappings_.end() || it->second.base > cursor) {
+            return {VmError::unmapped};
+        }
+        if (!has_protection(it->second.maximum_protection, maximum_protection) ||
+            !has_protection(maximum_protection, it->second.protection)) {
+            return {VmError::protection};
+        }
+        cursor = std::min(end, it->second.base + it->second.size);
+        ++it;
+    }
+
+    auto updated = mappings_;
+    for (const auto& [key, mapping] : mappings_) {
+        const std::uint64_t mapping_end = mapping.base + mapping.size;
+        if (mapping_end <= base || mapping.base >= end) continue;
+        const std::uint64_t first = std::max(base, mapping.base);
+        const std::uint64_t last = std::min(end, mapping_end);
+        updated.erase(key);
+        if (mapping.base < first) {
+            updated.emplace(mapping.base, Mapping{
+                mapping.base, first - mapping.base, mapping.protection,
+                mapping.maximum_protection, mapping.allocation_id});
+        }
+        updated.emplace(first, Mapping{
+            first, last - first, mapping.protection, maximum_protection,
+            mapping.allocation_id});
+        if (last < mapping_end) {
+            updated.emplace(last, Mapping{
+                last, mapping_end - last, mapping.protection,
+                mapping.maximum_protection, mapping.allocation_id});
         }
     }
     mappings_.swap(updated);
