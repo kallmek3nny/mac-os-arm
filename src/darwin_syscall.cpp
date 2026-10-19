@@ -380,6 +380,19 @@ SyscallDispatchResult dispatch_darwin_syscall(
         return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
     case kDarwinSysBsdthreadRegister:
         return dispatch_bsdthread_register_preflight(state, address_space, syscall_number);
+    case kDarwinSysBsdthreadTerminate:
+        // XNU syscalls.master #361: (stackaddr, freesize, port, sema_or_ulock).
+        // A registered pthread can also request stack deallocation, Mach
+        // right release and semaphore signaling. We cannot perform those
+        // kernel lifetime operations yet, so never acknowledge such a call.
+        // For manually constructed, resource-free guest execution contexts
+        // only, terminate the caller without killing sibling contexts.
+        if (current_thread == nullptr || state.x[0] != 0 ||
+            state.x[1] != 0 || state.x[2] != 0 || state.x[3] != 0) {
+            set_error(state, kDarwinErrnoEnosys);
+            return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+        }
+        return {SyscallDispatchError::none, SyscallAction::exit_thread, syscall_number, 0};
     case kDarwinSysBsdthreadCreate:
         // libpthread/kern/kern_support.c: _bsdthread_create rejects a
         // process before allocating a thread when proc_get_register(p) == 0.
@@ -389,7 +402,7 @@ SyscallDispatchResult dispatch_darwin_syscall(
         return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
     case kDarwinSysThreadSelfid:
         // _thread_selfid reports a 64-bit thread ID, not the Mach port name.
-        // The rehost currently models exactly one main thread per context.
+        // The current thread is the process main thread in the legacy path.
         set_success(state, current_thread != nullptr
                                ? current_thread->thread_id : context.thread_id());
         return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};

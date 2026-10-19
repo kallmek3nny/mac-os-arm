@@ -89,7 +89,11 @@ public:
             std::min(remaining_, quantum), &it->identity);
         remaining_ -= process.instructions_executed;
         it->instructions_executed += process.instructions_executed;
-        if (process.reason != ProcessStopReason::instruction_budget) {
+        if (process.reason == ProcessStopReason::thread_exited) {
+            // bsdthread_terminate ends this context. Other contexts remain
+            // runnable, including a worker outliving the original main.
+            it->status = GuestThreadStatus::stopped;
+        } else if (process.reason != ProcessStopReason::instruction_budget) {
             it->status = GuestThreadStatus::stopped;
             stopped_ = true; // BSD exit and fatal faults end the process.
         }
