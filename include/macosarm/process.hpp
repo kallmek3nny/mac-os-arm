@@ -11,6 +11,7 @@ namespace macosarm {
 
 enum class ProcessStopReason {
     exited,
+    thread_exited,
     instruction_budget,
     exception,
     memory_fault,

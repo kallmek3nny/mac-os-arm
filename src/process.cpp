@@ -92,6 +92,16 @@ ProcessResult run_process(
                         MachTrapDispatchError::none,
                     };
                 }
+                if (dispatch.action == SyscallAction::exit_thread) {
+                    return {
+                        ProcessStopReason::thread_exited,
+                        total_executed,
+                        0,
+                        VmError::none,
+                        SyscallDispatchError::none,
+                        MachTrapDispatchError::none,
+                    };
+                }
                 if (dispatch.action == SyscallAction::exit_process) {
                     return {
                         ProcessStopReason::exited,
@@ -182,6 +192,7 @@ ProcessResult run_process(
 std::string_view process_stop_reason_name(ProcessStopReason reason) noexcept {
     switch (reason) {
     case ProcessStopReason::exited: return "exited";
+    case ProcessStopReason::thread_exited: return "thread_exited";
     case ProcessStopReason::instruction_budget: return "instruction_budget";
     case ProcessStopReason::exception: return "exception";
     case ProcessStopReason::memory_fault: return "memory_fault";

@@ -102,4 +102,97 @@ void test_guest_threads_direct() {
     expect(different_process.process_id() != mach.process_id() &&
                host.calls == 0U,
            "Mach process namespace and host I/O remain isolated");
+
+    // Phase48: a guest context may exit without shutting down sibling
+    // contexts. Zero-resource bsdthread_terminate is a bounded subset of
+    // XNU syscall 361, not evidence of working pthread registration.
+    MachContext terminate_mach;
+    GuestThreadGroup terminating(vm, terminate_mach, 8U);
+    CpuState terminating_main = initial;
+    terminating_main.x[0] = 0U;
+    terminating_main.x[1] = 0U;
+    terminating_main.x[2] = 0U;
+    terminating_main.x[3] = 0U;
+    terminating_main.x[16] = kDarwinSysBsdthreadTerminate;
+    CpuState survivor = worker;
+    survivor.x[16] = kDarwinSysThreadSelfid;
+    const auto terminated_id = terminating.add_main(terminating_main);
+    const auto survivor_id = terminating.add_worker(survivor);
+    ScriptedBackend terminating_backend({{svc(1), false, 0, 0, 0, 0}});
+    const auto terminated = terminating.run_slice(
+        terminated_id.thread_id, terminating_backend, host, 4U);
+    ScriptedBackend survivor_backend({{svc(1), false, 0, 0, 0, 0}});
+    const auto survived = terminating.run_slice(
+        survivor_id.thread_id, survivor_backend, host, 1U);
+    const GuestThread* stopped_context = terminating.find(terminated_id.thread_id);
+    const GuestThread* running_context = terminating.find(survivor_id.thread_id);
+    expect(static_cast<bool>(terminated_id) && static_cast<bool>(survivor_id) &&
+               static_cast<bool>(terminated) &&
+               terminated.process.reason == ProcessStopReason::thread_exited &&
+               terminated.process.instructions_executed == 1U &&
+               !terminating.stopped() &&
+               stopped_context != nullptr &&
+               stopped_context->status == GuestThreadStatus::stopped &&
+               static_cast<bool>(survived) &&
+               survived.process.reason == ProcessStopReason::instruction_budget &&
+               running_context != nullptr &&
+               running_context->status == GuestThreadStatus::runnable &&
+               running_context->cpu.x[0] == survivor_id.thread_id &&
+               terminating.remaining_budget() == 6U &&
+               terminating.run_slice(terminated_id.thread_id, unused_backend,
+                                     host, 1U).error == GuestThreadRunError::stopped,
+           "bsdthread_terminate stops only its context and sibling keeps running");
+
+    // A registered pthread may hand stack memory, semaphore and port rights
+    // to the kernel. Reject requests needing unsupported cleanup, without
+    // mutating mappings or claiming the calling thread has exited.
+    MachContext cleanup_mach;
+    const MachThreadIdentity main_identity = cleanup_mach.main_thread_identity();
+    GuestThreadGroup cleanup_group(vm, cleanup_mach, 2U);
+    CpuState cleanup_main = terminating_main;
+    cleanup_main.x[0] = stack;
+    cleanup_main.x[1] = vm.kPageSize;
+    const auto cleanup_id = cleanup_group.add_main(cleanup_main);
+    ScriptedBackend cleanup_backend({{svc(1), false, 0, 0, 0, 0}});
+    const auto cleanup_result = cleanup_group.run_slice(
+        cleanup_id.thread_id, cleanup_backend, host, 1U);
+    const GuestThread* cleanup_context = cleanup_group.find(cleanup_id.thread_id);
+    expect(static_cast<bool>(cleanup_id) &&
+               static_cast<bool>(cleanup_result) &&
+               cleanup_result.process.reason == ProcessStopReason::instruction_budget &&
+               cleanup_context != nullptr &&
+               cleanup_context->status == GuestThreadStatus::runnable &&
+               cleanup_context->cpu.x[0] == kDarwinErrnoEnosys &&
+               (cleanup_context->cpu.pstate & kA64PstateCarry) != 0U &&
+               !cleanup_group.stopped() &&
+               static_cast<bool>(vm.probe_write(stack, vm.kPageSize)),
+           "unsupported stack reclamation fails closed without altering guest VM");
+
+    CpuState port_cleanup = terminating_main;
+    port_cleanup.x[2] = terminate_mach.thread_self_port();
+    const auto port_rejected = dispatch_darwin_syscall(
+        port_cleanup, vm, svc(1), host, cleanup_mach,
+        &main_identity);
+    expect(port_rejected.action == SyscallAction::resume &&
+               port_cleanup.x[0] == kDarwinErrnoEnosys &&
+               (port_cleanup.pstate & kA64PstateCarry) != 0U,
+           "unimplemented Mach port cleanup fails closed");
+
+    CpuState semaphore_cleanup = terminating_main;
+    semaphore_cleanup.x[3] = 1U;
+    const auto sem_rejected = dispatch_darwin_syscall(
+        semaphore_cleanup, vm, svc(1), host, cleanup_mach,
+        &main_identity);
+    expect(sem_rejected.action == SyscallAction::resume &&
+               semaphore_cleanup.x[0] == kDarwinErrnoEnosys,
+           "unimplemented semaphore signaling fails closed");
+
+    CpuState legacy_terminate = terminating_main;
+    const auto legacy_result = dispatch_darwin_syscall(
+        legacy_terminate, vm, svc(1), host, cleanup_mach);
+    expect(legacy_result.action == SyscallAction::resume &&
+               legacy_terminate.x[0] == kDarwinErrnoEnosys &&
+               (legacy_terminate.pstate & kA64PstateCarry) != 0U,
+           "legacy process runner cannot fake a thread termination");
+
 }

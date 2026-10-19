@@ -18,6 +18,7 @@ constexpr std::uint64_t kDarwinSysMunmap = 73;
 constexpr std::uint64_t kDarwinSysMprotect = 74;
 constexpr std::uint64_t kDarwinSysMmap = 197;
 constexpr std::uint64_t kDarwinSysBsdthreadCreate = 360;
+constexpr std::uint64_t kDarwinSysBsdthreadTerminate = 361;
 constexpr std::uint64_t kDarwinSysBsdthreadRegister = 366;
 constexpr std::uint64_t kDarwinSysThreadSelfid = 372;
 constexpr std::uint32_t kDarwinErrnoEio = 5;
@@ -59,6 +60,7 @@ public:
 enum class SyscallAction {
     resume,
     exit_process,
+    exit_thread,
 };
 
 enum class SyscallDispatchError {
