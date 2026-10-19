@@ -102,7 +102,6 @@ void test_guest_threads_direct() {
     expect(different_process.process_id() != mach.process_id() &&
                host.calls == 0U,
            "Mach process namespace and host I/O remain isolated");
-    const MachThreadIdentity main_identity = cleanup_mach.main_thread_identity();
 
     // Phase48: a guest context may exit without shutting down sibling
     // contexts. Zero-resource bsdthread_terminate is a bounded subset of
@@ -148,6 +147,7 @@ void test_guest_threads_direct() {
     // to the kernel. Reject requests needing unsupported cleanup, without
     // mutating mappings or claiming the calling thread has exited.
     MachContext cleanup_mach;
+    const MachThreadIdentity main_identity = cleanup_mach.main_thread_identity();
     GuestThreadGroup cleanup_group(vm, cleanup_mach, 2U);
     CpuState cleanup_main = terminating_main;
     cleanup_main.x[0] = stack;
