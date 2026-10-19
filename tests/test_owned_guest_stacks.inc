@@ -1,0 +1,153 @@
+// Phase49: process-managed guarded stacks with exact allocation provenance.
+// These are manually scheduled guest contexts, not Darwin pthreads.
+void test_owned_guest_stacks() {
+    using namespace macosarm;
+    constexpr std::uint64_t code = 0x2b0000000ULL;
+    constexpr std::uint64_t main_stack = 0x2c0000000ULL;
+    constexpr auto page = GuestAddressSpace::kPageSize;
+    const auto rw = Protection::read | Protection::write;
+    GuestAddressSpace vm;
+    const std::array<std::byte, 4> nop{
+        std::byte{0x1f}, std::byte{0x20}, std::byte{0x03}, std::byte{0xd5}};
+    expect(static_cast<bool>(vm.map(code, page,
+                        Protection::read | Protection::execute)) &&
+               static_cast<bool>(vm.load_bytes(code, nop)) &&
+               static_cast<bool>(vm.map(main_stack, page, rw)),
+           "owned stack test guest code and external main stack map");
+
+    CpuState main{};
+    main.pc = code;
+    main.sp = main_stack + page;
+    CpuState worker = main;
+    worker.x[16] = kDarwinSysBsdthreadTerminate;
+
+    MachContext mach;
+    {
+        GuestThreadGroup group(vm, mach, 8U);
+        const auto main_id = group.add_main(main);
+        const auto missing_size = group.add_owned_worker(worker, 0);
+        const auto bad_alignment = group.add_owned_worker(worker, page + 1U);
+        const auto excessive_size = group.add_owned_worker(
+            worker, (GuestThreadGroup::kMaxOwnedStackPages + 1U) * page);
+        const auto created = group.add_owned_worker(worker, 2U * page);
+        const GuestThread* t = group.find(created.thread_id);
+        const std::uint64_t expected_top =
+            GuestThreadGroup::kStackArenaBase + 3U * page;
+        const auto token = vm.allocation_id_at(GuestThreadGroup::kStackArenaBase);
+        expect(static_cast<bool>(main_id) &&
+                   missing_size.error == GuestThreadAddError::invalid_stack_size &&
+                   bad_alignment.error == GuestThreadAddError::invalid_stack_size &&
+                   excessive_size.error == GuestThreadAddError::invalid_stack_size &&
+                   static_cast<bool>(created) && t != nullptr &&
+                   created.thread_id == MachContext::kSyntheticMainThreadId + 1U &&
+                   t->cpu.sp == expected_top &&
+                   t->owned_stack.has_value() &&
+                   t->owned_stack->base == GuestThreadGroup::kStackArenaBase &&
+                   token.has_value() &&
+                   t->owned_stack->allocation_id == *token &&
+                   vm.probe_write(expected_top - 16U, 16U) &&
+                   vm.probe_write(GuestThreadGroup::kStackArenaBase, 16U).error ==
+                       VmError::protection &&
+                   group.reap_stopped_worker(created.thread_id).error ==
+                       GuestThreadReapError::still_running &&
+                   group.reap_stopped_worker(main_id.thread_id).error ==
+                       GuestThreadReapError::main_thread,
+               "valid guarded worker stack owns a unique VM allocation and rejects early reap");
+
+        CaptureHost host;
+        ScriptedBackend terminate({{svc(1), false, 0, 0, 0, 0}});
+        const auto stopped = group.run_slice(created.thread_id, terminate, host, 2U);
+        expect(static_cast<bool>(stopped) &&
+                   stopped.process.reason == ProcessStopReason::thread_exited &&
+                   group.find(created.thread_id)->status == GuestThreadStatus::stopped,
+               "owned worker can terminate independently");
+
+        // mprotect divides the original allocation but retains its identity.
+        expect(static_cast<bool>(vm.protect_range(
+                   GuestThreadGroup::kStackArenaBase + page, page, Protection::read)),
+               "stack subrange protect preserves the original allocation lease");
+        const auto released = group.reap_stopped_worker(created.thread_id);
+        expect(static_cast<bool>(released) &&
+                   group.find(created.thread_id) == nullptr &&
+                   !vm.allocation_id_at(GuestThreadGroup::kStackArenaBase) &&
+                   vm.probe_write(expected_top - 16U, 16U).error == VmError::unmapped &&
+                   group.reap_stopped_worker(created.thread_id).error ==
+                       GuestThreadReapError::unknown_thread,
+               "reaping frees every guarded stack mapping and rejects reused identity");
+
+        const auto reused = group.add_owned_worker(worker, page);
+        const GuestThread* t2 = group.find(reused.thread_id);
+        expect(static_cast<bool>(reused) && t2 != nullptr &&
+                   reused.thread_id != created.thread_id &&
+                   t2->owned_stack.has_value() &&
+                   t2->owned_stack->base == GuestThreadGroup::kStackArenaBase &&
+                   t2->owned_stack->allocation_id != *token &&
+                   group.remaining_budget() == 7U,
+               "reclaimed synthetic VA slot can be reused without reusing thread ID");
+    }
+    expect(!vm.allocation_id_at(GuestThreadGroup::kStackArenaBase),
+           "group destruction reclaims remaining originally owned stack mappings");
+
+    // A foreign mapping in the first synthetic slot must remain untouched.
+    expect(static_cast<bool>(vm.map(GuestThreadGroup::kStackArenaBase, page, rw)),
+           "synthetic stack collision maps a foreign page");
+    const std::array<std::byte, 4> marker{
+        std::byte{0x33}, std::byte{0x44}, std::byte{0x55}, std::byte{0x66}};
+    expect(static_cast<bool>(vm.write(GuestThreadGroup::kStackArenaBase, marker)),
+           "write foreign stack-slot marker");
+    {
+        MachContext collision_mach;
+        GuestThreadGroup collision(vm, collision_mach, 4U);
+        const auto m = collision.add_main(main);
+        const auto w = collision.add_owned_worker(worker, page);
+        const GuestThread* owned = collision.find(w.thread_id);
+        expect(static_cast<bool>(m) && static_cast<bool>(w) &&
+                   owned != nullptr && owned->owned_stack.has_value() &&
+                   owned->owned_stack->slot == 1U,
+               "stack allocator skips reserved foreign guest mappings");
+    }
+    std::array<std::byte, 4> foreign_bytes{};
+    expect(static_cast<bool>(vm.read(GuestThreadGroup::kStackArenaBase,
+                                    foreign_bytes)) &&
+               foreign_bytes == marker,
+           "group stack cleanup preserves foreign mapping and its bytes");
+
+    // A guest can unmap the guard and replace it before a stopped worker is
+    // reaped. Never reclaim the new owner's memory or report successful reap.
+    {
+        MachContext replacement_mach;
+        GuestThreadGroup group(vm, replacement_mach, 3U);
+        const auto m = group.add_main(main);
+        const auto w = group.add_owned_worker(worker, page);
+        const GuestThread* owned = group.find(w.thread_id);
+        const std::uint64_t owned_base = owned != nullptr &&
+                  owned->owned_stack ? owned->owned_stack->base : 0U;
+        expect(static_cast<bool>(m) && static_cast<bool>(w) &&
+                   owned_base == GuestThreadGroup::kStackArenaBase +
+                                     GuestThreadGroup::kStackSlotSize,
+               "replacement case uses the second slot");
+        CaptureHost host;
+        ScriptedBackend terminate({{svc(1), false, 0, 0, 0, 0}});
+        const auto exit_result = group.run_slice(w.thread_id, terminate, host, 1U);
+        expect(static_cast<bool>(exit_result) &&
+                   exit_result.process.reason == ProcessStopReason::thread_exited &&
+                   static_cast<bool>(vm.unmap_range(owned_base, page)) &&
+                   static_cast<bool>(vm.map(owned_base, page, rw)) &&
+                   static_cast<bool>(vm.write(owned_base, marker)),
+               "guest replaces guarded allocation's first page");
+        const auto rejected = group.reap_stopped_worker(w.thread_id);
+        std::array<std::byte, 4> replacement_bytes{};
+        expect(rejected.error == GuestThreadReapError::allocation_changed &&
+                   group.find(w.thread_id) != nullptr &&
+                   static_cast<bool>(vm.read(owned_base, replacement_bytes)) &&
+                   replacement_bytes == marker,
+               "provenance mismatch refuses to reclaim unrelated replacement pages");
+        // Simulate application process teardown: an explicit guest munmap
+        // removes both leases, including the foreign replacement.
+        expect(static_cast<bool>(vm.unmap_range(owned_base, 2U * page)),
+               "guest teardown can remove its own un-reapable stack region");
+    }
+    expect(static_cast<bool>(vm.read(GuestThreadGroup::kStackArenaBase,
+                                    foreign_bytes)) && foreign_bytes == marker,
+           "unrelated synthetic slot remains intact after replacement case");
+}
