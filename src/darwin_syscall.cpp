@@ -346,7 +346,8 @@ SyscallDispatchResult dispatch_darwin_syscall(
     GuestAddressSpace& address_space,
     const ExecutionResult& execution,
     DarwinHostServices& host,
-    const MachContext& context) {
+    const MachContext& context,
+    const MachThreadIdentity* current_thread) {
 
     if (execution.reason != StopReason::supervisor_call) {
         return {SyscallDispatchError::not_supervisor_call, SyscallAction::resume, 0, 0};
@@ -389,12 +390,22 @@ SyscallDispatchResult dispatch_darwin_syscall(
     case kDarwinSysThreadSelfid:
         // _thread_selfid reports a 64-bit thread ID, not the Mach port name.
         // The rehost currently models exactly one main thread per context.
-        set_success(state, context.thread_id());
+        set_success(state, current_thread != nullptr
+                               ? current_thread->thread_id : context.thread_id());
         return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
     default:
         set_error(state, kDarwinErrnoEnosys);
         return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
     }
+}
+
+SyscallDispatchResult dispatch_darwin_syscall(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    const ExecutionResult& execution,
+    DarwinHostServices& host,
+    const MachContext& context) {
+    return dispatch_darwin_syscall(state, address_space, execution, host, context, nullptr);
 }
 
 SyscallDispatchResult dispatch_darwin_syscall(

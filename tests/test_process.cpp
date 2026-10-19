@@ -1,5 +1,7 @@
 #include "macosarm/process.hpp"
+#include "macosarm/guest_threads.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -96,6 +98,8 @@ void load_message(
 }
 
 } // namespace
+
+#include "test_guest_threads_direct.inc"
 
 int main() {
     constexpr std::uint64_t data_base = 0x200000000ULL;
@@ -250,6 +254,8 @@ int main() {
                    second_state.x[0] == macosarm::MachContext::kFirstReplyPort + 1U,
                "caller-owned process Mach context persists across process runs");
     }
+
+    test_guest_threads_direct();
 
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
