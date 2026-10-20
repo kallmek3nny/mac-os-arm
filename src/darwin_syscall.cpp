@@ -288,54 +288,100 @@ void set_error(CpuState& state, std::uint32_t error) noexcept {
     return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
 }
 
-// Model only XNU's early registration rejection paths. Successful pthread
-// registration requires thread, workqueue and QoS behavior we do not provide;
-// valid calls remain ENOSYS instead of advertising fake kernel capabilities.
+// Apple libpthread/kern/kern_internal.h: fixed, packed 56-byte record.
+// Extract little-endian input fields after the copyin and size-version check.
+[[nodiscard]] std::uint64_t pthread_record_u64(
+    const std::array<std::byte, 56>& bytes, std::size_t offset) noexcept {
+    std::uint64_t value = 0;
+    for (std::size_t i = 0; i < 8U; ++i) {
+        value |= static_cast<std::uint64_t>(
+            std::to_integer<unsigned char>(bytes[offset + i])) << (i * 8U);
+    }
+    return value;
+}
+
+[[nodiscard]] std::uint32_t pthread_record_u32(
+    const std::array<std::byte, 56>& bytes, std::size_t offset) noexcept {
+    std::uint32_t value = 0;
+    for (std::size_t i = 0; i < 4U; ++i) {
+        value |= static_cast<std::uint32_t>(
+            std::to_integer<unsigned char>(bytes[offset + i])) << (i * 8U);
+    }
+    return value;
+}
+
+// Preflight *never* commits registration or edits guest bytes. A valid
+// request still returns ENOSYS instead of pretending support for pthread
+// creation, registration copyout, workqueue scheduling, or QoS policies.
 [[nodiscard]] SyscallDispatchResult dispatch_bsdthread_register_preflight(
     CpuState& state,
     GuestAddressSpace& address_space,
+    const MachContext& context,
     std::uint64_t syscall_number) {
-
     const auto reject = [&](std::uint32_t error) {
         set_error(state, error);
         return SyscallDispatchResult{
             SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
     };
-
-    // XNU's register shim passes uint32_t flags to its signed pthread size.
     const auto pthread_size = static_cast<std::int32_t>(
         static_cast<std::uint32_t>(state.x[2]));
     if (pthread_size < 0 || pthread_size > 64 * 1024) {
         return reject(kDarwinErrnoEinval);
     }
-
+    PthreadRegistrationPreflight candidate{};
+    candidate.threadstart = state.x[0];
+    candidate.wqthread = state.x[1];
+    candidate.pthread_size = static_cast<std::uint32_t>(pthread_size);
     const std::uint64_t data_address = state.x[3];
     const std::uint64_t data_size = state.x[4];
-    if (data_address != 0) {
-        constexpr std::size_t kRegistrationSize = 56;
-        constexpr std::size_t kVersionSize = sizeof(std::uint64_t);
-        if (data_size < kVersionSize) {
+    if (data_address != 0U) {
+        if (data_size < sizeof(std::uint64_t)) {
             return reject(kDarwinErrnoEinval);
         }
-
-        // libpthread/kern/kern_internal.h uses a packed 56-byte record;
-        // _bsdthread_register copyins min(sizeof(record), supplied_size).
-        std::array<std::byte, kRegistrationSize> record{};
-        const auto copy_size = static_cast<std::size_t>(
+        std::array<std::byte, 56> record{};
+        const std::size_t copied = static_cast<std::size_t>(
             std::min<std::uint64_t>(data_size, record.size()));
-        if (!address_space.read(data_address, std::span<std::byte>(record).first(copy_size))) {
+        if (!address_space.read(data_address, std::span<std::byte>(record).first(copied))) {
             return reject(kDarwinErrnoEfault);
         }
-        std::uint64_t version = 0;
-        for (std::size_t i = 0; i < kVersionSize; ++i) {
-            version |= static_cast<std::uint64_t>(
-                std::to_integer<unsigned char>(record[i])) << (8U * i);
-        }
-        if (version != data_size) {
+        if (pthread_record_u64(record, 0U) != data_size) {
             return reject(kDarwinErrnoEinval);
         }
+        candidate.record_size = data_size;
+        candidate.dispatch_queue_offset = pthread_record_u64(record, 8U);
+        candidate.tsd_offset = pthread_record_u32(record, 24U);
+        candidate.return_to_kernel_offset = pthread_record_u32(record, 28U);
+        candidate.mach_thread_self_offset = pthread_record_u32(record, 32U);
+        candidate.joinable_offset_bits = pthread_record_u32(record, 48U);
+        candidate.wq_quantum_expiry_offset = pthread_record_u32(record, 52U);
+        candidate.copyout_writable =
+            static_cast<bool>(address_space.probe_write(data_address, copied));
+    } else {
+        candidate.dispatch_queue_offset = state.x[5];
     }
-
+    // Match libpthread's source-observed per-process offsets. Values outside
+    // the pthread structure's 64-bit TSD slot are ignored, not accepted.
+    constexpr std::uint32_t slot_size = sizeof(std::uint64_t);
+    std::uint32_t maximum_offset = 0U;
+    if (candidate.pthread_size >= slot_size &&
+        candidate.tsd_offset <= candidate.pthread_size - slot_size) {
+        maximum_offset = candidate.pthread_size - candidate.tsd_offset - slot_size;
+    } else {
+        candidate.tsd_offset = 0U;
+    }
+    if (candidate.dispatch_queue_offset > maximum_offset) {
+        candidate.dispatch_queue_offset = 0U;
+    }
+    if (candidate.return_to_kernel_offset > maximum_offset) {
+        candidate.return_to_kernel_offset = 0U;
+    }
+    if (candidate.mach_thread_self_offset > maximum_offset) {
+        candidate.mach_thread_self_offset = 0U;
+    }
+    if (candidate.wq_quantum_expiry_offset > maximum_offset) {
+        candidate.wq_quantum_expiry_offset = 0U;
+    }
+    context.observe_pthread_registration_preflight(candidate);
     return reject(kDarwinErrnoEnosys);
 }
 
@@ -379,7 +425,8 @@ SyscallDispatchResult dispatch_darwin_syscall(
         set_success(state, context.process_id());
         return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
     case kDarwinSysBsdthreadRegister:
-        return dispatch_bsdthread_register_preflight(state, address_space, syscall_number);
+        return dispatch_bsdthread_register_preflight(
+            state, address_space, context, syscall_number);
     case kDarwinSysBsdthreadTerminate:
         // XNU syscalls.master #361: (stackaddr, freesize, port, sema_or_ulock).
         // A registered pthread can also request stack deallocation, Mach
@@ -398,7 +445,9 @@ SyscallDispatchResult dispatch_darwin_syscall(
         // process before allocating a thread when proc_get_register(p) == 0.
         // Our bsdthread_register cannot succeed yet; remain unregistered and
         // reject creation with XNU's EINVAL, without claiming thread support.
-        set_error(state, kDarwinErrnoEinval);
+        // A validated preflight is not a successful registration.
+        set_error(state, context.pthread_registered()
+                             ? kDarwinErrnoEnosys : kDarwinErrnoEinval);
         return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
     case kDarwinSysThreadSelfid:
         // _thread_selfid reports a 64-bit thread ID, not the Mach port name.

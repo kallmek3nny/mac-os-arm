@@ -231,6 +231,113 @@ int main() {
               "registration copyin crossing unmapped page");
         check(16384, 0, 0, macosarm::kDarwinErrnoEnosys,
               "legacy registration without record stays unsupported");
+        macosarm::MachContext owner;
+        macosarm::MachContext independent;
+        // Seed the source-defined packed copyin offsets on a read-only page.
+        const auto write32 = [&](std::size_t offset, std::uint32_t val) {
+            for (std::size_t i = 0; i < 4U; ++i) {
+                record[offset + i] = static_cast<std::byte>((val >> (8U * i)) & 0xffU);
+            }
+        };
+        write32(24U, 224U);
+        write32(28U, 40U);
+        write32(32U, 24U);
+        write32(48U, 392U);
+        write32(52U, 960U);
+        expect(static_cast<bool>(vm.load_bytes(buffer_base, record)),
+               "packed pthread registration fixture copies to read-only VM");
+        state = {};
+        state.x[0] = 0x120000000ULL;
+        state.x[1] = 0x130000000ULL;
+        state.x[2] = 16384U;
+        state.x[3] = buffer_base;
+        state.x[4] = 56U;
+        state.x[5] = 999U;
+        state.x[16] = macosarm::kDarwinSysBsdthreadRegister;
+        const auto valid = macosarm::dispatch_darwin_syscall(state, vm, svc(), host, owner);
+        const auto& staged = owner.pthread_registration_preflight();
+        expect(static_cast<bool>(valid) &&
+                   state.x[0] == macosarm::kDarwinErrnoEnosys &&
+                   carry_is_set(state) && staged.has_value() &&
+                   staged->threadstart == 0x120000000ULL &&
+                   staged->wqthread == 0x130000000ULL &&
+                   staged->pthread_size == 16384U &&
+                   staged->record_size == 56U &&
+                   staged->tsd_offset == 224U &&
+                   staged->dispatch_queue_offset == 160U &&
+                   staged->return_to_kernel_offset == 40U &&
+                   staged->mach_thread_self_offset == 24U &&
+                   staged->wq_quantum_expiry_offset == 960U &&
+                   staged->joinable_offset_bits == 392U &&
+                   !staged->copyout_writable &&
+                   !owner.pthread_registered() &&
+                   !independent.pthread_registration_preflight(),
+               "parsed pthread registration belongs only to requesting process");
+        std::array<std::byte, 56> untouched{};
+        expect(static_cast<bool>(vm.read(buffer_base, untouched)) && untouched == record,
+               "read-only pthread record remains unchanged on unsupported syscall");
+        state = {};
+        state.x[16] = macosarm::kDarwinSysBsdthreadCreate;
+        const auto still_unregistered =
+            macosarm::dispatch_darwin_syscall(state, vm, svc(), host, owner);
+        expect(static_cast<bool>(still_unregistered) &&
+                   state.x[0] == macosarm::kDarwinErrnoEinval &&
+                   carry_is_set(state),
+               "successful copyin does not grant bsdthread_create support");
+        state = {};
+        state.x[2] = 16384U;
+        state.x[3] = 0xdead00000000ULL;
+        state.x[4] = 56U;
+        state.x[16] = macosarm::kDarwinSysBsdthreadRegister;
+        const auto failed_retry =
+            macosarm::dispatch_darwin_syscall(state, vm, svc(), host, owner);
+        expect(static_cast<bool>(failed_retry) &&
+                   state.x[0] == macosarm::kDarwinErrnoEfault &&
+                   owner.pthread_registration_preflight()->threadstart ==
+                       0x120000000ULL,
+               "malformed retry does not corrupt prior process preflight");
+        // Forward/backward structure compatibility: a smaller versioned
+        // record fills absent fields with zero and never reads beyond size.
+        std::array<std::byte, 8> short_record{};
+        short_record[0] = std::byte{8};
+        const auto short_address = buffer_base + 128U;
+        expect(static_cast<bool>(vm.load_bytes(short_address, short_record)),
+               "short versioned pthread record copied to guest");
+        state = {};
+        state.x[2] = 16U;
+        state.x[3] = short_address;
+        state.x[4] = 8U;
+        state.x[16] = macosarm::kDarwinSysBsdthreadRegister;
+        const auto short_result =
+            macosarm::dispatch_darwin_syscall(state, vm, svc(), host, independent);
+        const auto& short_snapshot = independent.pthread_registration_preflight();
+        expect(static_cast<bool>(short_result) &&
+                   state.x[0] == macosarm::kDarwinErrnoEnosys &&
+                   short_snapshot.has_value() && short_snapshot->record_size == 8U &&
+                   short_snapshot->tsd_offset == 0U &&
+                   short_snapshot->dispatch_queue_offset == 0U &&
+                   !short_snapshot->copyout_writable,
+               "short registration copyin zero pads the missing fields");
+        write32(24U, 16384U);
+        write32(52U, 0xffffffffU);
+        expect(static_cast<bool>(vm.load_bytes(buffer_base, record)),
+               "invalid pthread TSD bounds fixture loaded");
+        state = {};
+        state.x[2] = 16384U;
+        state.x[3] = buffer_base;
+        state.x[4] = 56U;
+        state.x[16] = macosarm::kDarwinSysBsdthreadRegister;
+        const auto bounds =
+            macosarm::dispatch_darwin_syscall(state, vm, svc(), host, independent);
+        const auto& bounds_snapshot = independent.pthread_registration_preflight();
+        expect(static_cast<bool>(bounds) &&
+                   state.x[0] == macosarm::kDarwinErrnoEnosys &&
+                   bounds_snapshot.has_value() &&
+                   bounds_snapshot->tsd_offset == 0U &&
+                   bounds_snapshot->dispatch_queue_offset == 0U &&
+                   bounds_snapshot->return_to_kernel_offset == 0U &&
+                   bounds_snapshot->wq_quantum_expiry_offset == 0U,
+               "out-of-range TSD offsets are zeroed, not trusted");
         expect(host.fds.empty(), "registration preflight never calls host write");
         std::array<std::byte, 56> unchanged{};
         expect(static_cast<bool>(vm.read(buffer_base, unchanged)) && unchanged == record,
