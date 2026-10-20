@@ -38,6 +38,7 @@ struct GuestThreadRunResult {
 };
 enum class GuestThreadReapError {
     none, unknown_thread, main_thread, still_running, allocation_changed,
+    identity_changed,
 };
 struct GuestThreadReapResult {
     GuestThreadReapError error{GuestThreadReapError::none};
@@ -82,13 +83,19 @@ public:
     GuestThreadGroup& operator=(GuestThreadGroup&&) = delete;
 
     ~GuestThreadGroup() noexcept {
-        for (const GuestThread& thread : threads_) {
+        for (std::size_t i = 0; i < threads_.size(); ++i) {
+            const GuestThread& thread = threads_[i];
             if (thread.owned_stack) {
                 const GuestOwnedStack& stack = *thread.owned_stack;
                 // A guest may have unmapped and replaced these pages. The VM
                 // allocation token prevents deleting unrelated guest memory.
                 (void)vm_.unmap_allocation(stack.base, stack.size,
                                            stack.allocation_id);
+            }
+            // The host is destroying these manually managed contexts, not
+            // implementing pthread_detach or a kernel thread-port send right.
+            if (i != 0U) {
+                (void)mach_.retire_worker_thread_identity(thread.identity);
             }
         }
     }
@@ -185,12 +192,18 @@ public:
         if (it->status != GuestThreadStatus::stopped) {
             return {GuestThreadReapError::still_running};
         }
+        if (!mach_.is_active_worker_thread_identity(it->identity)) {
+            return {GuestThreadReapError::identity_changed};
+        }
         if (it->owned_stack) {
             const GuestOwnedStack stack = *it->owned_stack;
             if (!vm_.unmap_allocation(stack.base, stack.size, stack.allocation_id)) {
                 return {GuestThreadReapError::allocation_changed};
             }
             stack_slots_[stack.slot] = false;
+        }
+        if (!mach_.retire_worker_thread_identity(it->identity)) {
+            return {GuestThreadReapError::identity_changed};
         }
         threads_.erase(it);
         return {};

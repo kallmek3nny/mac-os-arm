@@ -159,4 +159,95 @@ void test_owned_guest_stacks() {
     expect(static_cast<bool>(vm.read(GuestThreadGroup::kStackArenaBase,
                                     foreign_bytes)) && foreign_bytes == marker,
            "unrelated synthetic slot remains intact after replacement case");
+
+    // Phase51: retain a strict simultaneous-worker bound, but retire identities
+    // on reap without recycling stale guest-visible IDs or Mach port names.
+    {
+        MachContext identity_mach;
+        std::array<MachThreadIdentity, MachContext::kMaxGuestThreads - 1U> issued{};
+        bool allocations_ok = true;
+        for (auto& identity : issued) {
+            const auto allocated = identity_mach.allocate_worker_thread_identity();
+            if (!allocated) {
+                allocations_ok = false;
+                break;
+            }
+            identity = *allocated;
+        }
+        const auto saturated = identity_mach.allocate_worker_thread_identity();
+        const MachThreadIdentity forged{
+            issued[0].thread_id, issued[1].thread_self_port};
+        const bool rejected_forgery =
+            !identity_mach.retire_worker_thread_identity(forged);
+        const bool retired =
+            identity_mach.retire_worker_thread_identity(issued[0]);
+        const bool rejected_duplicate =
+            !identity_mach.retire_worker_thread_identity(issued[0]);
+        const auto next = identity_mach.allocate_worker_thread_identity();
+        expect(allocations_ok && !saturated && rejected_forgery &&
+                   retired && rejected_duplicate && next.has_value() &&
+                   next->thread_id > issued.back().thread_id &&
+                   next->thread_self_port > issued.back().thread_self_port &&
+                   !identity_mach.is_active_worker_thread_identity(issued[0]) &&
+                   identity_mach.is_active_worker_thread_identity(*next) &&
+                   !identity_mach.allocate_worker_thread_identity(),
+               "active Mach worker cap remains bounded but retired identities never alias");
+    }
+
+    {
+        MachContext churn_mach;
+        constexpr std::size_t cycles = MachContext::kMaxGuestThreads + 5U;
+        GuestThreadGroup churn(vm, churn_mach, cycles + 2U);
+        const auto m = churn.add_main(main);
+        CaptureHost host;
+        bool safe = static_cast<bool>(m);
+        std::uint64_t last_id = 0;
+        std::uint32_t last_port = 0;
+        for (std::size_t index = 0; index < cycles && safe; ++index) {
+            const auto added = churn.add_owned_worker(worker, page);
+            const GuestThread* current = churn.find(added.thread_id);
+            if (!added || current == nullptr || !current->owned_stack ||
+                added.thread_id <= last_id ||
+                current->identity.thread_self_port <= last_port) {
+                safe = false;
+                break;
+            }
+            last_id = added.thread_id;
+            last_port = current->identity.thread_self_port;
+            ScriptedBackend terminate({{svc(1), false, 0, 0, 0, 0}});
+            const auto stopped = churn.run_slice(added.thread_id, terminate, host, 1U);
+            const auto reclaimed = churn.reap_stopped_worker(added.thread_id);
+            if (!stopped || stopped.process.reason != ProcessStopReason::thread_exited ||
+                !reclaimed || churn.find(added.thread_id) != nullptr ||
+                churn.size() != 1U ||
+                vm.allocation_id_at(GuestThreadGroup::kStackArenaBase)) {
+                safe = false;
+            }
+        }
+        expect(safe && churn.remaining_budget() == 2U,
+               "more than 63 guarded workers run and reap sequentially without port aliasing");
+    }
+
+    // A host context group ending with live workers also gives its Mach
+    // identity slots back, while the old numeric identity remains retired.
+    {
+        MachContext context;
+        std::uint64_t last_id = 0;
+        {
+            GuestThreadGroup group(vm, context, 2U);
+            const auto m = group.add_main(main);
+            bool filled = static_cast<bool>(m);
+            for (std::size_t index = 0;
+                 index < MachContext::kMaxGuestThreads - 1U && filled; ++index) {
+                const auto w = group.add_worker(worker);
+                filled = static_cast<bool>(w);
+                if (w) last_id = w.thread_id;
+            }
+            expect(filled && !context.allocate_worker_thread_identity(),
+                   "active group occupies the entire worker identity cap");
+        }
+        const auto after_destroy = context.allocate_worker_thread_identity();
+        expect(after_destroy && after_destroy->thread_id > last_id,
+               "host group destruction retires worker slots without id reuse");
+    }
 }
