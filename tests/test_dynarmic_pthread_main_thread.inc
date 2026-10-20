@@ -251,6 +251,22 @@ int dynarmic_pthread_main_thread_init_main() {
         return EXIT_FAILURE;
     }
 
+    // The translated ARM64 #366 path must decode the same packed fields
+    // without fabricating registration success or changing the record.
+    const auto& preflight = context.pthread_registration_preflight();
+    if (!preflight || preflight->threadstart != code_base ||
+        preflight->wqthread != code_base || preflight->pthread_size != 16384U ||
+        preflight->record_size != 56U || preflight->tsd_offset != 224U ||
+        preflight->dispatch_queue_offset != 160U ||
+        preflight->return_to_kernel_offset != 40U ||
+        preflight->mach_thread_self_offset != 24U ||
+        preflight->joinable_offset_bits != 392U ||
+        preflight->wq_quantum_expiry_offset != 960U ||
+        !preflight->copyout_writable || context.pthread_registered()) {
+        std::cerr << "FAIL: translated bsdthread_register preflight data\n";
+        return EXIT_FAILURE;
+    }
+
     const std::uint32_t reply_port = pthread_main_read_u32(vm, name_address);
     if (reply_port != MachContext::kFirstReplyPort || !context.is_receive_port(reply_port)) {
         std::cerr << "FAIL: mach_port_construct exposes a live synthetic reply receive port\n";

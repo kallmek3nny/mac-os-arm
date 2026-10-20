@@ -73,6 +73,22 @@ constexpr std::size_t kMachMsgHeaderSize = 24;
 constexpr std::size_t kMachMsgMaxInlineSize = 1024 * 1024;
 constexpr std::size_t kMachMsgMaxQueueDepth = 64;
 
+// Only a structurally accepted copyin, NOT a kernel pthread registration.
+// No thread creation, QoS promises or feature bits follow from this record.
+struct PthreadRegistrationPreflight {
+    std::uint64_t threadstart{};
+    std::uint64_t wqthread{};
+    std::uint64_t record_size{};
+    std::uint64_t dispatch_queue_offset{};
+    std::uint32_t pthread_size{};
+    std::uint32_t tsd_offset{};
+    std::uint32_t return_to_kernel_offset{};
+    std::uint32_t mach_thread_self_offset{};
+    std::uint32_t wq_quantum_expiry_offset{};
+    std::uint32_t joinable_offset_bits{};
+    bool copyout_writable{};
+};
+
 // Per-context identity for a translated guest thread, not a host pthread.
 struct MachThreadIdentity {
     std::uint64_t thread_id{};
@@ -97,6 +113,21 @@ public:
     static constexpr std::uint64_t kVmAnywhereBase = 0x1000000000ULL;
 
     MachContext();
+
+    // A preflight never changes the separate committed registration state.
+    // A future implementation must complete XNU startup/copyout contracts
+    // before it is allowed to commit, or to enable bsdthread_create.
+    void observe_pthread_registration_preflight(
+        PthreadRegistrationPreflight candidate) const noexcept {
+        pthread_registration_preflight_ = candidate;
+    }
+    [[nodiscard]] const std::optional<PthreadRegistrationPreflight>&
+    pthread_registration_preflight() const noexcept {
+        return pthread_registration_preflight_;
+    }
+    [[nodiscard]] bool pthread_registered() const noexcept {
+        return pthread_registered_;
+    }
 
     [[nodiscard]] std::uint32_t process_id() const noexcept { return process_id_; }
     [[nodiscard]] std::uint32_t task_self_port() const noexcept { return task_self_port_; }
@@ -126,6 +157,8 @@ public:
     [[nodiscard]] std::size_t queued_message_count(std::uint32_t port) const noexcept;
 
 private:
+    mutable std::optional<PthreadRegistrationPreflight> pthread_registration_preflight_{};
+    bool pthread_registered_{};
     std::uint32_t process_id_{};
     std::uint32_t task_self_port_{kDefaultTaskSelfPort};
     std::uint32_t thread_self_port_{kDefaultThreadSelfPort};
