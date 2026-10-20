@@ -56,6 +56,8 @@ struct GuestOwnedStack {
     std::uint64_t pthread_base{};
     std::uint64_t tsd_base{};
     std::uint32_t pthread_size{};
+    // Source-derived guest errno_t field, owned by the same VM lease.
+    std::uint64_t errno_address{};
 };
 
 struct GuestThread {
@@ -142,6 +144,18 @@ public:
             initial, stack_size, PthreadTlsShape{pthread_size, tsd_offset});
     }
 
+    // opt-in libpthread errno slot 1. Apple _pthread_struct_init stores
+    // &pthread->err_no there; the offset comes from the caller's ABI
+    // layout, not a host C++ struct. No syscall or feature bits change.
+    [[nodiscard]] GuestThreadAddResult add_owned_worker_with_errno_tsd(
+        CpuState initial, std::uint64_t stack_size,
+        std::uint32_t pthread_size, std::uint32_t tsd_offset,
+        std::uint32_t errno_offset) {
+        return add_owned_worker_impl(
+            initial, stack_size,
+            PthreadTlsShape{pthread_size, tsd_offset, errno_offset});
+    }
+
     // Explicit host-managed reaping, *not* pthread_join: it does not block
     // and cannot release a running worker. All owned stack pages must still
     // belong to the allocation that created them, even after mprotect splits.
@@ -216,6 +230,7 @@ private:
     struct PthreadTlsShape {
         std::uint32_t pthread_size{};
         std::uint32_t tsd_offset{};
+        std::optional<std::uint32_t> errno_offset{};
     };
 
     [[nodiscard]] GuestThreadAddResult add_owned_worker_impl(
@@ -238,7 +253,12 @@ private:
                     tls->pthread_size > 64U * 1024U ||
                     (tls->pthread_size % 8U) != 0U ||
                     (tls->tsd_offset % 8U) != 0U ||
-                    tls->tsd_offset > tls->pthread_size - prefix_size)) {
+                    tls->tsd_offset > tls->pthread_size - prefix_size ||
+                    (tls->errno_offset &&
+                     (tls->tsd_offset < sizeof(std::uint32_t) ||
+                      (*tls->errno_offset % alignof(std::uint32_t)) != 0U ||
+                      *tls->errno_offset >
+                          tls->tsd_offset - sizeof(std::uint32_t))))) {
             return {GuestThreadAddError::invalid_stack_size, 0};
         }
         if ((initial.pc & 3U) != 0U) {
@@ -273,6 +293,8 @@ private:
             }
             const std::uint64_t pthread_base = base + page + stack_size;
             const std::uint64_t tsd_base = tls ? pthread_base + tls->tsd_offset : 0U;
+            const std::uint64_t errno_address = tls && tls->errno_offset
+                ? pthread_base + *tls->errno_offset : 0U;
             initial.sp = pthread_base;
             if (tls) initial.tpidrro_el0 = tsd_base;
             const GuestThreadAddResult added = add_worker(initial);
@@ -289,8 +311,12 @@ private:
                     }
                 };
                 encode(0U, pthread_base);
+                if (errno_address != 0U) encode(8U, errno_address);
                 encode(24U, threads_.back().identity.thread_self_port);
-                if (!vm_.write(tsd_base, prefix)) {
+                const std::array<std::byte, 4> initial_errno{};
+                if (!vm_.write(tsd_base, prefix) ||
+                    (errno_address != 0U &&
+                     !vm_.write(errno_address, initial_errno))) {
                     // Atomic construction: on copyout failure undo both VM
                     // ownership and thread-table identity publication.
                     const MachThreadIdentity failed = threads_.back().identity;
@@ -303,7 +329,7 @@ private:
             threads_.back().owned_stack = GuestOwnedStack{
                 base, reservation, *id, slot,
                 tls ? pthread_base : 0U, tsd_base,
-                tls ? tls->pthread_size : 0U};
+                tls ? tls->pthread_size : 0U, errno_address};
             stack_slots_[slot] = true;
             return added;
         }
