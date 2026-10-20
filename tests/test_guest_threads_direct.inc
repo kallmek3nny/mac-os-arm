@@ -195,4 +195,86 @@ void test_guest_threads_direct() {
                (legacy_terminate.pstate & kA64PstateCarry) != 0U,
            "legacy process runner cannot fake a thread termination");
 
+
+    // Phase54: owned stack and pthread-shaped tail have one provenance lease;
+    // TSD slot 0 is pthread_self, slot 3 is the per-worker Mach thread port.
+    {
+        MachContext tls_mach;
+        GuestThreadGroup tls_group(vm, tls_mach, 8U);
+        CpuState main_cpu{};
+        main_cpu.pc = code;
+        main_cpu.sp = stack + vm.kPageSize;
+        const auto main_id = tls_group.add_main(main_cpu);
+        CpuState worker_cpu = main_cpu;
+        worker_cpu.x[16] = kDarwinSysBsdthreadTerminate;
+        worker_cpu.tpidrro_el0 = UINT64_MAX;
+        expect(static_cast<bool>(main_id) &&
+                   tls_group.add_owned_worker_with_tsd(
+                       worker_cpu, vm.kPageSize, 16U, 0U).error ==
+                       GuestThreadAddError::invalid_stack_size &&
+                   tls_group.add_owned_worker_with_tsd(
+                       worker_cpu, vm.kPageSize, 256U, 248U).error ==
+                       GuestThreadAddError::invalid_stack_size &&
+                   tls_group.add_owned_worker_with_tsd(
+                       worker_cpu, vm.kPageSize, 512U, 225U).error ==
+                       GuestThreadAddError::invalid_stack_size &&
+                   tls_group.size() == 1U &&
+                   !vm.allocation_id_at(GuestThreadGroup::kStackArenaBase),
+               "invalid pthread TLS geometry has no guest VM side effects");
+        const auto a = tls_group.add_owned_worker_with_tsd(
+            worker_cpu, vm.kPageSize, 512U, 224U);
+        const auto b = tls_group.add_owned_worker_with_tsd(
+            worker_cpu, vm.kPageSize, 512U, 224U);
+        const GuestThread* ta = tls_group.find(a.thread_id);
+        const GuestThread* tb = tls_group.find(b.thread_id);
+        const auto read64 = [&](std::uint64_t address)
+            -> std::optional<std::uint64_t> {
+            std::array<std::byte, 8> bytes{};
+            if (!vm.read(address, bytes)) return std::nullopt;
+            std::uint64_t value = 0;
+            for (std::size_t i = 0; i < bytes.size(); ++i) {
+                value |= static_cast<std::uint64_t>(
+                    std::to_integer<unsigned char>(bytes[i])) << (i * 8U);
+            }
+            return value;
+        };
+        expect(a && b && ta && tb && ta->owned_stack && tb->owned_stack &&
+                   a.thread_id != b.thread_id &&
+                   ta->cpu.tpidrro_el0 != tb->cpu.tpidrro_el0 &&
+                   ta->cpu.sp == ta->owned_stack->pthread_base &&
+                   tb->cpu.sp == tb->owned_stack->pthread_base &&
+                   ta->cpu.tpidrro_el0 == ta->owned_stack->tsd_base &&
+                   tb->cpu.tpidrro_el0 == tb->owned_stack->tsd_base &&
+                   ta->owned_stack->pthread_size == 512U &&
+                   read64(ta->cpu.tpidrro_el0) == ta->owned_stack->pthread_base &&
+                   read64(tb->cpu.tpidrro_el0) == tb->owned_stack->pthread_base &&
+                   read64(ta->cpu.tpidrro_el0 + 24U) ==
+                       ta->identity.thread_self_port &&
+                   read64(tb->cpu.tpidrro_el0 + 24U) ==
+                       tb->identity.thread_self_port &&
+                   vm.probe_write(ta->owned_stack->base, 8U).error ==
+                       VmError::protection &&
+                   static_cast<bool>(vm.probe_write(ta->cpu.sp - 16U, 16U)) &&
+                   !tls_mach.pthread_registered(),
+               "worker pthread_self, Mach TLS and guard page are isolated");
+        const GuestOwnedStack lease_a = ta && ta->owned_stack
+            ? *ta->owned_stack : GuestOwnedStack{};
+        const GuestOwnedStack lease_b = tb && tb->owned_stack
+            ? *tb->owned_stack : GuestOwnedStack{};
+        ScriptedBackend backend_a({{svc(1), false, 0, 0, 0, 0}});
+        ScriptedBackend backend_b({{svc(1), false, 0, 0, 0, 0}});
+        const auto exit_a = tls_group.run_slice(a.thread_id, backend_a, host, 1U);
+        const auto exit_b = tls_group.run_slice(b.thread_id, backend_b, host, 1U);
+        const auto reap_a = tls_group.reap_stopped_worker(a.thread_id);
+        const auto reap_b = tls_group.reap_stopped_worker(b.thread_id);
+        expect(exit_a && exit_b &&
+                   exit_a.process.reason == ProcessStopReason::thread_exited &&
+                   exit_b.process.reason == ProcessStopReason::thread_exited &&
+                   reap_a && reap_b && tls_group.size() == 1U &&
+                   !vm.allocation_id_at(lease_a.base) &&
+                   !vm.allocation_id_at(lease_b.base) &&
+                   !tls_group.stopped() && tls_group.remaining_budget() == 6U,
+               "pthread TLS plus stack are reaped by one guarded allocation token");
+    }
+
 }
