@@ -262,6 +262,10 @@ int dynarmic_pthread_main_thread_init_main() {
         preflight->mach_thread_self_offset != 24U ||
         preflight->joinable_offset_bits != 392U ||
         preflight->wq_quantum_expiry_offset != 960U ||
+        preflight->record_address != registration_address ||
+        preflight->copyout_size != 56U ||
+        !preflight->threadstart_executable ||
+        !preflight->wqthread_executable ||
         !preflight->copyout_writable || context.pthread_registered()) {
         std::cerr << "FAIL: translated bsdthread_register preflight data\n";
         return EXIT_FAILURE;

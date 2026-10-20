@@ -269,6 +269,10 @@ int main() {
                    staged->mach_thread_self_offset == 24U &&
                    staged->wq_quantum_expiry_offset == 960U &&
                    staged->joinable_offset_bits == 392U &&
+                   staged->record_address == buffer_base &&
+                   staged->copyout_size == 56U &&
+                   !staged->threadstart_executable &&
+                   !staged->wqthread_executable &&
                    !staged->copyout_writable &&
                    !owner.pthread_registered() &&
                    !independent.pthread_registration_preflight(),
@@ -314,6 +318,8 @@ int main() {
         expect(static_cast<bool>(short_result) &&
                    state.x[0] == macosarm::kDarwinErrnoEnosys &&
                    short_snapshot.has_value() && short_snapshot->record_size == 8U &&
+                   short_snapshot->copyout_size == 8U &&
+                   short_snapshot->record_address == short_address &&
                    short_snapshot->tsd_offset == 0U &&
                    short_snapshot->dispatch_queue_offset == 0U &&
                    !short_snapshot->copyout_writable,
@@ -338,6 +344,118 @@ int main() {
                    bounds_snapshot->return_to_kernel_offset == 0U &&
                    bounds_snapshot->wq_quantum_expiry_offset == 0U,
                "out-of-range TSD offsets are zeroed, not trusted");
+        // Record versions larger than Apple's known 56-byte layout still
+        // consume and would copy out only the known prefix. The 64-bit size
+        // is compared exactly; trailing guest memory is never accessed.
+        std::array<std::byte, 56> newer_record{};
+        newer_record[0] = std::byte{120};
+        constexpr std::uint64_t newer_address = buffer_base + 256U;
+        expect(static_cast<bool>(vm.load_bytes(newer_address, newer_record)),
+               "newer pthread record header loads");
+        state = {};
+        state.x[2] = 16384U;
+        state.x[3] = newer_address;
+        state.x[4] = 120U;
+        state.x[16] = macosarm::kDarwinSysBsdthreadRegister;
+        const auto newer_result = macosarm::dispatch_darwin_syscall(
+            state, vm, svc(), host, independent);
+        const auto& newer = independent.pthread_registration_preflight();
+        expect(static_cast<bool>(newer_result) &&
+                   state.x[0] == macosarm::kDarwinErrnoEnosys &&
+                   newer && newer->record_size == 120U &&
+                   newer->record_address == newer_address &&
+                   newer->copyout_size == 56U && !newer->copyout_writable,
+               "forward record version uses bounded 56-byte copyout plan");
+
+        // Neither a source-visible entrypoint nor a valid copyin grants
+        // pthread registration. Check executable ARM64 veneers separately
+        // from the record's copyout permissions.
+        constexpr std::uint64_t executable_base = 0x190000000ULL;
+        std::array<std::byte, 4> nop{std::byte{0x1f}, std::byte{0x20},
+                                     std::byte{0x03}, std::byte{0xd5}};
+        expect(static_cast<bool>(vm.map(
+                   executable_base, macosarm::GuestAddressSpace::kPageSize,
+                   macosarm::Protection::read | macosarm::Protection::execute)) &&
+                   static_cast<bool>(vm.load_bytes(executable_base, nop)),
+               "pthread startup entrypoint maps executable ARM64 veneer");
+        state = {};
+        state.x[0] = executable_base;
+        state.x[1] = executable_base + 4U;
+        state.x[2] = 16384U;
+        state.x[3] = buffer_base;
+        state.x[4] = 56U;
+        state.x[16] = macosarm::kDarwinSysBsdthreadRegister;
+        const auto executable_result = macosarm::dispatch_darwin_syscall(
+            state, vm, svc(), host, owner);
+        const auto& executable = owner.pthread_registration_preflight();
+        expect(static_cast<bool>(executable_result) &&
+                   state.x[0] == macosarm::kDarwinErrnoEnosys &&
+                   executable && executable->threadstart_executable &&
+                   executable->wqthread_executable && !executable->copyout_writable &&
+                   !owner.pthread_registered(),
+               "executable veneers are observed but cannot commit registration");
+        state.x[0] = executable_base + 1U;
+        state.x[1] = 0xdead00000000ULL;
+        state.x[2] = 16384U;
+        state.x[3] = buffer_base;
+        state.x[4] = 56U;
+        state.x[16] = macosarm::kDarwinSysBsdthreadRegister;
+        const auto bad_entry = macosarm::dispatch_darwin_syscall(
+            state, vm, svc(), host, owner);
+        const auto& not_ready = owner.pthread_registration_preflight();
+        expect(static_cast<bool>(bad_entry) &&
+                   state.x[0] == macosarm::kDarwinErrnoEnosys &&
+                   not_ready && !not_ready->threadstart_executable &&
+                   !not_ready->wqthread_executable && !owner.pthread_registered(),
+               "misaligned and unmapped entrypoints never become executable");
+
+        // Registration copyout may cross adjacent VM mapping fragments.
+        // Probe the complete XNU-sized prefix without guest writes, even
+        // when the second fragment is read-only.
+        macosarm::GuestAddressSpace split_vm;
+        constexpr std::uint64_t split_base = 0x340000000ULL;
+        constexpr std::uint64_t split_record =
+            split_base + macosarm::GuestAddressSpace::kPageSize - 24U;
+        std::array<std::byte, 56> split_data{};
+        split_data[0] = std::byte{56};
+        expect(static_cast<bool>(split_vm.map(
+                   split_base, macosarm::GuestAddressSpace::kPageSize,
+                   macosarm::Protection::read | macosarm::Protection::write)) &&
+                   static_cast<bool>(split_vm.map(
+                       split_base + macosarm::GuestAddressSpace::kPageSize,
+                       macosarm::GuestAddressSpace::kPageSize,
+                       macosarm::Protection::read | macosarm::Protection::write)) &&
+                   static_cast<bool>(split_vm.load_bytes(split_record, split_data)),
+               "cross-fragment registration copyin setup");
+        macosarm::MachContext split_context;
+        state = {};
+        state.x[2] = 16384U;
+        state.x[3] = split_record;
+        state.x[4] = 56U;
+        state.x[16] = macosarm::kDarwinSysBsdthreadRegister;
+        const auto split_good = macosarm::dispatch_darwin_syscall(
+            state, split_vm, svc(), host, split_context);
+        expect(static_cast<bool>(split_good) &&
+                   state.x[0] == macosarm::kDarwinErrnoEnosys &&
+                   split_context.pthread_registration_preflight() &&
+                   split_context.pthread_registration_preflight()->copyout_writable &&
+                   split_context.pthread_registration_preflight()->copyout_size == 56U,
+               "cross-fragment writable copyout prefix is detected");
+        expect(static_cast<bool>(split_vm.protect_range(
+                   split_base + macosarm::GuestAddressSpace::kPageSize,
+                   macosarm::GuestAddressSpace::kPageSize,
+                   macosarm::Protection::read)),
+               "second registration fragment becomes read-only");
+        const auto split_read_only = macosarm::dispatch_darwin_syscall(
+            state, split_vm, svc(), host, split_context);
+        std::array<std::byte, 56> split_unchanged{};
+        expect(static_cast<bool>(split_read_only) &&
+                   state.x[0] == macosarm::kDarwinErrnoEnosys &&
+                   split_context.pthread_registration_preflight() &&
+                   !split_context.pthread_registration_preflight()->copyout_writable &&
+                   static_cast<bool>(split_vm.read(split_record, split_unchanged)) &&
+                   split_unchanged == split_data && !split_context.pthread_registered(),
+               "partial guest read-only copyout cannot silently become registration");
         expect(host.fds.empty(), "registration preflight never calls host write");
         std::array<std::byte, 56> unchanged{};
         expect(static_cast<bool>(vm.read(buffer_base, unchanged)) && unchanged == record,

@@ -79,6 +79,10 @@ struct PthreadRegistrationPreflight {
     std::uint64_t threadstart{};
     std::uint64_t wqthread{};
     std::uint64_t record_size{};
+    // The bounded, source-defined copyin/copyout span, not the caller's
+    // potentially newer record size. Never implies a successful copyout.
+    std::uint64_t record_address{};
+    std::uint32_t copyout_size{};
     std::uint64_t dispatch_queue_offset{};
     std::uint32_t pthread_size{};
     std::uint32_t tsd_offset{};
@@ -87,6 +91,11 @@ struct PthreadRegistrationPreflight {
     std::uint32_t wq_quantum_expiry_offset{};
     std::uint32_t joinable_offset_bits{};
     bool copyout_writable{};
+    // Observational ARM64 startup prerequisites. XNU stores function
+    // pointers without validating executable mappings during registration.
+    // These flags do not grant registration or make arbitrary code safe.
+    bool threadstart_executable{};
+    bool wqthread_executable{};
 };
 
 // Per-context identity for a translated guest thread, not a host pthread.
