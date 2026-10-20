@@ -214,13 +214,16 @@ void test_owned_guest_stacks() {
             }
             last_id = added.thread_id;
             last_port = current->identity.thread_self_port;
+            // The earlier foreign mapping occupies slot zero. Check the
+            // actual leased slot, never unrelated guest memory.
+            const std::uint64_t owned_base = current->owned_stack->base;
             ScriptedBackend terminate({{svc(1), false, 0, 0, 0, 0}});
             const auto stopped = churn.run_slice(added.thread_id, terminate, host, 1U);
             const auto reclaimed = churn.reap_stopped_worker(added.thread_id);
             if (!stopped || stopped.process.reason != ProcessStopReason::thread_exited ||
                 !reclaimed || churn.find(added.thread_id) != nullptr ||
                 churn.size() != 1U ||
-                vm.allocation_id_at(GuestThreadGroup::kStackArenaBase)) {
+                vm.allocation_id_at(owned_base)) {
                 safe = false;
             }
         }
