@@ -348,6 +348,8 @@ void set_error(CpuState& state, std::uint32_t error) noexcept {
             return reject(kDarwinErrnoEinval);
         }
         candidate.record_size = data_size;
+        candidate.record_address = data_address;
+        candidate.copyout_size = static_cast<std::uint32_t>(copied);
         candidate.dispatch_queue_offset = pthread_record_u64(record, 8U);
         candidate.tsd_offset = pthread_record_u32(record, 24U);
         candidate.return_to_kernel_offset = pthread_record_u32(record, 28U);
@@ -381,6 +383,21 @@ void set_error(CpuState& state, std::uint32_t error) noexcept {
     if (candidate.wq_quantum_expiry_offset > maximum_offset) {
         candidate.wq_quantum_expiry_offset = 0U;
     }
+    // ARM64 bsdthread_create eventually jumps through the registered
+    // libpthread startup veneers. Observe whether both targets are aligned
+    // and executable in the guest VM, without changing XNU's register-time
+    // error ordering or claiming that their instructions are valid.
+    // In particular, never dereference a guest entrypoint as host memory.
+    const auto executable_entry = [&](std::uint64_t address) {
+        if (address == 0U || (address & 3U) != 0U) {
+            return false;
+        }
+        std::array<std::byte, 4> instruction{};
+        return static_cast<bool>(address_space.fetch_code(address, instruction));
+    };
+    candidate.threadstart_executable = executable_entry(candidate.threadstart);
+    candidate.wqthread_executable = executable_entry(candidate.wqthread);
+
     context.observe_pthread_registration_preflight(candidate);
     return reject(kDarwinErrnoEnosys);
 }
