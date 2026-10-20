@@ -83,6 +83,42 @@ int dynarmic_owned_stacks_main() {
         std::cerr << "FAIL: original stack contents and safe post-exit reclaim\n";
         return EXIT_FAILURE;
     }
+    // Execute the real translated thread-entry instructions repeatedly.
+    // Historical lifetime-count exhaustion would fail after 63 creations,
+    // even if the host had reclaimed each stack and CPU context.
+    {
+        constexpr std::size_t cycles = MachContext::kMaxGuestThreads + 5U;
+        MachContext churn_mach;
+        GuestThreadGroup churn(vm, churn_mach, 4U * cycles);
+        const auto m = churn.add_main(main);
+        bool ok = static_cast<bool>(m);
+        std::uint64_t last_id = 0;
+        std::uint32_t last_port = 0;
+        for (std::size_t i = 0; i < cycles && ok; ++i) {
+            const auto added = churn.add_owned_worker(worker, page);
+            const GuestThread* current = churn.find(added.thread_id);
+            if (!added || current == nullptr ||
+                added.thread_id <= last_id ||
+                current->identity.thread_self_port <= last_port) {
+                ok = false;
+                break;
+            }
+            last_id = added.thread_id;
+            last_port = current->identity.thread_self_port;
+            const auto ended = churn.run_slice(added.thread_id, backend, host, 4U);
+            const auto reaped = churn.reap_stopped_worker(added.thread_id);
+            if (!ended || ended.process.reason != ProcessStopReason::thread_exited ||
+                ended.process.instructions_executed != 4U || !reaped ||
+                churn.size() != 1U ||
+                vm.allocation_id_at(GuestThreadGroup::kStackArenaBase)) {
+                ok = false;
+            }
+        }
+        if (!ok || churn.remaining_budget() != 0U || host.writes != 0U) {
+            std::cerr << "FAIL: repeated real ARM64 worker identity retirement\n";
+            return EXIT_FAILURE;
+        }
+    }
     std::cout << "real ARM64 guarded worker-stack ownership passed\n";
     return EXIT_SUCCESS;
 }

@@ -3,6 +3,7 @@
 #include "macosarm/address_space.hpp"
 #include "macosarm/execution.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -106,6 +107,11 @@ public:
         return {thread_id_, thread_self_port_};
     }
     [[nodiscard]] std::optional<MachThreadIdentity> allocate_worker_thread_identity() noexcept;
+    // Retire the exact live worker identity. Thread IDs and Mach port names
+    // never recycle: stale guest handles must not resolve to a later worker.
+    [[nodiscard]] bool retire_worker_thread_identity(MachThreadIdentity identity) noexcept;
+    [[nodiscard]] bool is_active_worker_thread_identity(
+        MachThreadIdentity identity) const noexcept;
     [[nodiscard]] bool acquire_host_self_send_right() noexcept;
     [[nodiscard]] bool has_host_self_send_right() const noexcept {
         return host_self_send_refs_ != 0;
@@ -127,7 +133,11 @@ private:
     std::uint32_t host_self_port_{kDefaultHostSelfPort};
     std::uint32_t host_self_send_refs_{0};
     std::uint32_t next_reply_port_{kFirstReplyPort};
-    std::uint32_t allocated_worker_threads_{0};
+    // Bound *simultaneously* active workers, not lifetime thread creations.
+    // The monotonic serial is intentionally separate from reclaimed slots.
+    std::uint64_t next_worker_serial_{};
+    std::array<std::optional<MachThreadIdentity>, kMaxGuestThreads - 1U>
+        active_worker_threads_{};
     std::unordered_map<std::uint32_t, std::deque<std::vector<std::byte>>> receive_queues_;
 };
 

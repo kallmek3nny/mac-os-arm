@@ -2,6 +2,7 @@
 
 #include "macosarm/darwin_syscall.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -542,10 +543,42 @@ constexpr std::array<std::uint32_t, kHostPriorityInfoCount> kHostPriorityInfoVal
 MachContext::MachContext() : process_id_(allocate_synthetic_process_id()) {}
 
 std::optional<MachThreadIdentity> MachContext::allocate_worker_thread_identity() noexcept {
-    if (allocated_worker_threads_ >= kMaxGuestThreads - 1U) return std::nullopt;
-    const std::uint32_t index = allocated_worker_threads_++;
-    return MachThreadIdentity{
-        kSyntheticMainThreadId + 1U + index, kFirstWorkerThreadPort + index};
+    const auto free = std::find_if(
+        active_worker_threads_.begin(), active_worker_threads_.end(),
+        [](const auto& identity) { return !identity.has_value(); });
+    if (free == active_worker_threads_.end() ||
+        next_worker_serial_ >
+            std::numeric_limits<std::uint32_t>::max() - kFirstWorkerThreadPort) {
+        return std::nullopt;
+    }
+    const std::uint64_t serial = next_worker_serial_++;
+    const MachThreadIdentity identity{
+        kSyntheticMainThreadId + 1U + serial,
+        static_cast<std::uint32_t>(kFirstWorkerThreadPort + serial)};
+    *free = identity;
+    return identity;
+}
+
+bool MachContext::is_active_worker_thread_identity(
+    MachThreadIdentity identity) const noexcept {
+    return std::any_of(
+        active_worker_threads_.begin(), active_worker_threads_.end(),
+        [identity](const auto& active) {
+            return active && active->thread_id == identity.thread_id &&
+                   active->thread_self_port == identity.thread_self_port;
+        });
+}
+
+bool MachContext::retire_worker_thread_identity(MachThreadIdentity identity) noexcept {
+    const auto it = std::find_if(
+        active_worker_threads_.begin(), active_worker_threads_.end(),
+        [identity](const auto& active) {
+            return active && active->thread_id == identity.thread_id &&
+                   active->thread_self_port == identity.thread_self_port;
+        });
+    if (it == active_worker_threads_.end()) return false;
+    it->reset();
+    return true;
 }
 
 bool MachContext::acquire_host_self_send_right() noexcept {
