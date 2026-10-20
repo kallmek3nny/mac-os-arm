@@ -75,6 +75,9 @@ class GuestThreadGroup {
 public:
     static constexpr std::uint64_t kStackArenaBase = 0x40000000000ULL;
     static constexpr std::uint64_t kStackSlotSize = 0x200000ULL;
+    // Main-thread TLS has a distinct guarded lease; it never uses a worker slot.
+    static constexpr std::uint64_t kMainTlsArenaBase =
+        kStackArenaBase + MachContext::kMaxGuestThreads * kStackSlotSize;
     static constexpr std::uint64_t kMaxOwnedStackPages = 64U;
 
     GuestThreadGroup(GuestAddressSpace& vm, MachContext& mach,
@@ -113,6 +116,77 @@ public:
         const auto identity = mach_.main_thread_identity();
         threads_.push_back({identity, initial});
         return {GuestThreadAddError::none, identity.thread_id};
+    }
+
+    // Opt-in host-managed main-thread bootstrap for translated ARM64 tests.
+    // The main stack remains caller-owned. Only pthread-shaped TLS is mapped
+    // here; this is NOT XNU bsdthread_register or libpthread initialization.
+    // A failed attempt leaves the main CPU and all guest mappings unchanged.
+    [[nodiscard]] GuestThreadAddResult initialize_main_pthread_errno_tsd(
+        std::uint32_t pthread_size, std::uint32_t tsd_offset,
+        std::uint32_t errno_offset) {
+        if (stopped_) return {GuestThreadAddError::process_stopped, 0};
+        if (threads_.empty()) return {GuestThreadAddError::missing_main, 0};
+        GuestThread& main = threads_.front();
+        if (main.status != GuestThreadStatus::runnable) {
+            return {GuestThreadAddError::process_stopped, 0};
+        }
+        if (main.owned_stack) return {GuestThreadAddError::duplicate_main, 0};
+
+        constexpr std::uint64_t page = GuestAddressSpace::kPageSize;
+        constexpr std::uint32_t prefix_size = 4U * sizeof(std::uint64_t);
+        if (pthread_size < prefix_size || pthread_size > 64U * 1024U ||
+            (pthread_size % 8U) != 0U || (tsd_offset % 8U) != 0U ||
+            tsd_offset > pthread_size - prefix_size ||
+            tsd_offset < sizeof(std::uint32_t) ||
+            (errno_offset % alignof(std::uint32_t)) != 0U ||
+            errno_offset > tsd_offset - sizeof(std::uint32_t)) {
+            return {GuestThreadAddError::invalid_stack_size, 0};
+        }
+        const std::uint64_t pthread_pages =
+            (static_cast<std::uint64_t>(pthread_size) + page - 1U) / page;
+        const std::uint64_t reservation = page + pthread_pages * page;
+        const auto rw = Protection::read | Protection::write;
+        const VmResult mapped = vm_.map(kMainTlsArenaBase, reservation, rw);
+        if (!mapped) return {GuestThreadAddError::allocation_failed, 0};
+        const auto id = vm_.allocation_id_at(kMainTlsArenaBase);
+        if (!id || !vm_.protect_range(kMainTlsArenaBase, page, Protection::none) ||
+            !vm_.restrict_maximum_protection_range(
+                kMainTlsArenaBase, page, Protection::none)) {
+            if (id) {
+                (void)vm_.unmap_allocation(kMainTlsArenaBase, reservation, *id);
+            } else {
+                (void)vm_.unmap_range(kMainTlsArenaBase, reservation);
+            }
+            return {GuestThreadAddError::allocation_failed, 0};
+        }
+
+        const std::uint64_t pthread_base = kMainTlsArenaBase + page;
+        const std::uint64_t tsd_base = pthread_base + tsd_offset;
+        const std::uint64_t errno_address = pthread_base + errno_offset;
+        std::array<std::byte, prefix_size> prefix{};
+        const auto encode = [&](std::size_t offset, std::uint64_t value) {
+            for (std::size_t i = 0; i < 8U; ++i) {
+                prefix[offset + i] = static_cast<std::byte>(
+                    (value >> (8U * i)) & 0xffU);
+            }
+        };
+        encode(0U, pthread_base); // _PTHREAD_TSD_SLOT_PTHREAD_SELF
+        encode(8U, errno_address); // _PTHREAD_TSD_SLOT_ERRNO
+        encode(24U, main.identity.thread_self_port); // MACH_THREAD_SELF
+        const std::array<std::byte, 4> initial_errno{};
+        if (!vm_.write(tsd_base, prefix) ||
+            !vm_.write(errno_address, initial_errno)) {
+            (void)vm_.unmap_allocation(kMainTlsArenaBase, reservation, *id);
+            return {GuestThreadAddError::allocation_failed, 0};
+        }
+
+        // Publish only after both guest copyouts succeed.
+        main.cpu.tpidrro_el0 = tsd_base;
+        main.owned_stack = GuestOwnedStack{
+            kMainTlsArenaBase, reservation, *id, stack_slots_.size(),
+            pthread_base, tsd_base, pthread_size, errno_address};
+        return {GuestThreadAddError::none, main.identity.thread_id};
     }
 
     [[nodiscard]] GuestThreadAddResult add_worker(CpuState initial) {

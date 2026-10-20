@@ -100,6 +100,7 @@ void load_message(
 } // namespace
 
 #include "test_guest_threads_direct.inc"
+#include "test_main_thread_errno_tsd.inc"
 #include "test_owned_guest_stacks.inc"
 
 int main() {
@@ -257,6 +258,7 @@ int main() {
     }
 
     test_guest_threads_direct();
+    test_main_thread_errno_tls_direct();
     test_owned_guest_stacks();
 
     if (failures != 0) {
