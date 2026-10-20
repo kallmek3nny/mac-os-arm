@@ -52,6 +52,10 @@ struct GuestOwnedStack {
     std::uint64_t size{};
     std::uint64_t allocation_id{};
     std::size_t slot{};
+    // Optional pthread-shaped storage backed by this same owned allocation.
+    std::uint64_t pthread_base{};
+    std::uint64_t tsd_base{};
+    std::uint32_t pthread_size{};
 };
 
 struct GuestThread {
@@ -122,60 +126,20 @@ public:
         return {GuestThreadAddError::none, identity->thread_id};
     }
 
-    // Allocate a worker's stack in a bounded synthetic guest VA arena.
-    // A permanently non-accessible page guards the lower bound, with stack growing down
-    // from the top of the contiguous writable pages. This does not create
-    // a real Darwin pthread or initialize Apple libpthread TLS.
+    // Existing guarded worker path, with no implied pthread registration.
     [[nodiscard]] GuestThreadAddResult add_owned_worker(
         CpuState initial, std::uint64_t stack_size) {
-        if (stopped_) return {GuestThreadAddError::process_stopped, 0};
-        if (threads_.empty()) return {GuestThreadAddError::missing_main, 0};
-        if (threads_.size() >= MachContext::kMaxGuestThreads) {
-            return {GuestThreadAddError::capacity, 0};
-        }
-        constexpr std::uint64_t page = GuestAddressSpace::kPageSize;
-        if (stack_size == 0 || stack_size > kMaxOwnedStackPages * page ||
-            (stack_size % page) != 0U) {
-            return {GuestThreadAddError::invalid_stack_size, 0};
-        }
-        if ((initial.pc & 3U) != 0U) {
-            return {GuestThreadAddError::invalid_cpu, 0};
-        }
-        std::uint32_t instruction = 0;
-        if (!fetch_instruction(vm_, initial.pc, instruction)) {
-            return {GuestThreadAddError::invalid_cpu, 0};
-        }
+        return add_owned_worker_impl(initial, stack_size, std::nullopt);
+    }
 
-        const std::uint64_t reservation = stack_size + page;
-        const auto rw = Protection::read | Protection::write;
-        for (std::size_t slot = 0; slot < stack_slots_.size(); ++slot) {
-            if (stack_slots_[slot]) continue;
-            const std::uint64_t base = kStackArenaBase + slot * kStackSlotSize;
-            const VmResult mapped = vm_.map(base, reservation, rw);
-            if (!mapped) {
-                if (mapped.error == VmError::overlap) continue;
-                return {GuestThreadAddError::allocation_failed, 0};
-            }
-            const auto allocation_id = vm_.allocation_id_at(base);
-            if (!allocation_id ||
-                !vm_.protect_range(base, page, Protection::none) ||
-                !vm_.restrict_maximum_protection_range(
-                    base, page, Protection::none)) {
-                (void)vm_.unmap_range(base, reservation);
-                return {GuestThreadAddError::allocation_failed, 0};
-            }
-            initial.sp = base + reservation;
-            const GuestThreadAddResult added = add_worker(initial);
-            if (!added) {
-                (void)vm_.unmap_allocation(base, reservation, *allocation_id);
-                return added;
-            }
-            threads_.back().owned_stack = GuestOwnedStack{
-                base, reservation, *allocation_id, slot};
-            stack_slots_[slot] = true;
-            return added;
-        }
-        return {GuestThreadAddError::allocation_failed, 0};
+    // Source-observed ARM64 TSD layout: TPIDRRO_EL0 points to slot 0
+    // (pthread_self) and slot 3 stores the Mach thread-self port. This
+    // optional manually managed worker does not implement syscall #360.
+    [[nodiscard]] GuestThreadAddResult add_owned_worker_with_tsd(
+        CpuState initial, std::uint64_t stack_size,
+        std::uint32_t pthread_size, std::uint32_t tsd_offset) {
+        return add_owned_worker_impl(
+            initial, stack_size, PthreadTlsShape{pthread_size, tsd_offset});
     }
 
     // Explicit host-managed reaping, *not* pthread_join: it does not block
@@ -249,6 +213,103 @@ public:
     [[nodiscard]] bool stopped() const noexcept { return stopped_; }
 
 private:
+    struct PthreadTlsShape {
+        std::uint32_t pthread_size{};
+        std::uint32_t tsd_offset{};
+    };
+
+    [[nodiscard]] GuestThreadAddResult add_owned_worker_impl(
+        CpuState initial, std::uint64_t stack_size,
+        std::optional<PthreadTlsShape> tls) {
+        if (stopped_) return {GuestThreadAddError::process_stopped, 0};
+        if (threads_.empty()) return {GuestThreadAddError::missing_main, 0};
+        if (threads_.size() >= MachContext::kMaxGuestThreads) {
+            return {GuestThreadAddError::capacity, 0};
+        }
+        constexpr std::uint64_t page = GuestAddressSpace::kPageSize;
+        if (stack_size == 0 || stack_size > kMaxOwnedStackPages * page ||
+            (stack_size % page) != 0U) {
+            return {GuestThreadAddError::invalid_stack_size, 0};
+        }
+        // Four 64-bit slots are needed for source-defined PTHREAD_SELF and
+        // MACH_THREAD_SELF, without claiming other libpthread TLS fields.
+        constexpr std::size_t prefix_size = 4U * sizeof(std::uint64_t);
+        if (tls && (tls->pthread_size < prefix_size ||
+                    tls->pthread_size > 64U * 1024U ||
+                    (tls->pthread_size % 8U) != 0U ||
+                    (tls->tsd_offset % 8U) != 0U ||
+                    tls->tsd_offset > tls->pthread_size - prefix_size)) {
+            return {GuestThreadAddError::invalid_stack_size, 0};
+        }
+        if ((initial.pc & 3U) != 0U) {
+            return {GuestThreadAddError::invalid_cpu, 0};
+        }
+        std::uint32_t instruction = 0;
+        if (!fetch_instruction(vm_, initial.pc, instruction)) {
+            return {GuestThreadAddError::invalid_cpu, 0};
+        }
+        const std::uint64_t pthread_pages = tls
+            ? (static_cast<std::uint64_t>(tls->pthread_size) + page - 1U) / page
+            : 0U;
+        const std::uint64_t reservation = page + stack_size + pthread_pages * page;
+        if (reservation > kStackSlotSize) {
+            return {GuestThreadAddError::invalid_stack_size, 0};
+        }
+        const auto rw = Protection::read | Protection::write;
+        for (std::size_t slot = 0; slot < stack_slots_.size(); ++slot) {
+            if (stack_slots_[slot]) continue;
+            const std::uint64_t base = kStackArenaBase + slot * kStackSlotSize;
+            const VmResult mapped = vm_.map(base, reservation, rw);
+            if (!mapped) {
+                if (mapped.error == VmError::overlap) continue;
+                return {GuestThreadAddError::allocation_failed, 0};
+            }
+            const auto id = vm_.allocation_id_at(base);
+            if (!id || !vm_.protect_range(base, page, Protection::none) ||
+                !vm_.restrict_maximum_protection_range(
+                    base, page, Protection::none)) {
+                (void)vm_.unmap_range(base, reservation);
+                return {GuestThreadAddError::allocation_failed, 0};
+            }
+            const std::uint64_t pthread_base = base + page + stack_size;
+            const std::uint64_t tsd_base = tls ? pthread_base + tls->tsd_offset : 0U;
+            initial.sp = pthread_base;
+            if (tls) initial.tpidrro_el0 = tsd_base;
+            const GuestThreadAddResult added = add_worker(initial);
+            if (!added) {
+                (void)vm_.unmap_allocation(base, reservation, *id);
+                return added;
+            }
+            if (tls) {
+                std::array<std::byte, prefix_size> prefix{};
+                const auto encode = [&](std::size_t offset, std::uint64_t value) {
+                    for (std::size_t i = 0; i < 8U; ++i) {
+                        prefix[offset + i] = static_cast<std::byte>(
+                            (value >> (i * 8U)) & 0xffU);
+                    }
+                };
+                encode(0U, pthread_base);
+                encode(24U, threads_.back().identity.thread_self_port);
+                if (!vm_.write(tsd_base, prefix)) {
+                    // Atomic construction: on copyout failure undo both VM
+                    // ownership and thread-table identity publication.
+                    const MachThreadIdentity failed = threads_.back().identity;
+                    threads_.pop_back();
+                    (void)mach_.retire_worker_thread_identity(failed);
+                    (void)vm_.unmap_allocation(base, reservation, *id);
+                    return {GuestThreadAddError::allocation_failed, 0};
+                }
+            }
+            threads_.back().owned_stack = GuestOwnedStack{
+                base, reservation, *id, slot,
+                tls ? pthread_base : 0U, tsd_base,
+                tls ? tls->pthread_size : 0U};
+            stack_slots_[slot] = true;
+            return added;
+        }
+        return {GuestThreadAddError::allocation_failed, 0};
+    }
+
     [[nodiscard]] bool valid_initial_state(const CpuState& state) const noexcept {
         if ((state.pc & 3U) != 0U || (state.sp & 15U) != 0U || state.sp < 16U) {
             return false;

@@ -46,6 +46,7 @@
 #include "test_dynarmic_cooperative_threads.inc"
 #include "test_dynarmic_thread_termination.inc"
 #include "test_dynarmic_owned_stacks.inc"
+#include "test_dynarmic_owned_pthread_tsd.inc"
 #include "test_dynarmic_cross_mapping_memory.inc"
 
 int main() {
@@ -60,6 +61,7 @@ int main() {
     const int thread_group_result = dynarmic_cooperative_threads_main();
     const int terminate_result = dynarmic_thread_termination_main();
     const int owned_stacks_result = dynarmic_owned_stacks_main();
+    const int owned_tsd_result = dynarmic_owned_pthread_tsd_main();
     const int cross_mapping_result = dynarmic_cross_mapping_memory_main();
     return legacy_result == EXIT_SUCCESS &&
                    pauth_result == EXIT_SUCCESS &&
@@ -72,6 +74,7 @@ int main() {
                    thread_group_result == EXIT_SUCCESS &&
                    terminate_result == EXIT_SUCCESS &&
                    owned_stacks_result == EXIT_SUCCESS &&
+                   owned_tsd_result == EXIT_SUCCESS &&
                    cross_mapping_result == EXIT_SUCCESS
                ? EXIT_SUCCESS
                : EXIT_FAILURE;
