@@ -277,4 +277,103 @@ void test_guest_threads_direct() {
                "pthread TLS plus stack are reaped by one guarded allocation token");
     }
 
+
+    // Phase55: errno_t lives inside each worker's owned pthread tail.
+    // The TSD slot contains its guest address, never a host address.
+    // A malformed offset must fail before reserving an identity or mapping.
+    {
+        MachContext errno_mach;
+        GuestThreadGroup errno_group(vm, errno_mach, 8U);
+        CpuState main_cpu{};
+        main_cpu.pc = code;
+        main_cpu.sp = stack + vm.kPageSize;
+        CpuState worker_cpu = main_cpu;
+        worker_cpu.x[16] = kDarwinSysBsdthreadTerminate;
+        const auto main_id = errno_group.add_main(main_cpu);
+        expect(static_cast<bool>(main_id) &&
+                   errno_group.add_owned_worker_with_errno_tsd(
+                       worker_cpu, vm.kPageSize, 512U, 224U, 173U).error ==
+                       GuestThreadAddError::invalid_stack_size &&
+                   errno_group.add_owned_worker_with_errno_tsd(
+                       worker_cpu, vm.kPageSize, 512U, 224U, 224U).error ==
+                       GuestThreadAddError::invalid_stack_size &&
+                   errno_group.add_owned_worker_with_errno_tsd(
+                       worker_cpu, vm.kPageSize, 512U, 224U, UINT32_MAX).error ==
+                       GuestThreadAddError::invalid_stack_size &&
+                   errno_group.size() == 1U &&
+                   !vm.allocation_id_at(GuestThreadGroup::kStackArenaBase),
+               "malformed pthread errno offsets cannot consume worker resources");
+        const auto first = errno_group.add_owned_worker_with_errno_tsd(
+            worker_cpu, vm.kPageSize, 512U, 224U, 172U);
+        const auto second = errno_group.add_owned_worker_with_errno_tsd(
+            worker_cpu, vm.kPageSize, 512U, 224U, 172U);
+        const GuestThread* a = errno_group.find(first.thread_id);
+        const GuestThread* b = errno_group.find(second.thread_id);
+        const auto read64 = [&](std::uint64_t address)
+            -> std::optional<std::uint64_t> {
+            std::array<std::byte, 8> bytes{};
+            if (!vm.read(address, bytes)) return std::nullopt;
+            std::uint64_t value = 0U;
+            for (std::size_t i = 0; i < bytes.size(); ++i) {
+                value |= static_cast<std::uint64_t>(
+                    std::to_integer<unsigned char>(bytes[i])) << (i * 8U);
+            }
+            return value;
+        };
+        expect(first && second && a && b && a->owned_stack && b->owned_stack &&
+                   first.thread_id != second.thread_id &&
+                   a->cpu.tpidrro_el0 != b->cpu.tpidrro_el0 &&
+                   a->owned_stack->errno_address ==
+                       a->owned_stack->pthread_base + 172U &&
+                   b->owned_stack->errno_address ==
+                       b->owned_stack->pthread_base + 172U &&
+                   read64(a->cpu.tpidrro_el0) == a->owned_stack->pthread_base &&
+                   read64(b->cpu.tpidrro_el0) == b->owned_stack->pthread_base &&
+                   read64(a->cpu.tpidrro_el0 + 8U) ==
+                       a->owned_stack->errno_address &&
+                   read64(b->cpu.tpidrro_el0 + 8U) ==
+                       b->owned_stack->errno_address &&
+                   read64(a->cpu.tpidrro_el0 + 24U) ==
+                       a->identity.thread_self_port &&
+                   read64(b->cpu.tpidrro_el0 + 24U) ==
+                       b->identity.thread_self_port &&
+                   !errno_mach.pthread_registered(),
+               "each worker gets an isolated source-derived errno pointer");
+
+        const GuestOwnedStack lease_a = a && a->owned_stack
+            ? *a->owned_stack : GuestOwnedStack{};
+        const GuestOwnedStack lease_b = b && b->owned_stack
+            ? *b->owned_stack : GuestOwnedStack{};
+        const std::array<std::byte, 4> errno_a{
+            std::byte{42}, std::byte{0}, std::byte{0}, std::byte{0}};
+        const std::array<std::byte, 4> errno_b{
+            std::byte{14}, std::byte{0}, std::byte{0}, std::byte{0}};
+        std::array<std::byte, 4> observed_a{};
+        std::array<std::byte, 4> observed_b{};
+        expect(static_cast<bool>(vm.write(lease_a.errno_address, errno_a)) &&
+                   static_cast<bool>(vm.write(lease_b.errno_address, errno_b)) &&
+                   static_cast<bool>(vm.read(lease_a.errno_address, observed_a)) &&
+                   static_cast<bool>(vm.read(lease_b.errno_address, observed_b)) &&
+                   observed_a == errno_a && observed_b == errno_b,
+               "errno field stores independent writable guest values");
+        ScriptedBackend backend_a({{svc(1), false, 0, 0, 0, 0}});
+        ScriptedBackend backend_b({{svc(1), false, 0, 0, 0, 0}});
+        const auto exit_a = errno_group.run_slice(first.thread_id, backend_a, host, 1U);
+        const auto exit_b = errno_group.run_slice(second.thread_id, backend_b, host, 1U);
+        const auto reap_a = errno_group.reap_stopped_worker(first.thread_id);
+        const auto reap_b = errno_group.reap_stopped_worker(second.thread_id);
+        expect(exit_a && exit_b &&
+                   exit_a.process.reason == ProcessStopReason::thread_exited &&
+                   exit_b.process.reason == ProcessStopReason::thread_exited &&
+                   reap_a && reap_b && errno_group.size() == 1U &&
+                   vm.read(lease_a.errno_address, observed_a).error ==
+                       VmError::unmapped &&
+                   vm.read(lease_b.errno_address, observed_b).error ==
+                       VmError::unmapped &&
+                   !vm.allocation_id_at(lease_a.base) &&
+                   !vm.allocation_id_at(lease_b.base) &&
+                   errno_group.remaining_budget() == 6U && !errno_group.stopped(),
+               "errno storage retires with worker stack and TLS allocation");
+    }
+
 }
