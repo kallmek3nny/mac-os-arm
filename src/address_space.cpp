@@ -53,6 +53,11 @@ VmResult GuestAddressSpace::map(std::uint64_t base, std::uint64_t size,
     mappings_.emplace(base, Mapping{
         base, size, protection, maximum_protection, next_allocation_id_});
     ++next_allocation_id_;
+    // A backend may still hold a cached fault translation for an address that
+    // was previously unmapped or non-executable; new code must be refetched.
+    if (has_protection(protection, Protection::execute)) {
+        advance_code_generation();
+    }
     return {};
 }
 
@@ -60,6 +65,10 @@ VmResult GuestAddressSpace::unmap(std::uint64_t base, std::uint64_t size) {
     Mapping* mapping = find_exact_mapping(base, size);
     if (mapping == nullptr) {
         return {VmError::not_exact_mapping};
+    }
+    // Nothing after this point can fail, so invalidating first is safe.
+    if (has_protection(mapping->protection, Protection::execute)) {
+        advance_code_generation();
     }
 
     const std::uint64_t end = base + size;
@@ -88,6 +97,12 @@ VmResult GuestAddressSpace::unmap_range(std::uint64_t base, std::uint64_t size) 
     }
 
     const std::uint64_t end = base + size;
+    // Validation is complete. Drop translated code before any executable
+    // byte disappears; holes and purely data ranges keep the cache warm.
+    // unmap_allocation() funnels through here and inherits this behavior.
+    if (range_has_execute(base, size)) {
+        advance_code_generation();
+    }
     auto it = mappings_.lower_bound(base);
     if (it != mappings_.begin()) {
         --it; // The preceding mapping can straddle the removal start.
@@ -180,6 +195,12 @@ VmResult GuestAddressSpace::protect(std::uint64_t base, std::uint64_t size, Prot
         protection != Protection::none) {
         return {VmError::protection};
     }
+    // Validation is complete. Gaining or losing execute rights changes what
+    // an instruction fetch observes, so translated code must be refetched.
+    if (has_protection(mapping->protection, Protection::execute) ||
+        has_protection(protection, Protection::execute)) {
+        advance_code_generation();
+    }
     mapping->protection = protection;
     return {};
 }
@@ -221,6 +242,11 @@ VmResult GuestAddressSpace::protect_range(
         ++it;
     }
 
+    // Decide invalidation against the pre-change protections: the range can
+    // lose execute rights (current state) or gain them (requested state).
+    const bool touches_code = has_protection(protection, Protection::execute) ||
+                              range_has_execute(base, size);
+
     // Copy/split into a temporary map, then publish atomically: even an
     // allocation exception cannot leave partially changed VM protections.
     auto updated = mappings_;
@@ -250,6 +276,11 @@ VmResult GuestAddressSpace::protect_range(
         }
     }
     mappings_.swap(updated);
+    // Advance only after the noexcept publish, so a throwing copy leaves both
+    // the protections and the code epoch untouched.
+    if (touches_code) {
+        advance_code_generation();
+    }
     return {};
 }
 
@@ -315,6 +346,11 @@ VmResult GuestAddressSpace::load_bytes(std::uint64_t address, std::span<const st
     if (!validation) {
         return validation;
     }
+    // Validation is complete. Advance before copying: copy_into() can throw
+    // after storing a prefix, and a spurious epoch bump only forces a retranslate.
+    if (range_has_execute(address, bytes.size())) {
+        advance_code_generation();
+    }
     return copy_into(address, bytes);
 }
 
@@ -347,6 +383,11 @@ VmResult GuestAddressSpace::write(std::uint64_t address, std::span<const std::by
     const VmResult validation = validate_range(address, bytes.size(), Protection::write);
     if (!validation) {
         return validation;
+    }
+    // Validation is complete. Advance before copying: copy_into() can throw
+    // after storing a prefix, and a spurious epoch bump only forces a retranslate.
+    if (range_has_execute(address, bytes.size())) {
+        advance_code_generation();
     }
     return copy_into(address, bytes);
 }
@@ -402,6 +443,31 @@ VmResult GuestAddressSpace::validate_range(
         ++it;
     }
     return {};
+}
+
+bool GuestAddressSpace::range_has_execute(
+    std::uint64_t address, std::uint64_t size) const noexcept {
+    if (size == 0) {
+        return false;
+    }
+    // Clamp instead of wrapping so an oversized length still inspects only
+    // mappings that actually exist above the start address.
+    const std::uint64_t end = range_overflows(address, size)
+        ? std::numeric_limits<std::uint64_t>::max()
+        : address + size;
+    auto it = mappings_.upper_bound(address);
+    if (it != mappings_.begin()) {
+        --it; // The preceding mapping can straddle the range start.
+    }
+    for (; it != mappings_.end() && it->second.base < end; ++it) {
+        if (it->second.base + it->second.size <= address) {
+            continue;
+        }
+        if (has_protection(it->second.protection, Protection::execute)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 Mapping* GuestAddressSpace::find_exact_mapping(std::uint64_t base, std::uint64_t size) {

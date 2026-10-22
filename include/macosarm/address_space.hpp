@@ -102,6 +102,19 @@ public:
     [[nodiscard]] std::vector<Mapping> mappings() const;
     [[nodiscard]] std::size_t resident_page_count() const noexcept { return pages_.size(); }
 
+    // Monotonic code-invalidation epoch for translating execution backends.
+    // It advances whenever a successful operation may change what an
+    // instruction fetch observes: creating an executable mapping, removing or
+    // re-protecting a range that was or becomes executable, and loader or
+    // guest stores that touch currently executable bytes. A backend that
+    // caches translated code must discard it when this value differs from the
+    // one it translated against. Reads, fetches, failed operations, and
+    // traffic confined to non-executable memory never advance it, so ordinary
+    // data mmap/munmap/mprotect keeps translated code warm.
+    [[nodiscard]] std::uint64_t code_generation() const noexcept {
+        return code_generation_;
+    }
+
 private:
     using Page = std::array<std::byte, kPageSize>;
 
@@ -109,6 +122,11 @@ private:
     // splits do not turn neighboring virtual pages into holes.
     [[nodiscard]] VmResult validate_range(std::uint64_t address, std::uint64_t size,
                                           Protection required) const noexcept;
+    // True when any currently mapped byte of the range is executable. Holes
+    // are skipped; callers perform their own coverage validation.
+    [[nodiscard]] bool range_has_execute(std::uint64_t address,
+                                         std::uint64_t size) const noexcept;
+    void advance_code_generation() noexcept { ++code_generation_; }
     [[nodiscard]] Mapping* find_exact_mapping(std::uint64_t base, std::uint64_t size);
     [[nodiscard]] VmResult copy_out(std::uint64_t address, std::span<std::byte> out) const;
     [[nodiscard]] VmResult copy_into(std::uint64_t address, std::span<const std::byte> bytes);
@@ -116,6 +134,7 @@ private:
 
     std::map<std::uint64_t, Mapping> mappings_;
     std::uint64_t next_allocation_id_{1};
+    std::uint64_t code_generation_{0};
     std::unordered_map<std::uint64_t, std::unique_ptr<Page>> pages_;
 };
 

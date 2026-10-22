@@ -333,6 +333,102 @@ int main() {
                "instruction fetch spans adjacent executable mapping fragments");
     }
 
+    {
+        // Code-invalidation epoch consumed by translating execution backends.
+        GuestAddressSpace vm;
+        constexpr std::uint64_t page = GuestAddressSpace::kPageSize;
+        constexpr std::uint64_t code = 0x100000000ULL;
+        constexpr std::uint64_t data = 0x200000000ULL;
+        constexpr std::uint64_t jit = 0x300000000ULL;
+        constexpr std::uint64_t legacy = 0x400000000ULL;
+        const auto rw = Protection::read | Protection::write;
+        const auto rx = Protection::read | Protection::execute;
+        const auto rwx = rw | Protection::execute;
+        const std::array<std::byte, 4> insn{
+            std::byte{0x1f}, std::byte{0x20}, std::byte{0x03}, std::byte{0xd5}};
+        std::array<std::byte, 4> scratch{};
+
+        expect(vm.code_generation() == 0U,
+               "fresh address space starts at code generation zero");
+        std::uint64_t generation = vm.code_generation();
+        expect(static_cast<bool>(vm.map(data, 2U * page, rw)) &&
+                   static_cast<bool>(vm.write(data, insn)) &&
+                   static_cast<bool>(vm.load_bytes(data, insn)) &&
+                   static_cast<bool>(vm.read(data, scratch)) &&
+                   static_cast<bool>(vm.protect_range(data + page, page, Protection::read)) &&
+                   static_cast<bool>(vm.unmap_range(data + page, page)) &&
+                   vm.code_generation() == generation,
+               "data-only map, store, mprotect, and munmap keep translated code warm");
+
+        expect(static_cast<bool>(vm.map(code, 2U * page, rx)) &&
+                   vm.code_generation() > generation,
+               "executable map advances the code generation");
+        generation = vm.code_generation();
+        expect(static_cast<bool>(vm.load_bytes(code, insn)) &&
+                   vm.code_generation() > generation,
+               "loader store into executable bytes advances the code generation");
+        generation = vm.code_generation();
+        expect(static_cast<bool>(vm.fetch_code(code, scratch)) && scratch == insn &&
+                   static_cast<bool>(vm.read(code, scratch)) &&
+                   vm.code_generation() == generation,
+               "instruction fetch and data read never advance the code generation");
+        expect(vm.write(code, insn).error == VmError::protection &&
+                   vm.protect_range(code, page, rwx).error == VmError::protection &&
+                   vm.map(code, page, rx).error == VmError::overlap &&
+                   vm.unmap(code, page).error == VmError::not_exact_mapping &&
+                   vm.protect(code, page, rwx).error == VmError::not_exact_mapping &&
+                   vm.code_generation() == generation,
+               "failed operations leave the code generation untouched");
+
+        expect(static_cast<bool>(vm.map(jit, page, rwx)), "RWX JIT mapping succeeds");
+        generation = vm.code_generation();
+        expect(static_cast<bool>(vm.write(jit, insn)) &&
+                   vm.code_generation() > generation,
+               "guest store into executable bytes advances the code generation");
+
+        generation = vm.code_generation();
+        expect(static_cast<bool>(vm.protect_range(code + page, page, Protection::read)) &&
+                   vm.code_generation() > generation,
+               "dropping execute rights from a subrange advances the code generation");
+        generation = vm.code_generation();
+        expect(static_cast<bool>(vm.protect_range(code + page, page, Protection::none)) &&
+                   vm.code_generation() == generation,
+               "re-protecting a non-executable fragment keeps the code generation");
+        expect(static_cast<bool>(vm.protect_range(code + page, page, rx)) &&
+                   vm.code_generation() > generation,
+               "regaining execute rights advances the code generation");
+
+        expect(static_cast<bool>(vm.map(legacy, page, rw)), "legacy exact mapping succeeds");
+        generation = vm.code_generation();
+        expect(static_cast<bool>(vm.protect(legacy, page, rx)) &&
+                   vm.code_generation() > generation,
+               "exact protect gaining execute advances the code generation");
+        generation = vm.code_generation();
+        expect(static_cast<bool>(vm.protect(legacy, page, rw)) &&
+                   vm.code_generation() > generation,
+               "exact protect losing execute advances the code generation");
+        generation = vm.code_generation();
+        expect(static_cast<bool>(vm.protect(legacy, page, Protection::read)) &&
+                   static_cast<bool>(vm.unmap(legacy, page)) &&
+                   vm.code_generation() == generation,
+               "exact protect and unmap of data memory keep the code generation");
+        expect(static_cast<bool>(vm.unmap(jit, page)) &&
+                   vm.code_generation() > generation,
+               "exact unmap of executable memory advances the code generation");
+
+        generation = vm.code_generation();
+        expect(static_cast<bool>(vm.unmap_range(code + 8U * page, page)) &&
+                   static_cast<bool>(vm.restrict_maximum_protection_range(code, page, rx)) &&
+                   vm.code_generation() == generation,
+               "munmap of a hole and max-protection sealing keep the code generation");
+        const auto code_allocation = vm.allocation_id_at(code);
+        expect(code_allocation.has_value() &&
+                   static_cast<bool>(vm.unmap_allocation(code, 2U * page, *code_allocation)) &&
+                   vm.code_generation() > generation &&
+                   vm.fetch_code(code, scratch).error == VmError::unmapped,
+               "reaping an executable allocation advances the code generation");
+    }
+
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return EXIT_FAILURE;
