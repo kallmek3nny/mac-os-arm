@@ -60,6 +60,24 @@ if(MACOSARM_ENABLE_DYNARMIC)
         $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>
         $<$<CXX_COMPILER_ID:MSVC>:/W4;/WX>
     )
+
+    # Runs a raw ARM64 Mach-O through the Dynarmic session. Only guest stdout
+    # and stderr reach the host; every other descriptor reports EBADF.
+    add_executable(macho-run src/macho_run.cpp)
+    target_link_libraries(macho-run PRIVATE macosarm_dynarmic)
+    target_compile_options(macho-run PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>
+        $<$<CXX_COMPILER_ID:MSVC>:/W4;/WX>
+    )
+    # MinGW: no executable that links the JIT backend (macho-run and every
+    # Dynarmic test) may resolve libstdc++-6.dll or libgcc_s_seh-1.dll from
+    # PATH at load time. If PATH finds an older, ABI-incompatible copy first
+    # (for example Git's mingw64/bin), the executable fails to start with
+    # STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139) under CTest. INTERFACE link
+    # options carry over to the link step of each consumer.
+    if(MINGW)
+        target_link_options(macosarm_dynarmic INTERFACE -static-libstdc++ -static-libgcc)
+    endif()
 endif()
 
 include(CTest)
@@ -258,6 +276,42 @@ if(BUILD_TESTING)
             $<$<CXX_COMPILER_ID:MSVC>:/W4;/WX>
         )
         add_test(NAME dynarmic-mach-msg-transport COMMAND test_mach_msg_dynarmic)
+
+        # End-to-end macho-run checks. The fixture tool writes a raw ARM64
+        # Mach-O; macho_run_check.cmake runs it through macho-run and compares
+        # the exact guest exit status and stdout bytes.
+        add_executable(macho_run_fixture tests/macho_run_fixture.cpp)
+        target_compile_options(macho_run_fixture PRIVATE
+            $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>
+            $<$<CXX_COMPILER_ID:MSVC>:/W4;/WX>
+        )
+        # MinGW: an ABI-incompatible libstdc++-6.dll found earlier on PATH
+        # (for example Git's mingw64/bin) crashes the generator inside
+        # std::ofstream. Link the GCC runtime statically so the fixture does
+        # not depend on whichever runtime DLL the PATH resolves first.
+        if(MINGW)
+            target_link_options(macho_run_fixture PRIVATE -static-libstdc++ -static-libgcc)
+        endif()
+        add_test(
+            NAME macho-run-hello-exit-status
+            COMMAND "${CMAKE_COMMAND}"
+                "-DFIXTURE_TOOL=$<TARGET_FILE:macho_run_fixture>"
+                "-DRUNNER=$<TARGET_FILE:macho-run>"
+                -DKIND=hello
+                "-DIMAGE=${CMAKE_CURRENT_BINARY_DIR}/macho-run-hello.bin"
+                -DEXPECTED_EXIT=7
+                -DEXPECTED_STDOUT=hello
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
+        add_test(
+            NAME macho-run-guest-argc
+            COMMAND "${CMAKE_COMMAND}"
+                "-DFIXTURE_TOOL=$<TARGET_FILE:macho_run_fixture>"
+                "-DRUNNER=$<TARGET_FILE:macho-run>"
+                -DKIND=argc
+                "-DIMAGE=${CMAKE_CURRENT_BINARY_DIR}/macho-run-argc.bin"
+                "-DGUEST_ARGS=one two"
+                -DEXPECTED_EXIT=3
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
     endif()
 endif()
 
