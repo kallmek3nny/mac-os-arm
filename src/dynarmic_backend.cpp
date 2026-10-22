@@ -103,6 +103,7 @@ struct DynarmicBackend::Impl final : Dynarmic::A64::UserCallbacks {
 
         if (address_space != &new_address_space) {
             address_space = &new_address_space;
+            observed_code_generation = address_space->code_generation();
             jit->ClearCache();
         }
 
@@ -114,6 +115,10 @@ struct DynarmicBackend::Impl final : Dynarmic::A64::UserCallbacks {
         while (executed < instruction_budget) {
             pending_result.reset();
             jit->ClearHalt(Dynarmic::HaltReason::UserDefined1);
+            // Host-side mapping or protection changes between runs and guest
+            // stores into code during the previous step all surface as a new
+            // code generation; drop stale translations before fetching.
+            synchronize_code_generation();
 
             const std::optional<std::uint32_t> instruction = peek_instruction();
             if (instruction.has_value() && is_pointer_auth_instruction(*instruction)) {
@@ -235,6 +240,20 @@ struct DynarmicBackend::Impl final : Dynarmic::A64::UserCallbacks {
     std::uint64_t GetCNTPCT() override { return 0; }
 
 private:
+    // The address space advances its code generation whenever guest code
+    // bytes, execute permissions, or mappings may have changed. Dynarmic caches
+    // translated blocks by guest PC, so drop every cached block before the next
+    // fetch once the generation moves.
+    void synchronize_code_generation() {
+        const std::uint64_t generation = address_space->code_generation();
+        if (generation != observed_code_generation) {
+            observed_code_generation = generation;
+            jit->ClearCache();
+        }
+    }
+
+    std::uint64_t observed_code_generation{};
+
     [[nodiscard]] std::optional<std::uint32_t> peek_instruction() const {
         std::array<std::byte, 4> bytes{};
         const VmResult result = address_space->fetch_code(jit->GetPC(), bytes);
