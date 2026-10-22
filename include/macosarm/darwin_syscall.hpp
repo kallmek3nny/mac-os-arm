@@ -12,6 +12,7 @@ namespace macosarm {
 
 constexpr std::uint32_t kDarwinSvcImmediate = 0x80;
 constexpr std::uint64_t kDarwinSysExit = 1;
+constexpr std::uint64_t kDarwinSysRead = 3;
 constexpr std::uint64_t kDarwinSysWrite = 4;
 constexpr std::uint64_t kDarwinSysGetpid = 20;
 constexpr std::uint64_t kDarwinSysGetuid = 24;
@@ -28,6 +29,7 @@ constexpr std::uint64_t kDarwinSysBsdthreadTerminate = 361;
 constexpr std::uint64_t kDarwinSysBsdthreadRegister = 366;
 constexpr std::uint64_t kDarwinSysThreadSelfid = 372;
 constexpr std::uint32_t kDarwinErrnoEio = 5;
+constexpr std::uint32_t kDarwinErrnoEbadf = 9;
 constexpr std::uint32_t kDarwinErrnoEnomem = 12;
 constexpr std::uint32_t kDarwinErrnoEacces = 13;
 constexpr std::uint32_t kDarwinErrnoEinval = 22;
@@ -62,6 +64,15 @@ struct HostWriteResult {
     }
 };
 
+struct HostReadResult {
+    std::uint64_t bytes_read{};
+    std::uint32_t error{};
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return error == 0;
+    }
+};
+
 class DarwinHostServices {
 public:
     virtual ~DarwinHostServices() = default;
@@ -69,6 +80,17 @@ public:
     [[nodiscard]] virtual HostWriteResult write(
         std::int32_t fd,
         std::span<const std::byte> bytes) = 0;
+
+    // Fill at most bytes.size() bytes from guest descriptor fd. A successful
+    // zero-byte result is end-of-file. Hosts that do not override this expose
+    // no readable descriptors and report EBADF, never fabricated input.
+    [[nodiscard]] virtual HostReadResult read(
+        std::int32_t fd,
+        std::span<std::byte> bytes) {
+        static_cast<void>(fd);
+        static_cast<void>(bytes);
+        return {0, kDarwinErrnoEbadf};
+    }
 };
 
 enum class SyscallAction {

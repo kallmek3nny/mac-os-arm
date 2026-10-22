@@ -19,10 +19,39 @@ namespace {
 constexpr std::uint32_t kGuestErrnoEio = 5;
 constexpr std::uint32_t kGuestErrnoEbadf = 9;
 
-// Only the guest's stdout and stderr reach the host, as raw bytes. No other
-// descriptor exists in the translated process yet, so those report EBADF.
+// The guest's stdin, stdout and stderr reach the host's, as raw bytes. No
+// other descriptor exists in the translated process yet, so those report EBADF.
 class ConsoleHost final : public macosarm::DarwinHostServices {
 public:
+    // Like a canonical-mode terminal read, return after a newline, a full
+    // buffer or end-of-file rather than blocking until the buffer fills.
+    // A zero-length request only validates the descriptor and consumes nothing.
+    macosarm::HostReadResult read(
+        std::int32_t fd,
+        std::span<std::byte> bytes) override {
+        if (fd != 0) {
+            return {0, kGuestErrnoEbadf};
+        }
+        std::size_t received = 0;
+        while (received < bytes.size()) {
+            const int value = std::fgetc(stdin);
+            if (value == EOF) {
+                break;
+            }
+            bytes[received++] = static_cast<std::byte>(static_cast<unsigned char>(value));
+            if (value == '\n') {
+                break;
+            }
+        }
+        const bool failed = received == 0 && !bytes.empty() && std::ferror(stdin) != 0;
+        // Keep end-of-file non-sticky, like a terminal after an EOF keystroke.
+        std::clearerr(stdin);
+        if (failed) {
+            return {0, kGuestErrnoEio};
+        }
+        return {received, 0};
+    }
+
     macosarm::HostWriteResult write(
         std::int32_t fd,
         std::span<const std::byte> bytes) override {

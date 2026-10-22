@@ -88,6 +88,83 @@ void set_error(CpuState& state, std::uint32_t error) noexcept {
     return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
 }
 
+// XNU bsd/kern/sys_generic.c: read_nocancel resolves the descriptor (EBADF)
+// before dofileread rejects nbyte > INT_MAX (EINVAL) or copyout faults
+// (EFAULT). A read may legally return fewer bytes than requested, so issue
+// exactly one bounded host read and never block again to fill the buffer.
+// The destination is probed first, so host input is never consumed and then
+// dropped because the guest buffer cannot receive it.
+[[nodiscard]] SyscallDispatchResult dispatch_read(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    DarwinHostServices& host,
+    std::uint64_t syscall_number) {
+
+    const auto finish = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    };
+    const auto contract_violation = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::host_contract_violation,
+            SyscallAction::resume, syscall_number, 0};
+    };
+
+    const auto fd = static_cast<std::int32_t>(static_cast<std::uint32_t>(state.x[0]));
+    const std::uint64_t guest_address = state.x[1];
+    const std::uint64_t nbyte = state.x[2];
+
+    // A zero-length host read validates the descriptor without consuming
+    // input; a bad descriptor wins over any later argument error.
+    const auto check_descriptor =
+        [&](std::uint32_t fallback_error) -> SyscallDispatchResult {
+        const HostReadResult probe = host.read(fd, std::span<std::byte>{});
+        if (probe.bytes_read != 0U) {
+            return contract_violation();
+        }
+        if (!probe) {
+            set_error(state, probe.error);
+        } else if (fallback_error != 0U) {
+            set_error(state, fallback_error);
+        } else {
+            set_success(state, 0U);
+        }
+        return finish();
+    };
+
+    if (nbyte == 0U) {
+        return check_descriptor(0U);
+    }
+    if (nbyte > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+        return check_descriptor(kDarwinErrnoEinval);
+    }
+    const auto requested = static_cast<std::size_t>(
+        std::min<std::uint64_t>(nbyte, kIoChunkSize));
+    if (!address_space.probe_write(guest_address, requested)) {
+        return check_descriptor(kDarwinErrnoEfault);
+    }
+
+    std::array<std::byte, kIoChunkSize> chunk{};
+    const HostReadResult host_result = host.read(
+        fd, std::span<std::byte>(chunk.data(), requested));
+    if (!host_result) {
+        set_error(state, host_result.error);
+        return finish();
+    }
+    if (host_result.bytes_read > requested) {
+        return contract_violation();
+    }
+    const auto received = static_cast<std::size_t>(host_result.bytes_read);
+    if (received != 0U &&
+        !address_space.write(guest_address,
+                             std::span<const std::byte>(chunk.data(), received))) {
+        set_error(state, kDarwinErrnoEfault);
+        return finish();
+    }
+    set_success(state, host_result.bytes_read);
+    return finish();
+}
+
 // The narrow anonymous mmap contract used by guest malloc and libsystem.
 // XNU bsd/kern/kern_mman.c uses mach_vm_map_kernel for MAP_ANON and
 // treats non-fixed addr as a start hint. We currently have neither vnode
@@ -428,6 +505,8 @@ SyscallDispatchResult dispatch_darwin_syscall(
             syscall_number,
             static_cast<std::int32_t>(static_cast<std::uint32_t>(state.x[0])),
         };
+    case kDarwinSysRead:
+        return dispatch_read(state, address_space, host, syscall_number);
     case kDarwinSysWrite:
         return dispatch_write(state, address_space, host, syscall_number);
     case kDarwinSysMmap:

@@ -55,6 +55,50 @@ struct CaptureHost final : macosarm::DarwinHostServices {
     }
 };
 
+// Scripted descriptor input for read(2). Only readable_fd has data; every
+// other descriptor reports EBADF, including zero-length descriptor probes.
+// Every host call is recorded so tests can prove input is never consumed
+// when the guest destination is rejected first.
+struct ReadHost final : macosarm::DarwinHostServices {
+    std::vector<std::byte> input;
+    std::size_t consumed{};
+    std::vector<std::int32_t> fds;
+    std::vector<std::size_t> requests;
+    std::int32_t readable_fd{0};
+    std::uint32_t next_error{};
+    bool violate_contract{};
+
+    macosarm::HostWriteResult write(
+        std::int32_t fd,
+        std::span<const std::byte> bytes) override {
+        static_cast<void>(fd);
+        static_cast<void>(bytes);
+        return {0, macosarm::kDarwinErrnoEbadf};
+    }
+
+    macosarm::HostReadResult read(
+        std::int32_t fd,
+        std::span<std::byte> bytes) override {
+        fds.push_back(fd);
+        requests.push_back(bytes.size());
+        if (fd != readable_fd) {
+            return {0, macosarm::kDarwinErrnoEbadf};
+        }
+        if (next_error != 0) {
+            const std::uint32_t error = next_error;
+            next_error = 0;
+            return {0, error};
+        }
+        if (violate_contract) {
+            return {static_cast<std::uint64_t>(bytes.size()) + 1, 0};
+        }
+        const std::size_t count = std::min(bytes.size(), input.size() - consumed);
+        std::copy_n(input.begin() + static_cast<std::ptrdiff_t>(consumed), count, bytes.begin());
+        consumed += count;
+        return {count, 0};
+    }
+};
+
 macosarm::ExecutionResult svc(std::uint32_t immediate = macosarm::kDarwinSvcImmediate) {
     return {
         macosarm::StopReason::supervisor_call,
@@ -987,6 +1031,116 @@ int main() {
         const auto result = macosarm::dispatch_darwin_syscall(state, vm, svc(), host);
         expect(result.error == macosarm::SyscallDispatchError::host_contract_violation,
                "impossible host write count is rejected");
+    }
+
+    {
+        // XNU bsd/kern/sys_generic.c read(2): a bad descriptor wins over
+        // argument errors, nbyte > INT_MAX is EINVAL, and an unwritable
+        // destination is EFAULT without consuming any host input.
+        constexpr std::uint64_t page = macosarm::GuestAddressSpace::kPageSize;
+        constexpr std::uint64_t read_base = 0x800000000ULL;
+        constexpr std::uint64_t io_chunk = 64U * 1024U; // dispatcher's bounded host read
+        constexpr std::int32_t closed_fd = 7;
+        const auto rw = macosarm::Protection::read | macosarm::Protection::write;
+        const auto run_read = [](macosarm::GuestAddressSpace& vm, ReadHost& host,
+                                 std::int32_t fd, std::uint64_t address,
+                                 std::uint64_t nbyte, macosarm::CpuState& state) {
+            state = {};
+            state.x[0] = static_cast<std::uint32_t>(fd);
+            state.x[1] = address;
+            state.x[2] = nbyte;
+            state.x[16] = macosarm::kDarwinSysRead;
+            return macosarm::dispatch_darwin_syscall(state, vm, svc(), host);
+        };
+        const auto failed_with = [](const macosarm::SyscallDispatchResult& result,
+                                    macosarm::CpuState& state, std::uint32_t error) {
+            return static_cast<bool>(result) && carry_is_set(state) && state.x[0] == error;
+        };
+
+        {
+            macosarm::GuestAddressSpace vm;
+            ReadHost host;
+            host.input = {std::byte{'h'}, std::byte{'e'}, std::byte{'y'}};
+            expect(static_cast<bool>(vm.map(read_base, page, rw)), "read destination maps");
+            macosarm::CpuState state{};
+            const auto result = run_read(vm, host, 0, read_base, 16U, state);
+            std::array<std::byte, 3> landed{};
+            expect(static_cast<bool>(result) && !carry_is_set(state) && state.x[0] == 3U &&
+                       host.consumed == 3U &&
+                       host.requests == std::vector<std::size_t>{16U} &&
+                       static_cast<bool>(vm.read(read_base, landed)) &&
+                       std::equal(landed.begin(), landed.end(), host.input.begin()),
+                   "read copies one short host result without blocking to refill");
+            const auto at_eof = run_read(vm, host, 0, read_base, 16U, state);
+            expect(static_cast<bool>(at_eof) && !carry_is_set(state) && state.x[0] == 0U,
+                   "read at end of file succeeds with zero bytes");
+        }
+
+        {
+            macosarm::GuestAddressSpace vm;
+            ReadHost host;
+            host.input = {std::byte{'x'}};
+            macosarm::CpuState state{};
+            const auto empty = run_read(vm, host, 0, read_base, 0U, state);
+            expect(static_cast<bool>(empty) && !carry_is_set(state) && state.x[0] == 0U &&
+                       host.consumed == 0U && host.requests == std::vector<std::size_t>{0U},
+                   "zero-length read probes the descriptor without touching guest memory");
+            const auto closed = run_read(vm, host, closed_fd, read_base, 0U, state);
+            expect(failed_with(closed, state, macosarm::kDarwinErrnoEbadf),
+                   "zero-length read on a closed descriptor is EBADF");
+            constexpr std::uint64_t too_large = 0x80000000ULL;
+            const auto oversized = run_read(vm, host, 0, read_base, too_large, state);
+            expect(failed_with(oversized, state, macosarm::kDarwinErrnoEinval) &&
+                       host.consumed == 0U,
+                   "read rejects nbyte above INT_MAX with EINVAL");
+            const auto closed_oversized =
+                run_read(vm, host, closed_fd, read_base, too_large, state);
+            expect(failed_with(closed_oversized, state, macosarm::kDarwinErrnoEbadf),
+                   "bad descriptor wins over oversized nbyte");
+            const auto unmapped = run_read(vm, host, 0, read_base, 1U, state);
+            expect(failed_with(unmapped, state, macosarm::kDarwinErrnoEfault) &&
+                       host.consumed == 0U,
+                   "unmapped read destination is EFAULT without consuming input");
+            const auto closed_unmapped = run_read(vm, host, closed_fd, read_base, 1U, state);
+            expect(failed_with(closed_unmapped, state, macosarm::kDarwinErrnoEbadf),
+                   "bad descriptor wins over an unmapped destination");
+            const std::vector<std::byte> original{std::byte{'r'}};
+            load_readable(vm, read_base, original);
+            const auto read_only = run_read(vm, host, 0, read_base, 1U, state);
+            std::array<std::byte, 1> kept{};
+            expect(failed_with(read_only, state, macosarm::kDarwinErrnoEfault) &&
+                       host.consumed == 0U &&
+                       static_cast<bool>(vm.read(read_base, kept)) && kept[0] == std::byte{'r'},
+                   "read-only destination is EFAULT and preserves guest bytes");
+        }
+
+        {
+            macosarm::GuestAddressSpace vm;
+            ReadHost host;
+            host.input.assign(static_cast<std::size_t>(io_chunk + page), std::byte{0x5a});
+            expect(static_cast<bool>(vm.map(read_base, 2U * io_chunk, rw)),
+                   "large read destination maps");
+            macosarm::CpuState state{};
+            const auto bounded = run_read(vm, host, 0, read_base, 2U * io_chunk, state);
+            expect(static_cast<bool>(bounded) && !carry_is_set(state) &&
+                       state.x[0] == io_chunk && host.consumed == io_chunk &&
+                       host.requests ==
+                           std::vector<std::size_t>{static_cast<std::size_t>(io_chunk)},
+                   "read issues exactly one bounded host read per syscall");
+            host.next_error = macosarm::kDarwinErrnoEio;
+            const auto failed = run_read(vm, host, 0, read_base, 1U, state);
+            expect(failed_with(failed, state, macosarm::kDarwinErrnoEio) &&
+                       host.consumed == io_chunk,
+                   "host read errors propagate to the guest");
+            host.violate_contract = true;
+            const auto violated = run_read(vm, host, 0, read_base, 1U, state);
+            expect(violated.error == macosarm::SyscallDispatchError::host_contract_violation,
+                   "impossible host read count is rejected");
+            const auto violated_probe = run_read(vm, host, 0, read_base, 0U, state);
+            expect(violated_probe.error ==
+                       macosarm::SyscallDispatchError::host_contract_violation,
+                   "nonzero descriptor probe count is rejected");
+        }
     }
 
     if (failures != 0) {
