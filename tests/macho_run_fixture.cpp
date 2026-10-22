@@ -5,6 +5,8 @@
 //
 //   hello: write(1, "hello", 5); exit(7)
 //   argc:  exit(argc), loaded from the Darwin startup stack at [sp]
+//   echo:  n = read(0, buf, 64); write(1, buf, n); exit(n), or exit(100)
+//          when read fails
 
 #include <array>
 #include <cstddef>
@@ -105,8 +107,33 @@ constexpr std::array<std::uint32_t, 3> kArgcCode{
     0xd4001001U, // svc #0x80
 };
 
+// n = read(0, buffer, 64); write(1, buffer, n); exit(n). A failed read
+// (carry set) exits 100 instead, so an errno cannot pass for a byte count.
+// The buffer lies in the zero-filled tail of __DATA, past "hello".
+constexpr std::array<std::uint32_t, 19> kEchoCode{
+    0xd2800000U, // mov x0, #0 (stdin)
+    0xd2882001U, // mov x1, #0x4100
+    0xf2c00021U, // movk x1, #1, lsl #32 -> 0x100004100
+    0xd2800802U, // mov x2, #64
+    0xd2800070U, // mov x16, #3 (read)
+    0xd4001001U, // svc #0x80
+    0x54000142U, // b.cs read_failed (+40)
+    0xaa0003e2U, // mov x2, x0 -> bytes read
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd2882001U, // mov x1, #0x4100
+    0xf2c00021U, // movk x1, #1, lsl #32
+    0xd2800090U, // mov x16, #4 (write)
+    0xd4001001U, // svc #0x80
+    0xaa0203e0U, // mov x0, x2
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800c80U, // read_failed: mov x0, #100
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+};
+
 int usage() {
-    std::cerr << "usage: macho_run_fixture <hello|argc> <output-path>\n";
+    std::cerr << "usage: macho_run_fixture <hello|argc|echo> <output-path>\n";
     return 2;
 }
 
@@ -122,6 +149,8 @@ int main(int argc, char** argv) {
         bytes = image(kHelloCode);
     } else if (kind == "argc") {
         bytes = image(kArgcCode);
+    } else if (kind == "echo") {
+        bytes = image(kEchoCode);
     } else {
         return usage();
     }
