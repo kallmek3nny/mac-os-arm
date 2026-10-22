@@ -14,9 +14,15 @@ constexpr std::uint32_t kDarwinSvcImmediate = 0x80;
 constexpr std::uint64_t kDarwinSysExit = 1;
 constexpr std::uint64_t kDarwinSysWrite = 4;
 constexpr std::uint64_t kDarwinSysGetpid = 20;
+constexpr std::uint64_t kDarwinSysGetuid = 24;
+constexpr std::uint64_t kDarwinSysGeteuid = 25;
+constexpr std::uint64_t kDarwinSysGetppid = 39;
+constexpr std::uint64_t kDarwinSysGetegid = 43;
+constexpr std::uint64_t kDarwinSysGetgid = 47;
 constexpr std::uint64_t kDarwinSysMunmap = 73;
 constexpr std::uint64_t kDarwinSysMprotect = 74;
 constexpr std::uint64_t kDarwinSysMmap = 197;
+constexpr std::uint64_t kDarwinSysIssetugid = 327;
 constexpr std::uint64_t kDarwinSysBsdthreadCreate = 360;
 constexpr std::uint64_t kDarwinSysBsdthreadTerminate = 361;
 constexpr std::uint64_t kDarwinSysBsdthreadRegister = 366;
@@ -27,6 +33,14 @@ constexpr std::uint32_t kDarwinErrnoEacces = 13;
 constexpr std::uint32_t kDarwinErrnoEinval = 22;
 constexpr std::uint32_t kDarwinErrnoEfault = 14;
 constexpr std::uint32_t kDarwinErrnoEnosys = 78;
+
+// Synthetic POSIX credentials for a translated process: an ordinary,
+// non-setugid macOS login user (uid 501, gid 20 "staff") whose parent is
+// launchd (pid 1). These never reflect host credentials or host process
+// ancestry, and they do not imply set*id, fork, or exec support.
+constexpr std::uint32_t kDarwinSyntheticUserId = 501;
+constexpr std::uint32_t kDarwinSyntheticGroupId = 20;
+constexpr std::uint32_t kDarwinSyntheticParentProcessId = 1;
 constexpr std::uint32_t kA64PstateCarry = 1u << 29;
 
 // XNU bsd/sys/mman.h, kept separate from host OS mmap flags.

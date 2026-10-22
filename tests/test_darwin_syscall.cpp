@@ -548,6 +548,71 @@ int main() {
     }
 
     {
+        // XNU syscalls.master #24 getuid, #25 geteuid, #39 getppid,
+        // #43 getegid, #47 getgid and #327 issetugid always succeed. Their
+        // answers are synthetic, host-independent POSIX credentials.
+        expect(macosarm::kDarwinSysGetuid == 24U &&
+                   macosarm::kDarwinSysGeteuid == 25U &&
+                   macosarm::kDarwinSysGetppid == 39U &&
+                   macosarm::kDarwinSysGetegid == 43U &&
+                   macosarm::kDarwinSysGetgid == 47U &&
+                   macosarm::kDarwinSysIssetugid == 327U,
+               "credential syscalls use XNU BSD syscall numbers");
+        expect(macosarm::kDarwinSyntheticUserId == 501U &&
+                   macosarm::kDarwinSyntheticGroupId == 20U &&
+                   macosarm::kDarwinSyntheticParentProcessId == 1U,
+               "synthetic credentials are a non-root staff user under launchd");
+
+        macosarm::GuestAddressSpace vm;
+        CaptureHost host;
+        macosarm::MachContext context;
+        macosarm::MachContext other;
+        macosarm::CpuState state{};
+        const auto query = [&](macosarm::MachContext& process,
+                               std::uint64_t number,
+                               std::uint64_t expected,
+                               const std::string& label) {
+            state = {};
+            state.x[0] = UINT64_MAX;
+            state.x[16] = number;
+            state.pstate = macosarm::kA64PstateCarry;
+            const auto result = macosarm::dispatch_darwin_syscall(
+                state, vm, svc(), host, process);
+            expect(static_cast<bool>(result) &&
+                       result.action == macosarm::SyscallAction::resume &&
+                       static_cast<std::uint64_t>(result.syscall_number) == number &&
+                       state.x[0] == expected && !carry_is_set(state),
+                   label + " returns synthetic value and clears stale carry");
+        };
+        const std::uint64_t uid = macosarm::kDarwinSyntheticUserId;
+        const std::uint64_t gid = macosarm::kDarwinSyntheticGroupId;
+        const std::uint64_t ppid = macosarm::kDarwinSyntheticParentProcessId;
+        query(context, macosarm::kDarwinSysGetuid, uid, "getuid");
+        query(context, macosarm::kDarwinSysGeteuid, uid, "geteuid");
+        query(context, macosarm::kDarwinSysGetgid, gid, "getgid");
+        query(context, macosarm::kDarwinSysGetegid, gid, "getegid");
+        query(context, macosarm::kDarwinSysGetppid, ppid, "getppid");
+        query(context, macosarm::kDarwinSysIssetugid, 0U, "issetugid");
+        expect(ppid != static_cast<std::uint64_t>(context.process_id()),
+               "getppid never reports the translated process as its own parent");
+
+        // Credentials stay stable after a rejected syscall and do not vary
+        // with per-process synthetic identity state.
+        state = {};
+        state.x[16] = 0xfeedU;
+        const auto rejected = macosarm::dispatch_darwin_syscall(
+            state, vm, svc(), host, context);
+        expect(static_cast<bool>(rejected) &&
+                   state.x[0] == macosarm::kDarwinErrnoEnosys && carry_is_set(state),
+               "unknown syscall between credential queries fails closed");
+        query(context, macosarm::kDarwinSysGetuid, uid, "getuid after rejection");
+        query(other, macosarm::kDarwinSysGeteuid, uid, "geteuid in another process");
+        query(other, macosarm::kDarwinSysGetegid, gid, "getegid in another process");
+        query(other, macosarm::kDarwinSysGetppid, ppid, "getppid in another process");
+        expect(host.fds.empty(), "credential queries never invoke host writes");
+    }
+
+    {
         // XNU's _bsdthread_create checks proc_get_register(p) before using
         // thread entry points. Every translated process is unregistered
         // until full bsdthread_register and thread support is implemented.

@@ -441,6 +441,29 @@ SyscallDispatchResult dispatch_darwin_syscall(
         // Process identity belongs to the shared context, never to the host.
         set_success(state, context.process_id());
         return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    case kDarwinSysGetppid:
+        // XNU syscalls.master #39: int getppid(void). A translated process is
+        // reported as a child of launchd, never of the host parent process.
+        set_success(state, kDarwinSyntheticParentProcessId);
+        return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    case kDarwinSysGetuid:
+    case kDarwinSysGeteuid:
+        // XNU syscalls.master #24 getuid / #25 geteuid: both always succeed.
+        // Real and effective ids are the same synthetic non-root login user;
+        // host credentials are never consulted or exposed.
+        set_success(state, kDarwinSyntheticUserId);
+        return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    case kDarwinSysGetgid:
+    case kDarwinSysGetegid:
+        // XNU syscalls.master #47 getgid / #43 getegid: synthetic "staff".
+        set_success(state, kDarwinSyntheticGroupId);
+        return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    case kDarwinSysIssetugid:
+        // XNU syscalls.master #327: int issetugid(void). The synthetic
+        // credentials never change and no image is launched set-id, so the
+        // process is not tainted; libSystem may then honor environment vars.
+        set_success(state, 0U);
+        return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
     case kDarwinSysBsdthreadRegister:
         return dispatch_bsdthread_register_preflight(
             state, address_space, context, syscall_number);
