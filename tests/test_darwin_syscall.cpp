@@ -1143,6 +1143,76 @@ int main() {
         }
     }
 
+    {
+        // XNU syscalls.master #396 read_nocancel / #397 write_nocancel take
+        // the same arguments and report the same results as read / write.
+        constexpr std::uint64_t page = macosarm::GuestAddressSpace::kPageSize;
+        constexpr std::uint64_t nocancel_base = 0x900000000ULL;
+        constexpr std::uint64_t unmapped_base = 0xA00000000ULL;
+        const auto rw = macosarm::Protection::read | macosarm::Protection::write;
+
+        {
+            macosarm::GuestAddressSpace vm;
+            const std::vector<std::byte> message{std::byte{'n'}, std::byte{'c'}};
+            load_readable(vm, buffer_base, message);
+            CaptureHost host;
+            macosarm::CpuState state{};
+            state.x[16] = macosarm::kDarwinSysWriteNocancel;
+            state.x[0] = 1;
+            state.x[1] = buffer_base;
+            state.x[2] = message.size();
+            const auto result = macosarm::dispatch_darwin_syscall(state, vm, svc(), host);
+            expect(static_cast<bool>(result) && !carry_is_set(state) &&
+                       state.x[0] == message.size() &&
+                       result.syscall_number == macosarm::kDarwinSysWriteNocancel &&
+                       host.captured == message &&
+                       host.fds == std::vector<std::int32_t>{1},
+                   "write_nocancel writes guest bytes like write");
+
+            state = {};
+            state.x[16] = macosarm::kDarwinSysWriteNocancel;
+            state.x[0] = 1;
+            state.x[1] = unmapped_base;
+            state.x[2] = 1;
+            const auto faulted = macosarm::dispatch_darwin_syscall(state, vm, svc(), host);
+            expect(static_cast<bool>(faulted) && carry_is_set(state) &&
+                       state.x[0] == macosarm::kDarwinErrnoEfault &&
+                       host.captured == message,
+                   "write_nocancel from unmapped memory is EFAULT");
+        }
+
+        {
+            macosarm::GuestAddressSpace vm;
+            ReadHost host;
+            host.input = {std::byte{'a'}, std::byte{'b'}, std::byte{'c'}};
+            expect(static_cast<bool>(vm.map(nocancel_base, page, rw)),
+                   "read_nocancel destination maps");
+            macosarm::CpuState state{};
+            state.x[16] = macosarm::kDarwinSysReadNocancel;
+            state.x[0] = 0;
+            state.x[1] = nocancel_base;
+            state.x[2] = 16U;
+            const auto result = macosarm::dispatch_darwin_syscall(state, vm, svc(), host);
+            std::array<std::byte, 3> landed{};
+            expect(static_cast<bool>(result) && !carry_is_set(state) && state.x[0] == 3U &&
+                       result.syscall_number == macosarm::kDarwinSysReadNocancel &&
+                       host.consumed == 3U &&
+                       static_cast<bool>(vm.read(nocancel_base, landed)) &&
+                       std::equal(landed.begin(), landed.end(), host.input.begin()),
+                   "read_nocancel copies host input like read");
+
+            state = {};
+            state.x[16] = macosarm::kDarwinSysReadNocancel;
+            state.x[0] = 7;
+            state.x[1] = nocancel_base;
+            state.x[2] = 1U;
+            const auto closed = macosarm::dispatch_darwin_syscall(state, vm, svc(), host);
+            expect(static_cast<bool>(closed) && carry_is_set(state) &&
+                       state.x[0] == macosarm::kDarwinErrnoEbadf,
+                   "read_nocancel on a closed descriptor is EBADF");
+        }
+    }
+
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return EXIT_FAILURE;

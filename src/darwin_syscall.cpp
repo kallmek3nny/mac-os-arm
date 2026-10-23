@@ -506,8 +506,14 @@ SyscallDispatchResult dispatch_darwin_syscall(
             static_cast<std::int32_t>(static_cast<std::uint32_t>(state.x[0])),
         };
     case kDarwinSysRead:
+    case kDarwinSysReadNocancel:
+        // XNU syscalls.master #396 read_nocancel shares read's argument and
+        // error contract; only the pthread cancellation point differs, and
+        // no guest pthread can be cancelled yet.
         return dispatch_read(state, address_space, host, syscall_number);
     case kDarwinSysWrite:
+    case kDarwinSysWriteNocancel:
+        // XNU syscalls.master #397 write_nocancel likewise aliases write.
         return dispatch_write(state, address_space, host, syscall_number);
     case kDarwinSysMmap:
         return dispatch_mmap(state, address_space, syscall_number);
