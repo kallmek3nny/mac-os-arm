@@ -432,6 +432,78 @@ macosarm::SyscallDispatchResult run_fstat64(
     return macosarm::dispatch_darwin_syscall(state, vm, svc(), host);
 }
 
+// Scripted terminal state for ioctl(2). terminal_fd is a terminal with the
+// scripted window size, file_fd is open but not a terminal (ENOTTY), and
+// every other descriptor reports EBADF. Every host call is recorded so tests
+// can prove negative descriptors and copyin faults never reach the host.
+struct TerminalHost final : macosarm::DarwinHostServices {
+    std::int32_t terminal_fd{0};
+    std::int32_t file_fd{3};
+    std::uint16_t rows{0x1234};
+    std::uint16_t columns{0x5678};
+    std::uint16_t x_pixels{0x9abc};
+    std::uint16_t y_pixels{0xdef0};
+    std::vector<std::int32_t> requests;
+
+    macosarm::HostWriteResult write(
+        std::int32_t fd,
+        std::span<const std::byte> bytes) override {
+        static_cast<void>(fd);
+        static_cast<void>(bytes);
+        return {0, macosarm::kDarwinErrnoEbadf};
+    }
+
+    macosarm::HostTerminalResult terminal_status(std::int32_t fd) override {
+        requests.push_back(fd);
+        if (fd == terminal_fd) {
+            return {rows, columns, x_pixels, y_pixels, 0};
+        }
+        if (fd == file_fd) {
+            return {0, 0, 0, 0, macosarm::kDarwinErrnoEnotty};
+        }
+        return {0, 0, 0, 0, macosarm::kDarwinErrnoEbadf};
+    }
+};
+
+// ioctl(2) fixtures: one guest page pre-filled with a sentinel so tests can
+// prove each record is written whole or not at all.
+constexpr std::uint64_t kIoctlBase = 0xD00000000ULL;
+constexpr std::uint64_t kIoctlPage = macosarm::GuestAddressSpace::kPageSize;
+constexpr std::byte kIoctlSentinel{0xcc};
+
+void map_ioctl_page(macosarm::GuestAddressSpace& vm, macosarm::Protection protection) {
+    const std::vector<std::byte> sentinel(kIoctlPage, kIoctlSentinel);
+    expect(static_cast<bool>(vm.map(kIoctlBase, kIoctlPage, protection)), "ioctl buffer maps");
+    expect(static_cast<bool>(vm.load_bytes(kIoctlBase, sentinel)), "ioctl sentinel loads");
+}
+
+// True when every ioctl-page byte from offset onward is still the sentinel.
+bool ioctl_sentinel_from(macosarm::GuestAddressSpace& vm, std::size_t offset) {
+    std::vector<std::byte> bytes(kIoctlPage);
+    if (!vm.read(kIoctlBase, bytes)) {
+        return false;
+    }
+    return std::all_of(bytes.begin() + static_cast<std::ptrdiff_t>(offset), bytes.end(),
+                       [](std::byte value) { return value == kIoctlSentinel; });
+}
+
+macosarm::SyscallDispatchResult run_ioctl(
+    macosarm::GuestAddressSpace& vm,
+    macosarm::DarwinHostServices& host,
+    macosarm::CpuState& state,
+    std::uint64_t fd_register,
+    std::uint64_t command,
+    std::uint64_t data_address) {
+    state = {};
+    state.x[0] = fd_register;
+    state.x[1] = command;
+    state.x[2] = data_address;
+    state.x[16] = macosarm::kDarwinSysIoctl;
+    // Preset carry so every success test proves the dispatcher clears it.
+    state.pstate = macosarm::kA64PstateCarry;
+    return macosarm::dispatch_darwin_syscall(state, vm, svc(), host);
+}
+
 } // namespace
 
 int main() {
@@ -2050,6 +2122,223 @@ int main() {
             auto negative_nanoseconds = sample_file_status();
             negative_nanoseconds.birth_time.nanoseconds = -1;
             check_violation(negative_nanoseconds, "fstat64 negative nanoseconds");
+        }
+    }
+
+    {
+        // ioctl(2): TIOCGETA / TIOCGWINSZ record encoding, descriptor
+        // resolution, copyin/copyout fault ordering and the unmodeled
+        // file-table requests.
+        const auto rw = macosarm::Protection::read | macosarm::Protection::write;
+        const auto le_field = [](std::span<const std::byte> record,
+                                 std::size_t offset,
+                                 std::size_t width) {
+            std::uint64_t value = 0;
+            for (std::size_t i = 0; i < width; ++i) {
+                value |= static_cast<std::uint64_t>(record[offset + i]) << (8U * i);
+            }
+            return value;
+        };
+
+        {
+            // TIOCGWINSZ on a terminal copies out exactly the 8-byte winsize,
+            // returns 0 in x0 and clears a stale carry.
+            macosarm::GuestAddressSpace vm;
+            map_ioctl_page(vm, rw);
+            TerminalHost host;
+            macosarm::CpuState state{};
+            const auto result =
+                run_ioctl(vm, host, state, 0U, macosarm::kDarwinIoctlTiocgwinsz, kIoctlBase);
+            expect(static_cast<bool>(result) && result.action == macosarm::SyscallAction::resume &&
+                       result.syscall_number == macosarm::kDarwinSysIoctl,
+                   "ioctl dispatch resumes guest and reports its syscall number");
+            expect(state.x[0] == 0 && !carry_is_set(state) &&
+                       host.requests == std::vector<std::int32_t>{0},
+                   "TIOCGWINSZ success returns 0, clears carry and queries the fd once");
+            std::vector<std::byte> record(macosarm::kDarwinWinsizeSize);
+            expect(static_cast<bool>(vm.read(kIoctlBase, record)) &&
+                       le_field(record, 0, 2) == 0x1234U && le_field(record, 2, 2) == 0x5678U &&
+                       le_field(record, 4, 2) == 0x9abcU && le_field(record, 6, 2) == 0xdef0U,
+                   "TIOCGWINSZ encodes ws_row, ws_col, ws_xpixel and ws_ypixel");
+            expect(ioctl_sentinel_from(vm, macosarm::kDarwinWinsizeSize),
+                   "TIOCGWINSZ writes nothing past the 8-byte winsize");
+        }
+
+        {
+            // TIOCGETA on a terminal copies out the synthetic cooked-mode
+            // termios: XNU ttydefaults.h flags, ttydefchars and B9600.
+            macosarm::GuestAddressSpace vm;
+            map_ioctl_page(vm, rw);
+            TerminalHost host;
+            macosarm::CpuState state{};
+            const auto result =
+                run_ioctl(vm, host, state, 0U, macosarm::kDarwinIoctlTiocgeta, kIoctlBase);
+            expect(static_cast<bool>(result) && state.x[0] == 0 && !carry_is_set(state) &&
+                       host.requests == std::vector<std::int32_t>{0},
+                   "TIOCGETA success returns 0, clears carry and queries the fd once");
+            std::vector<std::byte> record(macosarm::kDarwinTermiosSize);
+            expect(static_cast<bool>(vm.read(kIoctlBase, record)), "termios record reads back");
+            expect(le_field(record, 0, 8) == 0x2b02U && le_field(record, 8, 8) == 0x0003U &&
+                       le_field(record, 16, 8) == 0x4b00U && le_field(record, 24, 8) == 0x05cbU,
+                   "TIOCGETA encodes TTYDEF_IFLAG, OFLAG, CFLAG and LFLAG");
+            // ttydefchars: CEOF, CEOL, CEOL, CERASE, CWERASE, CKILL, CREPRINT,
+            // spare, CINTR, CQUIT, CSUSP, CDSUSP, CSTART, CSTOP, CLNEXT,
+            // CDISCARD, CMIN, CTIME, CSTATUS, spare; 0xff is _POSIX_VDISABLE.
+            constexpr std::array<std::uint8_t, macosarm::kDarwinTermiosControlCharCount> chars{
+                0x04, 0xff, 0xff, 0x7f, 0x17, 0x15, 0x12, 0xff, 0x03, 0x1c,
+                0x1a, 0x19, 0x11, 0x13, 0x16, 0x0f, 0x01, 0x00, 0x14, 0xff,
+            };
+            bool chars_match = true;
+            for (std::size_t i = 0; i < chars.size(); ++i) {
+                chars_match = chars_match && le_field(record, 32U + i, 1) == chars[i];
+            }
+            expect(chars_match, "TIOCGETA encodes ttydefchars in c_cc index order");
+            expect(le_field(record, 52, 4) == 0U && le_field(record, 56, 8) == 9600U &&
+                       le_field(record, 64, 8) == 9600U,
+                   "TIOCGETA zeroes the c_cc padding and reports B9600 speeds");
+            expect(ioctl_sentinel_from(vm, macosarm::kDarwinTermiosSize),
+                   "TIOCGETA writes nothing past the 72-byte termios");
+        }
+
+        // An ioctl failure reports its errno in x0 with carry set.
+        const auto failed_with = [](const macosarm::CpuState& cpu, std::uint32_t error) {
+            return cpu.x[0] == error && carry_is_set(cpu);
+        };
+
+        {
+            // Descriptor resolution: a negative fd is EBADF without a host
+            // query, an unknown fd is EBADF, an open non-terminal is ENOTTY,
+            // no failure writes, and only the low 32 bits of x0 name the fd.
+            macosarm::GuestAddressSpace vm;
+            map_ioctl_page(vm, rw);
+            TerminalHost host;
+            macosarm::CpuState state{};
+            static_cast<void>(run_ioctl(
+                vm, host, state, 0xffffffffU, macosarm::kDarwinIoctlTiocgwinsz, kIoctlBase));
+            expect(failed_with(state, macosarm::kDarwinErrnoEbadf) && host.requests.empty(),
+                   "ioctl negative fd reports EBADF without querying the host");
+            static_cast<void>(run_ioctl(
+                vm, host, state, 7U, macosarm::kDarwinIoctlTiocgwinsz, kIoctlBase));
+            expect(failed_with(state, macosarm::kDarwinErrnoEbadf) &&
+                       host.requests == std::vector<std::int32_t>{7},
+                   "ioctl unknown fd reports EBADF");
+            static_cast<void>(run_ioctl(
+                vm, host, state, 3U, macosarm::kDarwinIoctlTiocgeta, kIoctlBase));
+            expect(failed_with(state, macosarm::kDarwinErrnoEnotty),
+                   "TIOCGETA on an open non-terminal reports ENOTTY");
+            expect(ioctl_sentinel_from(vm, 0), "failed ioctl requests write nothing");
+            static_cast<void>(run_ioctl(vm, host, state, 0xffffffff00000000ULL,
+                                        macosarm::kDarwinIoctlTiocgwinsz, kIoctlBase));
+            expect(state.x[0] == 0 && !carry_is_set(state) &&
+                       host.requests == std::vector<std::int32_t>{7, 3, 0},
+                   "ioctl takes the fd from the low 32 bits of x0");
+        }
+
+        {
+            // Copy-in precedes descriptor resolution: an unreadable IOC_IN
+            // argument is EFAULT even for a negative fd and never reaches the
+            // host; a readable one proceeds to the negative-fd check.
+            macosarm::GuestAddressSpace vm;
+            map_ioctl_page(vm, rw);
+            TerminalHost host;
+            macosarm::CpuState state{};
+            const std::uint64_t unmapped = kIoctlBase + kIoctlPage;
+            static_cast<void>(run_ioctl(
+                vm, host, state, 0xffffffffU, macosarm::kDarwinIoctlFionbio, unmapped));
+            expect(failed_with(state, macosarm::kDarwinErrnoEfault) && host.requests.empty(),
+                   "ioctl copyin fault reports EFAULT before EBADF and the host query");
+            static_cast<void>(run_ioctl(
+                vm, host, state, 0xffffffffU, macosarm::kDarwinIoctlFionbio, kIoctlBase));
+            expect(failed_with(state, macosarm::kDarwinErrnoEbadf) && host.requests.empty(),
+                   "ioctl readable argument proceeds to the negative-fd check");
+        }
+
+        {
+            // Copy-out follows terminal resolution: a record straddling the end
+            // of the mapping or landing on a read-only page is EFAULT, the host
+            // was still queried, and no partial record reaches the guest.
+            TerminalHost host;
+            macosarm::CpuState state{};
+            {
+                macosarm::GuestAddressSpace vm;
+                map_ioctl_page(vm, rw);
+                static_cast<void>(run_ioctl(vm, host, state, 0U,
+                                            macosarm::kDarwinIoctlTiocgwinsz,
+                                            kIoctlBase + kIoctlPage - 4U));
+                expect(failed_with(state, macosarm::kDarwinErrnoEfault) &&
+                           ioctl_sentinel_from(vm, 0),
+                       "TIOCGWINSZ straddling the mapping reports EFAULT and writes nothing");
+            }
+            {
+                macosarm::GuestAddressSpace vm;
+                map_ioctl_page(vm, macosarm::Protection::read);
+                static_cast<void>(run_ioctl(
+                    vm, host, state, 0U, macosarm::kDarwinIoctlTiocgeta, kIoctlBase));
+                expect(failed_with(state, macosarm::kDarwinErrnoEfault) &&
+                           ioctl_sentinel_from(vm, 0),
+                       "TIOCGETA to a read-only page reports EFAULT and writes nothing");
+            }
+            expect(host.requests == std::vector<std::int32_t>{0, 0},
+                   "ioctl copyout faults still query the terminal once each");
+        }
+
+        {
+            // File-table requests are not modeled yet: on any open descriptor,
+            // terminal or not, they report ENOSYS and write nothing. They
+            // still resolve the descriptor first, so an unknown fd is EBADF.
+            macosarm::GuestAddressSpace vm;
+            map_ioctl_page(vm, rw);
+            TerminalHost host;
+            macosarm::CpuState state{};
+            constexpr std::array<std::uint64_t, 6> file_table_requests{
+                macosarm::kDarwinIoctlFioclex,   macosarm::kDarwinIoctlFionclex,
+                macosarm::kDarwinIoctlFiogetown, macosarm::kDarwinIoctlFiosetown,
+                macosarm::kDarwinIoctlFioasync,  macosarm::kDarwinIoctlFionbio,
+            };
+            bool on_terminal = true;
+            bool on_file = true;
+            bool on_unknown = true;
+            for (const std::uint64_t request : file_table_requests) {
+                static_cast<void>(run_ioctl(vm, host, state, 0U, request, kIoctlBase));
+                on_terminal = on_terminal && failed_with(state, macosarm::kDarwinErrnoEnosys);
+                static_cast<void>(run_ioctl(vm, host, state, 3U, request, kIoctlBase));
+                on_file = on_file && failed_with(state, macosarm::kDarwinErrnoEnosys);
+                static_cast<void>(run_ioctl(vm, host, state, 7U, request, kIoctlBase));
+                on_unknown = on_unknown && failed_with(state, macosarm::kDarwinErrnoEbadf);
+            }
+            expect(on_terminal, "file-table ioctl requests on a terminal report ENOSYS");
+            expect(on_file, "file-table ioctl requests on an open non-terminal report ENOSYS");
+            expect(on_unknown, "file-table ioctl requests on an unknown fd report EBADF");
+            expect(host.requests.size() == 3U * file_table_requests.size(),
+                   "file-table ioctl requests resolve the descriptor once each");
+            expect(ioctl_sentinel_from(vm, 0), "file-table ioctl requests write nothing");
+        }
+
+        {
+            // Every other request reaches the device. A terminal rejects one it
+            // does not recognize with ENOTTY, and the command keeps all 64
+            // bits, so TIOCGWINSZ with bit 32 set is unrecognized rather than
+            // truncated into a match. TIOCGWINSZ on a non-terminal is ENOTTY.
+            macosarm::GuestAddressSpace vm;
+            map_ioctl_page(vm, rw);
+            TerminalHost host;
+            macosarm::CpuState state{};
+            constexpr std::uint64_t unrecognized = 0x40047a7fULL; // _IOR('z', 127, int)
+            static_cast<void>(run_ioctl(vm, host, state, 0U, unrecognized, kIoctlBase));
+            expect(failed_with(state, macosarm::kDarwinErrnoEnotty),
+                   "unrecognized ioctl request on a terminal reports ENOTTY");
+            static_cast<void>(run_ioctl(vm, host, state, 0U,
+                                        macosarm::kDarwinIoctlTiocgwinsz | (std::uint64_t{1} << 32U),
+                                        kIoctlBase));
+            expect(failed_with(state, macosarm::kDarwinErrnoEnotty),
+                   "ioctl matches the full 64-bit command, never a truncated one");
+            static_cast<void>(run_ioctl(
+                vm, host, state, 3U, macosarm::kDarwinIoctlTiocgwinsz, kIoctlBase));
+            expect(failed_with(state, macosarm::kDarwinErrnoEnotty),
+                   "TIOCGWINSZ on an open non-terminal reports ENOTTY");
+            expect(host.requests == std::vector<std::int32_t>{0, 0, 3} &&
+                       ioctl_sentinel_from(vm, 0),
+                   "unrecognized ioctl requests reach the device and write nothing");
         }
     }
 

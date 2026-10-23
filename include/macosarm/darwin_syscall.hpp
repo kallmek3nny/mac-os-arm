@@ -52,11 +52,41 @@ constexpr std::uint16_t kDarwinModeBlockDevice = 0060000; // S_IFBLK
 constexpr std::uint16_t kDarwinModeRegular = 0100000;     // S_IFREG
 constexpr std::uint16_t kDarwinModeSymlink = 0120000;     // S_IFLNK
 constexpr std::uint16_t kDarwinModeSocket = 0140000;      // S_IFSOCK
+// XNU syscalls.master #54: int ioctl(int fd, u_long com, caddr_t data). The
+// command keeps all 64 register bits: XNU never truncates it, so a command
+// with high bits set matches no request and the device reports ENOTTY.
+constexpr std::uint64_t kDarwinSysIoctl = 54;
+// XNU bsd/sys/ioccom.h: bits 29-31 of a command give its copy direction and
+// bits 16-28 its argument size. ioctl copies an IOC_IN argument in before it
+// resolves the descriptor, and copies an IOC_OUT result out only on success.
+constexpr std::uint64_t kDarwinIocOut = 0x40000000;
+constexpr std::uint64_t kDarwinIocIn = 0x80000000;
+constexpr std::uint64_t kDarwinIocParmMask = 0x1fff;
+// XNU bsd/sys/ttycom.h on arm64: TIOCGETA is _IOR('t', 19, struct termios),
+// issued by tcgetattr(3) and isatty(3), and TIOCGWINSZ is
+// _IOR('t', 104, struct winsize). The LP64 struct termios is 72 bytes: four
+// 8-byte tcflag_t, c_cc[NCCS], 4 padding bytes, then two 8-byte speed_t.
+// struct winsize is four unsigned shorts: rows, columns, x and y pixels.
+constexpr std::uint64_t kDarwinIoctlTiocgeta = 0x40487413;
+constexpr std::uint64_t kDarwinIoctlTiocgwinsz = 0x40087468;
+constexpr std::size_t kDarwinTermiosSize = 72;
+constexpr std::size_t kDarwinTermiosControlCharCount = 20; // NCCS
+constexpr std::size_t kDarwinWinsizeSize = 8;
+// XNU bsd/sys/filio.h requests that sys_generic.c's ioctl handles itself on
+// the file table entry instead of forwarding to the device. Descriptor flags
+// and ownership are not modeled yet, so they are never acknowledged.
+constexpr std::uint64_t kDarwinIoctlFioclex = 0x20006601;   // _IO('f', 1)
+constexpr std::uint64_t kDarwinIoctlFionclex = 0x20006602;  // _IO('f', 2)
+constexpr std::uint64_t kDarwinIoctlFiogetown = 0x4004667b; // _IOR('f', 123, int)
+constexpr std::uint64_t kDarwinIoctlFiosetown = 0x8004667c; // _IOW('f', 124, int)
+constexpr std::uint64_t kDarwinIoctlFioasync = 0x8004667d;  // _IOW('f', 125, int)
+constexpr std::uint64_t kDarwinIoctlFionbio = 0x8004667e;   // _IOW('f', 126, int)
 constexpr std::uint32_t kDarwinErrnoEio = 5;
 constexpr std::uint32_t kDarwinErrnoEbadf = 9;
 constexpr std::uint32_t kDarwinErrnoEnomem = 12;
 constexpr std::uint32_t kDarwinErrnoEacces = 13;
 constexpr std::uint32_t kDarwinErrnoEinval = 22;
+constexpr std::uint32_t kDarwinErrnoEnotty = 25;
 constexpr std::uint32_t kDarwinErrnoEfault = 14;
 constexpr std::uint32_t kDarwinErrnoEnosys = 78;
 
@@ -172,6 +202,25 @@ struct HostStatResult {
     }
 };
 
+// Guest-visible state of terminal descriptor fd for ioctl(2) TIOCGETA and
+// TIOCGWINSZ. The host reports only that fd is a terminal and its window
+// size; the dispatcher encodes struct winsize and a synthetic cooked-mode
+// struct termios (XNU bsd/sys/ttydefaults.h) itself, so no host terminal
+// settings or layouts reach the guest. An open descriptor that is not a
+// terminal reports ENOTTY and an unknown descriptor EBADF. A zero dimension
+// means the size is unknown, as XNU reports for a never-sized terminal.
+struct HostTerminalResult {
+    std::uint16_t rows{};     // ws_row
+    std::uint16_t columns{};  // ws_col
+    std::uint16_t x_pixels{}; // ws_xpixel
+    std::uint16_t y_pixels{}; // ws_ypixel
+    std::uint32_t error{};
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return error == 0;
+    }
+};
+
 class DarwinHostServices {
 public:
     virtual ~DarwinHostServices() = default;
@@ -224,6 +273,15 @@ public:
     [[nodiscard]] virtual HostCloseResult close(std::int32_t fd) {
         static_cast<void>(fd);
         return {kDarwinErrnoEbadf};
+    }
+
+    // Describe terminal descriptor fd for ioctl(2) TIOCGETA and TIOCGWINSZ.
+    // An open descriptor that is not a terminal reports ENOTTY. Hosts that
+    // do not override this expose no descriptors and report EBADF, never a
+    // fabricated terminal.
+    [[nodiscard]] virtual HostTerminalResult terminal_status(std::int32_t fd) {
+        static_cast<void>(fd);
+        return {0, 0, 0, 0, kDarwinErrnoEbadf};
     }
 };
 

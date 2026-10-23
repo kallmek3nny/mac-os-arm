@@ -705,6 +705,141 @@ void set_error(CpuState& state, std::uint32_t error) noexcept {
     return finish();
 }
 
+// The guest-visible struct termios for ioctl(2) TIOCGETA: XNU
+// bsd/sys/ttydefaults.h TTYDEF_IFLAG, TTYDEF_OFLAG, TTYDEF_CFLAG,
+// TTYDEF_LFLAG, ttydefchars and TTYDEF_SPEED (B9600), the canonical, echoing
+// mode of a freshly opened terminal. It is synthetic: no host terminal
+// settings reach the guest. Little-endian LP64 layout; the c_cc padding at
+// offsets 52-55 stays zero.
+[[nodiscard]] std::array<std::byte, kDarwinTermiosSize> synthetic_termios() noexcept {
+    static_assert(kDarwinTermiosSize == 72U, "LP64 struct termios is 72 bytes");
+    static_assert(kDarwinTermiosControlCharCount == 20U, "Darwin NCCS is 20");
+    // bsd/sys/termios.h flag bits.
+    constexpr std::uint64_t input_flags = 0x2b02;   // BRKINT|ICRNL|IXON|IXANY|IMAXBEL
+    constexpr std::uint64_t output_flags = 0x0003;  // OPOST|ONLCR
+    constexpr std::uint64_t control_flags = 0x4b00; // CS8|CREAD|HUPCL
+    constexpr std::uint64_t local_flags = 0x05cb;   // ECHOKE|ECHOE|ECHO|ECHOCTL|ISIG|ICANON|IEXTEN
+    constexpr std::uint64_t speed = 9600;           // B9600
+    // ttydefchars in V* index order; 0xff is _POSIX_VDISABLE.
+    constexpr std::array<std::uint8_t, kDarwinTermiosControlCharCount> control_chars{
+        0x04, 0xff, 0xff, 0x7f, 0x17, 0x15, 0x12, 0xff, 0x03, 0x1c, // VEOF..VQUIT
+        0x1a, 0x19, 0x11, 0x13, 0x16, 0x0f, 0x01, 0x00, 0x14, 0xff, // VSUSP..spare
+    };
+
+    std::array<std::byte, kDarwinTermiosSize> record{};
+    const auto put = [&](std::size_t offset, std::uint64_t value) {
+        for (std::size_t i = 0; i < sizeof(std::uint64_t); ++i) {
+            record[offset + i] = static_cast<std::byte>((value >> (8U * i)) & 0xffU);
+        }
+    };
+    put(0U, input_flags);    // c_iflag
+    put(8U, output_flags);   // c_oflag
+    put(16U, control_flags); // c_cflag
+    put(24U, local_flags);   // c_lflag
+    for (std::size_t i = 0; i < control_chars.size(); ++i) {
+        record[32U + i] = static_cast<std::byte>(control_chars[i]);
+    }
+    put(56U, speed); // c_ispeed
+    put(64U, speed); // c_ospeed
+    return record;
+}
+
+// XNU bsd/kern/sys_generic.c: ioctl(fd, com, data) sizes the argument from
+// bits 16-28 of com and copies an IOC_IN argument in (EFAULT) before it
+// resolves the descriptor (EBADF). FIOCLEX, FIONCLEX, FIONBIO, FIOASYNC,
+// FIOSETOWN and FIOGETOWN act on the file table entry itself; descriptor
+// flags and ownership are not modeled yet, so they report ENOSYS and are
+// never acknowledged. Every other request reaches the device, which reports
+// ENOTTY for a request it does not recognize, and an IOC_OUT result is
+// copied out only on success (EFAULT). Only TIOCGETA and TIOCGWINSZ on a
+// host terminal are recognized; the host reports just that fd is a terminal
+// and its window size, and the dispatcher encodes both records itself. A
+// negative descriptor never reaches the host.
+[[nodiscard]] SyscallDispatchResult dispatch_ioctl(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    DarwinHostServices& host,
+    std::uint64_t syscall_number) {
+
+    const auto finish = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    };
+
+    const auto fd = static_cast<std::int32_t>(static_cast<std::uint32_t>(state.x[0]));
+    const std::uint64_t command = state.x[1];
+    const std::uint64_t guest_address = state.x[2];
+    const auto size = static_cast<std::size_t>((command >> 16U) & kDarwinIocParmMask);
+
+    if ((command & kDarwinIocIn) != 0U && size != 0U) {
+        // Staged only to reproduce XNU's copyin fault ordering; no request
+        // handled here consumes guest input yet.
+        std::array<std::byte, kDarwinIocParmMask + 1U> argument{};
+        if (!address_space.read(guest_address, std::span<std::byte>(argument.data(), size))) {
+            set_error(state, kDarwinErrnoEfault);
+            return finish();
+        }
+    }
+    if (fd < 0) {
+        set_error(state, kDarwinErrnoEbadf);
+        return finish();
+    }
+    // The terminal query doubles as descriptor resolution: EBADF names no
+    // guest descriptor, ENOTTY an open descriptor that is not a terminal.
+    const HostTerminalResult terminal = host.terminal_status(fd);
+    if (terminal.error == kDarwinErrnoEbadf) {
+        set_error(state, kDarwinErrnoEbadf);
+        return finish();
+    }
+
+    const auto copy_out = [&](std::span<const std::byte> record) {
+        if (!address_space.probe_write(guest_address, record.size()) ||
+            !address_space.write(guest_address, record)) {
+            set_error(state, kDarwinErrnoEfault);
+        } else {
+            set_success(state, 0U);
+        }
+        return finish();
+    };
+
+    switch (command) {
+    case kDarwinIoctlFioclex:
+    case kDarwinIoctlFionclex:
+    case kDarwinIoctlFiogetown:
+    case kDarwinIoctlFiosetown:
+    case kDarwinIoctlFioasync:
+    case kDarwinIoctlFionbio:
+        set_error(state, kDarwinErrnoEnosys);
+        return finish();
+    case kDarwinIoctlTiocgeta: {
+        if (!terminal) {
+            set_error(state, terminal.error);
+            return finish();
+        }
+        const std::array<std::byte, kDarwinTermiosSize> record = synthetic_termios();
+        return copy_out(record);
+    }
+    case kDarwinIoctlTiocgwinsz: {
+        if (!terminal) {
+            set_error(state, terminal.error);
+            return finish();
+        }
+        static_assert(kDarwinWinsizeSize == 8U, "struct winsize is four unsigned shorts");
+        const std::array<std::uint16_t, 4> fields{
+            terminal.rows, terminal.columns, terminal.x_pixels, terminal.y_pixels};
+        std::array<std::byte, kDarwinWinsizeSize> record{};
+        for (std::size_t i = 0; i < fields.size(); ++i) {
+            record[2U * i] = static_cast<std::byte>(fields[i] & 0xffU);
+            record[2U * i + 1U] = static_cast<std::byte>(fields[i] >> 8U);
+        }
+        return copy_out(record);
+    }
+    default:
+        set_error(state, terminal ? kDarwinErrnoEnotty : terminal.error);
+        return finish();
+    }
+}
+
 } // namespace
 
 SyscallDispatchResult dispatch_darwin_syscall(
@@ -752,6 +887,12 @@ SyscallDispatchResult dispatch_darwin_syscall(
         // arm64, libSystem's fstat(3) traps here. Metadata comes only from the
         // host's guest-descriptor view and the dispatcher encodes the layout.
         return dispatch_fstat64(state, address_space, host, syscall_number);
+    case kDarwinSysIoctl:
+        // XNU syscalls.master #54: int ioctl(int fd, u_long com, caddr_t data).
+        // libSystem's isatty(3) and stdio's line-buffering probe issue
+        // TIOCGETA; terminal state comes only from the host's view of the
+        // guest descriptor and the dispatcher encodes every record itself.
+        return dispatch_ioctl(state, address_space, host, syscall_number);
     case kDarwinSysGetentropy:
         // XNU syscalls.master #500: int getentropy(void *buffer, size_t size).
         // libSystem seeds arc4random and malloc/stack guards from it; bytes
