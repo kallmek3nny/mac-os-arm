@@ -31,6 +31,9 @@ constexpr std::uint64_t kDarwinSysThreadSelfid = 372;
 constexpr std::uint64_t kDarwinSysReadNocancel = 396;
 constexpr std::uint64_t kDarwinSysWriteNocancel = 397;
 constexpr std::uint64_t kDarwinSysGetentropy = 500;
+// XNU syscalls.master #116: int gettimeofday(struct timeval *tp,
+// struct timezone *tzp, uint64_t *mach_absolute_time).
+constexpr std::uint64_t kDarwinSysGettimeofday = 116;
 constexpr std::uint32_t kDarwinErrnoEio = 5;
 constexpr std::uint32_t kDarwinErrnoEbadf = 9;
 constexpr std::uint32_t kDarwinErrnoEnomem = 12;
@@ -85,6 +88,19 @@ struct HostEntropyResult {
     }
 };
 
+// Host wall-clock time for gettimeofday(2): seconds and microseconds since
+// the Unix epoch. A successful result always has microseconds below one
+// million; the dispatcher treats anything else as a host contract violation.
+struct HostWallClockResult {
+    std::int64_t seconds{};
+    std::uint32_t microseconds{};
+    std::uint32_t error{};
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return error == 0;
+    }
+};
+
 class DarwinHostServices {
 public:
     virtual ~DarwinHostServices() = default;
@@ -111,6 +127,13 @@ public:
     [[nodiscard]] virtual HostEntropyResult fill_entropy(std::span<std::byte> bytes) {
         static_cast<void>(bytes);
         return {kDarwinErrnoEnosys};
+    }
+
+    // Report the host's current wall-clock time for gettimeofday(2) as
+    // seconds and microseconds since the Unix epoch. Hosts that do not
+    // override this have no clock and report ENOSYS, never a fabricated time.
+    [[nodiscard]] virtual HostWallClockResult wall_clock() {
+        return {0, 0, kDarwinErrnoEnosys};
     }
 };
 

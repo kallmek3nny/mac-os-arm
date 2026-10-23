@@ -2,6 +2,7 @@
 #include "macosarm/session.hpp"
 
 #include <charconv>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -108,6 +109,18 @@ public:
             offset += count;
         }
         return {0};
+    }
+
+    // gettimeofday(2) time comes only from the host's real-time clock, as
+    // whole seconds plus microseconds since the Unix epoch. Flooring keeps
+    // the microsecond part in [0, 1000000) even for a pre-epoch host clock.
+    macosarm::HostWallClockResult wall_clock() override {
+        const auto since_epoch = std::chrono::time_point_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now()).time_since_epoch();
+        const auto whole = std::chrono::floor<std::chrono::seconds>(since_epoch);
+        const auto fraction = since_epoch - whole;
+        return {static_cast<std::int64_t>(whole.count()),
+                static_cast<std::uint32_t>(fraction.count()), 0};
     }
 };
 

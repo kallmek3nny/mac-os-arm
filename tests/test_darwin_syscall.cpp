@@ -213,6 +213,95 @@ macosarm::SyscallDispatchResult run_getentropy(
     return macosarm::dispatch_darwin_syscall(state, vm, svc(), host);
 }
 
+// Scripted wall clock for gettimeofday(2). Every host call is counted so
+// tests can prove the clock is never read when the request fails closed or
+// the timeval destination is rejected first.
+struct ClockHost final : macosarm::DarwinHostServices {
+    std::int64_t seconds{};
+    std::uint32_t microseconds{};
+    std::uint32_t next_error{};
+    std::size_t calls{};
+
+    macosarm::HostWriteResult write(
+        std::int32_t fd,
+        std::span<const std::byte> bytes) override {
+        static_cast<void>(fd);
+        static_cast<void>(bytes);
+        return {0, macosarm::kDarwinErrnoEbadf};
+    }
+
+    macosarm::HostWallClockResult wall_clock() override {
+        ++calls;
+        if (next_error != 0) {
+            const std::uint32_t error = next_error;
+            next_error = 0;
+            return {0, 0, error};
+        }
+        return {seconds, microseconds, 0};
+    }
+};
+
+// gettimeofday(2) fixtures: one guest page pre-filled with a sentinel so
+// tests can prove exactly which bytes each copyout wrote.
+constexpr std::uint64_t kClockBase = 0xB00000000ULL;
+constexpr std::uint64_t kClockPage = macosarm::GuestAddressSpace::kPageSize;
+constexpr std::byte kClockSentinel{0xcc};
+
+void map_clock_page(macosarm::GuestAddressSpace& vm, macosarm::Protection protection) {
+    const std::vector<std::byte> sentinel(kClockPage, kClockSentinel);
+    expect(static_cast<bool>(vm.map(kClockBase, kClockPage, protection)),
+           "clock buffer maps");
+    expect(static_cast<bool>(vm.load_bytes(kClockBase, sentinel)), "clock sentinel loads");
+}
+
+// Decode a little-endian guest integer of width bytes (at most 8). Returns
+// false when any byte is unreadable.
+bool read_guest_le(macosarm::GuestAddressSpace& vm,
+                   std::uint64_t address,
+                   std::size_t width,
+                   std::uint64_t& value) {
+    std::array<std::byte, 8> bytes{};
+    if (width > bytes.size() ||
+        !vm.read(address, std::span<std::byte>(bytes.data(), width))) {
+        return false;
+    }
+    value = 0;
+    for (std::size_t i = 0; i < width; ++i) {
+        value |= static_cast<std::uint64_t>(std::to_integer<unsigned char>(bytes[i]))
+                 << (8U * i);
+    }
+    return true;
+}
+
+// True when count guest bytes starting at address all still hold the sentinel.
+bool clock_sentinel_at(macosarm::GuestAddressSpace& vm,
+                       std::uint64_t address,
+                       std::size_t count) {
+    std::vector<std::byte> bytes(count);
+    if (!vm.read(address, bytes)) {
+        return false;
+    }
+    return std::all_of(bytes.begin(), bytes.end(),
+                       [](std::byte value) { return value == kClockSentinel; });
+}
+
+macosarm::SyscallDispatchResult run_gettimeofday(
+    macosarm::GuestAddressSpace& vm,
+    macosarm::DarwinHostServices& host,
+    macosarm::CpuState& state,
+    std::uint64_t timeval_address,
+    std::uint64_t timezone_address,
+    std::uint64_t absolute_time_address) {
+    state = {};
+    state.x[0] = timeval_address;
+    state.x[1] = timezone_address;
+    state.x[2] = absolute_time_address;
+    state.x[16] = macosarm::kDarwinSysGettimeofday;
+    // Preset carry so every success test proves the dispatcher clears it.
+    state.pstate = macosarm::kA64PstateCarry;
+    return macosarm::dispatch_darwin_syscall(state, vm, svc(), host);
+}
+
 } // namespace
 
 int main() {
@@ -1413,6 +1502,190 @@ int main() {
             expect(static_cast<bool>(closed) && carry_is_set(state) &&
                        state.x[0] == macosarm::kDarwinErrnoEbadf,
                    "read_nocancel on a closed descriptor is EBADF");
+        }
+    }
+
+    {
+        // XNU bsd/kern/kern_time.c gettimeofday: a 64-bit process receives a
+        // 16-byte struct user64_timeval { int64 tv_sec; int32 tv_usec; } with
+        // zeroed tail padding and an 8-byte struct timezone. Success returns 0
+        // in x0 and clears carry; the time itself never travels in registers.
+        constexpr std::uint64_t clock_tv = kClockBase;
+        constexpr std::uint64_t clock_tz = kClockBase + 32U;
+        const auto clock_rw = macosarm::Protection::read | macosarm::Protection::write;
+
+        {
+            macosarm::GuestAddressSpace vm;
+            map_clock_page(vm, clock_rw);
+            ClockHost host;
+            host.seconds = 1700000000;
+            host.microseconds = 123456U;
+            macosarm::CpuState state{};
+            const auto result = run_gettimeofday(vm, host, state, clock_tv, clock_tz, 0U);
+            std::uint64_t seconds = 0;
+            std::uint64_t microseconds = 0;
+            std::uint64_t padding = 1;
+            std::uint64_t zone = 1;
+            expect(static_cast<bool>(result) &&
+                       result.action == macosarm::SyscallAction::resume &&
+                       result.syscall_number == macosarm::kDarwinSysGettimeofday &&
+                       state.x[0] == 0U && !carry_is_set(state) && host.calls == 1U,
+                   "gettimeofday succeeds with exactly one wall-clock read");
+            expect(read_guest_le(vm, clock_tv, 8U, seconds) && seconds == 1700000000U &&
+                       read_guest_le(vm, clock_tv + 8U, 4U, microseconds) &&
+                       microseconds == 123456U &&
+                       read_guest_le(vm, clock_tv + 12U, 4U, padding) && padding == 0U,
+                   "gettimeofday copies out a little-endian user64_timeval");
+            expect(read_guest_le(vm, clock_tz, 8U, zone) && zone == 0U,
+                   "gettimeofday reports synthetic UTC without DST");
+            expect(clock_sentinel_at(vm, clock_tv + 16U, 16U) &&
+                       clock_sentinel_at(vm, clock_tz + 8U, 64U),
+                   "gettimeofday writes only the timeval and timezone records");
+        }
+
+        {
+            // tv_sec is signed 64-bit: pre-epoch and post-2106 clocks keep
+            // every bit instead of wrapping through a 32-bit truncation.
+            const std::array<std::int64_t, 3> wall_clocks{-1, 0x100000005LL, -31536000LL};
+            for (const std::int64_t wall_seconds : wall_clocks) {
+                macosarm::GuestAddressSpace vm;
+                map_clock_page(vm, clock_rw);
+                ClockHost host;
+                host.seconds = wall_seconds;
+                host.microseconds = 999999U;
+                macosarm::CpuState state{};
+                const auto result = run_gettimeofday(vm, host, state, clock_tv, 0U, 0U);
+                std::uint64_t seconds = 0;
+                std::uint64_t microseconds = 0;
+                expect(static_cast<bool>(result) && state.x[0] == 0U && !carry_is_set(state) &&
+                           read_guest_le(vm, clock_tv, 8U, seconds) &&
+                           seconds == static_cast<std::uint64_t>(wall_seconds) &&
+                           read_guest_le(vm, clock_tv + 8U, 4U, microseconds) &&
+                           microseconds == 999999U,
+                       "gettimeofday preserves signed 64-bit tv_sec " +
+                           std::to_string(wall_seconds));
+                expect(clock_sentinel_at(vm, clock_tz, 8U),
+                       "null timezone pointer leaves guest memory untouched");
+            }
+        }
+
+        {
+            macosarm::GuestAddressSpace vm;
+            map_clock_page(vm, clock_rw);
+            ClockHost host;
+            macosarm::CpuState state{};
+            const auto neither = run_gettimeofday(vm, host, state, 0U, 0U, 0U);
+            expect(static_cast<bool>(neither) && state.x[0] == 0U && !carry_is_set(state) &&
+                       host.calls == 0U && clock_sentinel_at(vm, kClockBase, kClockPage),
+                   "gettimeofday without destinations succeeds without a clock read");
+
+            const auto zone_only = run_gettimeofday(vm, host, state, 0U, clock_tz, 0U);
+            std::uint64_t zone = 1;
+            expect(static_cast<bool>(zone_only) && state.x[0] == 0U && !carry_is_set(state) &&
+                       host.calls == 0U && read_guest_le(vm, clock_tz, 8U, zone) &&
+                       zone == 0U && clock_sentinel_at(vm, clock_tv, 16U),
+                   "timezone-only gettimeofday zeroes the zone without a clock read");
+        }
+    }
+
+    {
+        // gettimeofday failure paths fail closed: a rejected timeval
+        // destination is detected before the wall clock is read, host errors
+        // and contract violations leave guest memory untouched, and the
+        // unimplemented mach_absolute_time out-parameter is refused up front.
+        constexpr std::uint64_t clock_tv = kClockBase;
+        constexpr std::uint64_t clock_tz = kClockBase + 32U;
+        constexpr std::uint64_t clock_unmapped = 0xdead00000000ULL;
+        const auto clock_rw = macosarm::Protection::read | macosarm::Protection::write;
+
+        {
+            macosarm::GuestAddressSpace vm;
+            map_clock_page(vm, clock_rw);
+            ClockHost host;
+            host.seconds = 1700000000;
+            macosarm::CpuState state{};
+            const auto unmapped = run_gettimeofday(vm, host, state, clock_unmapped, clock_tz, 0U);
+            expect(static_cast<bool>(unmapped) &&
+                       state.x[0] == macosarm::kDarwinErrnoEfault && carry_is_set(state) &&
+                       host.calls == 0U && clock_sentinel_at(vm, kClockBase, kClockPage),
+                   "unmapped timeval faults before the clock read and timezone copyout");
+
+            const auto crossing =
+                run_gettimeofday(vm, host, state, kClockBase + kClockPage - 8U, 0U, 0U);
+            expect(static_cast<bool>(crossing) &&
+                       state.x[0] == macosarm::kDarwinErrnoEfault && carry_is_set(state) &&
+                       host.calls == 0U && clock_sentinel_at(vm, kClockBase, kClockPage),
+                   "timeval crossing into an unmapped page faults without partial copyout");
+        }
+
+        {
+            macosarm::GuestAddressSpace vm;
+            map_clock_page(vm, macosarm::Protection::read);
+            ClockHost host;
+            macosarm::CpuState state{};
+            const auto result = run_gettimeofday(vm, host, state, clock_tv, 0U, 0U);
+            expect(static_cast<bool>(result) &&
+                       state.x[0] == macosarm::kDarwinErrnoEfault && carry_is_set(state) &&
+                       host.calls == 0U && clock_sentinel_at(vm, kClockBase, kClockPage),
+                   "read-only timeval page faults without a clock read");
+        }
+
+        {
+            macosarm::GuestAddressSpace vm;
+            map_clock_page(vm, clock_rw);
+            ClockHost host;
+            host.next_error = 5U; // EIO reported by the host clock
+            macosarm::CpuState state{};
+            const auto result = run_gettimeofday(vm, host, state, clock_tv, clock_tz, 0U);
+            expect(static_cast<bool>(result) && state.x[0] == 5U && carry_is_set(state) &&
+                       host.calls == 1U && clock_sentinel_at(vm, kClockBase, kClockPage),
+                   "host clock errno is returned without timeval or timezone copyout");
+        }
+
+        {
+            macosarm::GuestAddressSpace vm;
+            map_clock_page(vm, clock_rw);
+            ClockHost host;
+            host.seconds = 1700000000;
+            host.microseconds = 1000000U;
+            macosarm::CpuState state{};
+            const auto result = run_gettimeofday(vm, host, state, clock_tv, clock_tz, 0U);
+            expect(!static_cast<bool>(result) && host.calls == 1U &&
+                       clock_sentinel_at(vm, kClockBase, kClockPage),
+                   "out-of-range host microseconds is a contract violation with no copyout");
+        }
+
+        {
+            macosarm::GuestAddressSpace vm;
+            map_clock_page(vm, clock_rw);
+            ClockHost host;
+            macosarm::CpuState state{};
+            const auto result =
+                run_gettimeofday(vm, host, state, clock_tv, clock_tz, kClockBase + 64U);
+            expect(static_cast<bool>(result) &&
+                       state.x[0] == macosarm::kDarwinErrnoEnosys && carry_is_set(state) &&
+                       host.calls == 0U && clock_sentinel_at(vm, kClockBase, kClockPage),
+                   "mach_absolute_time out-parameter is refused before any copyout");
+        }
+
+        {
+            // XNU copies the timeval out before the timezone, so a bad zone
+            // pointer still reports EFAULT after the time was delivered.
+            macosarm::GuestAddressSpace vm;
+            map_clock_page(vm, clock_rw);
+            ClockHost host;
+            host.seconds = 1700000000;
+            host.microseconds = 42U;
+            macosarm::CpuState state{};
+            const auto result = run_gettimeofday(vm, host, state, clock_tv, clock_unmapped, 0U);
+            std::uint64_t seconds = 0;
+            std::uint64_t microseconds = 0;
+            expect(static_cast<bool>(result) &&
+                       state.x[0] == macosarm::kDarwinErrnoEfault && carry_is_set(state) &&
+                       host.calls == 1U && read_guest_le(vm, clock_tv, 8U, seconds) &&
+                       seconds == 1700000000U &&
+                       read_guest_le(vm, clock_tv + 8U, 4U, microseconds) && microseconds == 42U,
+                   "unmapped timezone faults after the timeval copyout, matching XNU order");
         }
     }
 

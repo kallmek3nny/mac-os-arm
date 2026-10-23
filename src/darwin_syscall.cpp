@@ -533,6 +533,88 @@ void set_error(CpuState& state, std::uint32_t error) noexcept {
     return finish();
 }
 
+// XNU bsd/kern/kern_time.c: gettimeofday(tp, tzp, mach_absolute_time)
+// samples the clock only when tp or mach_absolute_time is requested, then
+// copies out a 64-bit timeval (tv_sec cast through uint32_t to match the
+// arm64 commpage), the kernel timezone and the Mach absolute time, in that
+// order. A failing copyout returns EFAULT at once while earlier copyouts
+// stay visible; success returns 0 in x0, never the time in registers.
+// No Mach timebase exists yet, so a paired absolute-time request fails
+// closed with ENOSYS before any clock read or guest write. Each destination
+// is probed before it is written (the timeval before the host clock is even
+// read), and the timezone is always UTC without DST, never the host's zone.
+[[nodiscard]] SyscallDispatchResult dispatch_gettimeofday(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    DarwinHostServices& host,
+    std::uint64_t syscall_number) {
+
+    constexpr std::size_t timeval_size = 16; // struct user64_timeval
+    constexpr std::size_t timezone_size = 8; // struct timezone
+    constexpr std::uint32_t microseconds_per_second = 1000000U;
+    const auto finish = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    };
+    const auto fault = [&]() {
+        set_error(state, kDarwinErrnoEfault);
+        return finish();
+    };
+
+    const std::uint64_t timeval_address = state.x[0];
+    const std::uint64_t timezone_address = state.x[1];
+    const std::uint64_t absolute_time_address = state.x[2];
+    if (absolute_time_address != 0U) {
+        set_error(state, kDarwinErrnoEnosys);
+        return finish();
+    }
+
+    if (timeval_address != 0U) {
+        if (!address_space.probe_write(timeval_address, timeval_size)) {
+            return fault();
+        }
+        const HostWallClockResult now = host.wall_clock();
+        if (!now) {
+            set_error(state, now.error);
+            return finish();
+        }
+        if (now.microseconds >= microseconds_per_second) {
+            return SyscallDispatchResult{
+                SyscallDispatchError::host_contract_violation,
+                SyscallAction::resume, syscall_number, 0};
+        }
+        // { int64 tv_sec; int32 tv_usec; } plus four zeroed padding bytes.
+        // Keep all 64 signed tv_sec bits: a uint32 cast would wrap pre-epoch
+        // clocks into the far future and truncate times past 2106.
+        const auto seconds = static_cast<std::uint64_t>(now.seconds);
+        std::array<std::byte, timeval_size> time_record{};
+        for (std::size_t i = 0; i < 8U; ++i) {
+            time_record[i] = static_cast<std::byte>((seconds >> (8U * i)) & 0xffU);
+        }
+        for (std::size_t i = 0; i < 4U; ++i) {
+            time_record[8U + i] =
+                static_cast<std::byte>((now.microseconds >> (8U * i)) & 0xffU);
+        }
+        if (!address_space.write(timeval_address,
+                                 std::span<const std::byte>(time_record))) {
+            return fault();
+        }
+    }
+
+    if (timezone_address != 0U) {
+        // { int tz_minuteswest; int tz_dsttime; } is all zero for UTC.
+        const std::array<std::byte, timezone_size> zone_record{};
+        if (!address_space.probe_write(timezone_address, zone_record.size()) ||
+            !address_space.write(timezone_address,
+                                 std::span<const std::byte>(zone_record))) {
+            return fault();
+        }
+    }
+
+    set_success(state, 0U);
+    return finish();
+}
+
 } // namespace
 
 SyscallDispatchResult dispatch_darwin_syscall(
@@ -580,6 +662,11 @@ SyscallDispatchResult dispatch_darwin_syscall(
         // libSystem seeds arc4random and malloc/stack guards from it; bytes
         // come only from the host's secure source, never a fabricated seed.
         return dispatch_getentropy(state, address_space, host, syscall_number);
+    case kDarwinSysGettimeofday:
+        // XNU syscalls.master #116: int gettimeofday(struct timeval *tp,
+        // struct timezone *tzp, uint64_t *mach_absolute_time). Time comes
+        // only from the host wall clock; the zone is always synthetic UTC.
+        return dispatch_gettimeofday(state, address_space, host, syscall_number);
     case kDarwinSysGetpid:
         // XNU bsd/kern/syscalls.master: BSD #20, int getpid(void).
         // Process identity belongs to the shared context, never to the host.
