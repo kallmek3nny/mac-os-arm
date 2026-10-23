@@ -37,8 +37,18 @@ if(DEFINED GUEST_ARGS)
     separate_arguments(guest_args UNIX_COMMAND "${GUEST_ARGS}")
 endif()
 
+# Guest stdin comes from a file, never the CTest console: STDIN_TEXT is
+# written verbatim, otherwise the file is empty and the guest sees end-of-file.
+set(stdin_file "${IMAGE}.stdin")
+if(DEFINED STDIN_TEXT)
+    file(WRITE "${stdin_file}" "${STDIN_TEXT}")
+else()
+    file(WRITE "${stdin_file}" "")
+endif()
+
 execute_process(
     COMMAND "${RUNNER}" ${runner_args} "${IMAGE}" ${guest_args}
+    INPUT_FILE "${stdin_file}"
     RESULT_VARIABLE run_result
     OUTPUT_VARIABLE run_stdout
     ERROR_VARIABLE run_stderr)

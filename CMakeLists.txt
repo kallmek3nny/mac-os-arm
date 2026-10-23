@@ -312,6 +312,31 @@ if(BUILD_TESTING)
                 "-DGUEST_ARGS=one two"
                 -DEXPECTED_EXIT=3
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
+        # Guest stdin is a file that macho_run_check.cmake writes next to
+        # IMAGE, so each stdin test needs its own IMAGE path. The echo fixture
+        # reads once, writes back exactly the bytes received and exits with
+        # that count; a failed read exits 100.
+        add_test(
+            NAME macho-run-stdin-echo
+            COMMAND "${CMAKE_COMMAND}"
+                "-DFIXTURE_TOOL=$<TARGET_FILE:macho_run_fixture>"
+                "-DRUNNER=$<TARGET_FILE:macho-run>"
+                -DKIND=echo
+                "-DIMAGE=${CMAKE_CURRENT_BINARY_DIR}/macho-run-echo.bin"
+                -DSTDIN_TEXT=ping
+                -DEXPECTED_EXIT=4
+                -DEXPECTED_STDOUT=ping
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
+        # Empty stdin is end-of-file: read succeeds with 0 bytes, not an errno.
+        add_test(
+            NAME macho-run-stdin-eof
+            COMMAND "${CMAKE_COMMAND}"
+                "-DFIXTURE_TOOL=$<TARGET_FILE:macho_run_fixture>"
+                "-DRUNNER=$<TARGET_FILE:macho-run>"
+                -DKIND=echo
+                "-DIMAGE=${CMAKE_CURRENT_BINARY_DIR}/macho-run-echo-eof.bin"
+                -DEXPECTED_EXIT=0
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
     endif()
 endif()
 
