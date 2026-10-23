@@ -182,9 +182,30 @@ constexpr std::array<std::uint32_t, 15> kFstatStdinCode{
     0xd4001001U, // svc #0x80
 };
 
+// ioctl(0, TIOCGETA, buffer); exit(errno). macho_run_check.cmake always
+// redirects guest stdin from a file, so the TIOCGETA probe behind isatty(3)
+// must fail with ENOTTY and the exit status is that errno (25). An ioctl that
+// succeeds exits 101 instead, so a fabricated terminal cannot pass for ENOTTY.
+// The 72-byte termios buffer lies in the zero-filled tail of __DATA.
+constexpr std::array<std::uint32_t, 13> kIoctlStdinCode{
+    0xd2800000U, // mov x0, #0 (stdin)
+    0xd28e8261U, // mov x1, #0x7413
+    0xf2a80901U, // movk x1, #0x4048, lsl #16 -> TIOCGETA 0x40487413
+    0xd2882002U, // mov x2, #0x4100
+    0xf2c00022U, // movk x2, #1, lsl #32 -> 0x100004100
+    0xd28006d0U, // mov x16, #54 (ioctl)
+    0xd4001001U, // svc #0x80
+    0x54000063U, // b.cc ioctl_succeeded (+12)
+    0xd2800030U, // mov x16, #1 (exit) with the ioctl errno still in x0
+    0xd4001001U, // svc #0x80
+    0xd2800ca0U, // ioctl_succeeded: mov x0, #101
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+};
+
 int usage() {
-    std::cerr << "usage: macho_run_fixture <hello|argc|echo|close-stdout|fstat-stdin> "
-                 "<output-path>\n";
+    std::cerr << "usage: macho_run_fixture "
+                 "<hello|argc|echo|close-stdout|fstat-stdin|ioctl-stdin> <output-path>\n";
     return 2;
 }
 
@@ -206,6 +227,8 @@ int main(int argc, char** argv) {
         bytes = image(kCloseStdoutCode);
     } else if (kind == "fstat-stdin") {
         bytes = image(kFstatStdinCode);
+    } else if (kind == "ioctl-stdin") {
+        bytes = image(kIoctlStdinCode);
     } else {
         return usage();
     }

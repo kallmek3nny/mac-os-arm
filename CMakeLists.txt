@@ -369,6 +369,20 @@ if(BUILD_TESTING)
                 -DEXPECTED_EXIT=8
                 "-DEXPECTED_STDOUT="
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
+        # ioctl(2) end to end: macho_run_check.cmake always redirects guest
+        # stdin from a file, so the TIOCGETA probe behind isatty(3) fails with
+        # ENOTTY and the guest exits 25 without writing. An ioctl that succeeds
+        # exits 101, so a fabricated terminal cannot pass for ENOTTY.
+        add_test(
+            NAME macho-run-ioctl-stdin
+            COMMAND "${CMAKE_COMMAND}"
+                "-DFIXTURE_TOOL=$<TARGET_FILE:macho_run_fixture>"
+                "-DRUNNER=$<TARGET_FILE:macho-run>"
+                -DKIND=ioctl-stdin
+                "-DIMAGE=${CMAKE_CURRENT_BINARY_DIR}/macho-run-ioctl-stdin.bin"
+                -DEXPECTED_EXIT=25
+                "-DEXPECTED_STDOUT="
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
     endif()
 endif()
 

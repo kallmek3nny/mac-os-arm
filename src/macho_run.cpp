@@ -15,7 +15,8 @@
 #include <vector>
 
 // Host services: getentropy(2) reads only the host operating system's CSPRNG,
-// and fstat64(2) asks the host only for a standard stream's file type.
+// fstat64(2) asks the host only for a standard stream's file type, and
+// ioctl(2) asks only whether a standard stream is a terminal and its size.
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -26,6 +27,7 @@
 #include <windows.h>
 #include <bcrypt.h>
 #else
+#include <sys/ioctl.h>
 #include <sys/random.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -36,6 +38,7 @@ namespace {
 // XNU bsd/sys/errno.h values reported to the guest, never host errno values.
 constexpr std::uint32_t kGuestErrnoEio = 5;
 constexpr std::uint32_t kGuestErrnoEbadf = 9;
+constexpr std::uint32_t kGuestErrnoEnotty = 25;
 
 // st_blksize reported for every guest standard descriptor. Darwin libc sizes
 // stdio buffers from it, so it must be positive; it describes no host file.
@@ -93,6 +96,62 @@ std::uint16_t host_stream_type(std::int32_t fd) noexcept {
 #endif
 }
 
+// What the host reveals about standard stream fd (0, 1 or 2) for ioctl(2):
+// only whether it is an interactive terminal and that terminal's window size.
+// No host terminal settings reach the guest. A dimension the host cannot
+// report stays zero, as XNU reports for a never-sized terminal.
+struct HostStreamTerminal {
+    bool is_terminal{};
+    std::uint16_t rows{};
+    std::uint16_t columns{};
+    std::uint16_t x_pixels{};
+    std::uint16_t y_pixels{};
+};
+
+HostStreamTerminal host_stream_terminal(std::int32_t fd) noexcept {
+    HostStreamTerminal terminal{};
+    if (fd < 0 || fd > 2) {
+        return terminal;
+    }
+#if defined(_WIN32)
+    constexpr DWORD kStandardHandles[] = {STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE};
+    const HANDLE handle = ::GetStdHandle(kStandardHandles[static_cast<std::size_t>(fd)]);
+    if (handle == nullptr || handle == INVALID_HANDLE_VALUE) {
+        return terminal;
+    }
+    // NUL is also a character device, so only a handle with a console mode
+    // counts as a terminal. A console input handle has no screen buffer, so
+    // stdin reports an unknown size.
+    DWORD mode = 0;
+    if (::GetFileType(handle) != FILE_TYPE_CHAR || ::GetConsoleMode(handle, &mode) == 0) {
+        return terminal;
+    }
+    terminal.is_terminal = true;
+    CONSOLE_SCREEN_BUFFER_INFO info{};
+    if (::GetConsoleScreenBufferInfo(handle, &info) != 0) {
+        const int columns = static_cast<int>(info.srWindow.Right) - info.srWindow.Left + 1;
+        const int rows = static_cast<int>(info.srWindow.Bottom) - info.srWindow.Top + 1;
+        if (columns > 0 && rows > 0 && columns <= 0xffff && rows <= 0xffff) {
+            terminal.columns = static_cast<std::uint16_t>(columns);
+            terminal.rows = static_cast<std::uint16_t>(rows);
+        }
+    }
+#else
+    if (::isatty(fd) != 1) {
+        return terminal;
+    }
+    terminal.is_terminal = true;
+    struct winsize window {};
+    if (::ioctl(fd, TIOCGWINSZ, &window) == 0) {
+        terminal.rows = static_cast<std::uint16_t>(window.ws_row);
+        terminal.columns = static_cast<std::uint16_t>(window.ws_col);
+        terminal.x_pixels = static_cast<std::uint16_t>(window.ws_xpixel);
+        terminal.y_pixels = static_cast<std::uint16_t>(window.ws_ypixel);
+    }
+#endif
+    return terminal;
+}
+
 // The guest's stdin, stdout and stderr reach the host's, as raw bytes. No
 // other descriptor exists in the translated process yet, so those report
 // EBADF, as does a standard descriptor after the guest has closed it.
@@ -138,6 +197,22 @@ public:
         status.group_id = macosarm::kDarwinSyntheticGroupId;
         status.block_size = kGuestBlockSize;
         return {status, 0};
+    }
+
+    // ioctl(2) TIOCGETA and TIOCGWINSZ describe only a standard descriptor
+    // the guest still has open. The host contributes just whether the stream
+    // is an interactive terminal and its window size; the dispatcher encodes
+    // a synthetic termios, so no host terminal settings reach the guest. A
+    // redirected or piped stream reports ENOTTY, as isatty(3) expects.
+    macosarm::HostTerminalResult terminal_status(std::int32_t fd) override {
+        if (!is_open(fd)) {
+            return {0, 0, 0, 0, kGuestErrnoEbadf};
+        }
+        const HostStreamTerminal terminal = host_stream_terminal(fd);
+        if (!terminal.is_terminal) {
+            return {0, 0, 0, 0, kGuestErrnoEnotty};
+        }
+        return {terminal.rows, terminal.columns, terminal.x_pixels, terminal.y_pixels, 0};
     }
 
     // Like a canonical-mode terminal read, return after a newline, a full
