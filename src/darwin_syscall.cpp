@@ -479,6 +479,96 @@ void set_error(CpuState& state, std::uint32_t error) noexcept {
     return reject(kDarwinErrnoEnosys);
 }
 
+// XNU bsd/kern/kern_descrip.c: fstat64(fd, ub) resolves the descriptor
+// (EBADF) before vn_stat fills the kernel stat and copyout writes the
+// 144-byte arm64 struct stat64 (EFAULT); success returns 0 in x0. The host
+// reports only guest-visible metadata and the dispatcher encodes the layout
+// itself, so no host stat structure reaches the guest. A malformed status is
+// a host contract violation and is never copied out. A negative descriptor
+// never reaches the host, and the destination is probed before any write.
+[[nodiscard]] SyscallDispatchResult dispatch_fstat64(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    DarwinHostServices& host,
+    std::uint64_t syscall_number) {
+
+    static_assert(kDarwinStat64Size == 144U, "arm64 struct stat64 is 144 bytes");
+    constexpr std::int64_t nanoseconds_per_second = 1000000000;
+    const auto finish = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    };
+
+    const auto fd = static_cast<std::int32_t>(static_cast<std::uint32_t>(state.x[0]));
+    const std::uint64_t guest_address = state.x[1];
+    if (fd < 0) {
+        set_error(state, kDarwinErrnoEbadf);
+        return finish();
+    }
+    const HostStatResult described = host.file_status(fd);
+    if (!described) {
+        set_error(state, described.error);
+        return finish();
+    }
+
+    const HostFileStatus& status = described.status;
+    const auto file_type = static_cast<std::uint16_t>(status.mode & kDarwinModeTypeMask);
+    const bool known_type =
+        file_type == kDarwinModeFifo || file_type == kDarwinModeCharDevice ||
+        file_type == kDarwinModeDirectory || file_type == kDarwinModeBlockDevice ||
+        file_type == kDarwinModeRegular || file_type == kDarwinModeSymlink ||
+        file_type == kDarwinModeSocket;
+    const auto valid_time = [&](const DarwinTimespec& stamp) {
+        return stamp.nanoseconds >= 0 && stamp.nanoseconds < nanoseconds_per_second;
+    };
+    if (!known_type || !valid_time(status.access_time) ||
+        !valid_time(status.modification_time) || !valid_time(status.change_time) ||
+        !valid_time(status.birth_time)) {
+        return SyscallDispatchResult{
+            SyscallDispatchError::host_contract_violation,
+            SyscallAction::resume, syscall_number, 0};
+    }
+
+    // Little-endian arm64 layout; unset bytes, including the padding at
+    // offset 28, stay zero so no stale staging data reaches the guest.
+    std::array<std::byte, kDarwinStat64Size> record{};
+    const auto put = [&](std::size_t offset, std::uint64_t value, std::size_t width) {
+        for (std::size_t i = 0; i < width; ++i) {
+            record[offset + i] = static_cast<std::byte>((value >> (8U * i)) & 0xffU);
+        }
+    };
+    const auto put_time = [&](std::size_t offset, const DarwinTimespec& stamp) {
+        put(offset, static_cast<std::uint64_t>(stamp.seconds), 8U);
+        put(offset + 8U, static_cast<std::uint64_t>(stamp.nanoseconds), 8U);
+    };
+    put(0U, static_cast<std::uint32_t>(status.device), 4U);
+    put(4U, status.mode, 2U);
+    put(6U, status.link_count, 2U);
+    put(8U, status.inode, 8U);
+    put(16U, status.user_id, 4U);
+    put(20U, status.group_id, 4U);
+    put(24U, static_cast<std::uint32_t>(status.special_device), 4U);
+    put_time(32U, status.access_time);
+    put_time(48U, status.modification_time);
+    put_time(64U, status.change_time);
+    put_time(80U, status.birth_time);
+    put(96U, static_cast<std::uint64_t>(status.size), 8U);
+    put(104U, static_cast<std::uint64_t>(status.blocks), 8U);
+    put(112U, static_cast<std::uint32_t>(status.block_size), 4U);
+    put(116U, status.flags, 4U);
+    // st_gen (120), st_lspare (124) and st_qspare (128-143) stay zero: XNU's
+    // vn_stat withholds st_gen from non-root callers, and the synthetic guest
+    // user is never root.
+
+    if (!address_space.probe_write(guest_address, record.size()) ||
+        !address_space.write(guest_address, std::span<const std::byte>(record))) {
+        set_error(state, kDarwinErrnoEfault);
+        return finish();
+    }
+    set_success(state, 0U);
+    return finish();
+}
+
 // XNU bsd/dev/random/randomdev.c: getentropy(buffer, size) rejects sizes
 // above its 256-byte kernel buffer with EINVAL (OpenBSD compatibility),
 // fills that buffer from the kernel CSPRNG, then copies it out (EFAULT).
@@ -657,6 +747,11 @@ SyscallDispatchResult dispatch_darwin_syscall(
         return dispatch_mprotect(state, address_space, syscall_number);
     case kDarwinSysMunmap:
         return dispatch_munmap(state, address_space, syscall_number);
+    case kDarwinSysFstat64:
+        // XNU syscalls.master #339: int fstat64(int fd, user_addr_t ub). On
+        // arm64, libSystem's fstat(3) traps here. Metadata comes only from the
+        // host's guest-descriptor view and the dispatcher encodes the layout.
+        return dispatch_fstat64(state, address_space, host, syscall_number);
     case kDarwinSysGetentropy:
         // XNU syscalls.master #500: int getentropy(void *buffer, size_t size).
         // libSystem seeds arc4random and malloc/stack guards from it; bytes

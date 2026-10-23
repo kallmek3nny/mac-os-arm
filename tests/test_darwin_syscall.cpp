@@ -350,6 +350,88 @@ macosarm::SyscallDispatchResult run_close(
     return macosarm::dispatch_darwin_syscall(state, vm, svc(), host);
 }
 
+// Scripted descriptor metadata for fstat64(2). Only described_fd has a
+// status; every other descriptor reports EBADF. Every host call is recorded
+// so tests can prove negative descriptors never reach the host and that a
+// host error or malformed status is never copied to the guest.
+struct StatHost final : macosarm::DarwinHostServices {
+    std::int32_t described_fd{3};
+    macosarm::HostFileStatus status{};
+    std::uint32_t next_error{};
+    std::vector<std::int32_t> requests;
+
+    macosarm::HostWriteResult write(
+        std::int32_t fd,
+        std::span<const std::byte> bytes) override {
+        static_cast<void>(fd);
+        static_cast<void>(bytes);
+        return {0, macosarm::kDarwinErrnoEbadf};
+    }
+
+    macosarm::HostStatResult file_status(std::int32_t fd) override {
+        requests.push_back(fd);
+        if (next_error != 0) {
+            const std::uint32_t error = next_error;
+            next_error = 0;
+            return {{}, error};
+        }
+        if (fd != described_fd) {
+            return {{}, macosarm::kDarwinErrnoEbadf};
+        }
+        return {status, 0};
+    }
+};
+
+// A regular file owned by the synthetic guest user. Every field holds a
+// distinct value, including a negative st_dev and a pre-epoch birth time,
+// so a misplaced, truncated, or sign-extended encoding is detectable.
+macosarm::HostFileStatus sample_file_status() {
+    macosarm::HostFileStatus status{};
+    status.device = static_cast<std::int32_t>(0x81020304U);
+    status.mode = static_cast<std::uint16_t>(macosarm::kDarwinModeRegular | 0644U);
+    status.link_count = 2;
+    status.inode = 0x0123456789abcdefULL;
+    status.user_id = macosarm::kDarwinSyntheticUserId;
+    status.group_id = macosarm::kDarwinSyntheticGroupId;
+    status.special_device = 0x0a0b0c0d;
+    status.access_time = {1700000000, 111111111};
+    status.modification_time = {1700000001, 222222222};
+    status.change_time = {1700000002, 333333333};
+    status.birth_time = {-1, 999999999};
+    status.size = 0x0000000100000fffLL;
+    status.blocks = 0x2008;
+    status.block_size = 4096;
+    status.flags = 0x00008000U; // UF_HIDDEN
+    return status;
+}
+
+// fstat64(2) fixtures: one guest page pre-filled with a sentinel so tests
+// can prove the 144-byte record is written whole or not at all.
+constexpr std::uint64_t kStatBase = 0xC00000000ULL;
+constexpr std::uint64_t kStatPage = macosarm::GuestAddressSpace::kPageSize;
+constexpr std::byte kStatSentinel{0xcc};
+
+void map_stat_page(macosarm::GuestAddressSpace& vm, macosarm::Protection protection) {
+    const std::vector<std::byte> sentinel(kStatPage, kStatSentinel);
+    expect(static_cast<bool>(vm.map(kStatBase, kStatPage, protection)), "stat buffer maps");
+    expect(static_cast<bool>(vm.load_bytes(kStatBase, sentinel)), "stat sentinel loads");
+}
+
+macosarm::SyscallDispatchResult run_fstat64(
+    macosarm::GuestAddressSpace& vm,
+    macosarm::DarwinHostServices& host,
+    macosarm::CpuState& state,
+    std::uint64_t fd_register,
+    std::uint64_t stat_address) {
+    state = {};
+    state.x[0] = fd_register;
+    state.x[1] = stat_address;
+    state.x[16] = macosarm::kDarwinSysFstat64;
+    // Preset carry so every success test proves the dispatcher clears it.
+    state.pstate = macosarm::kA64PstateCarry;
+    return macosarm::dispatch_darwin_syscall(state, vm, svc(), host);
+}
+
 } // namespace
 
 int main() {
@@ -1820,6 +1902,154 @@ int main() {
                        state.x[0] == macosarm::kDarwinErrnoEio && carry_is_set(state) &&
                        host.requests.size() == 1U && !close_host_has_open(host, 9),
                    "host close error after release is reported once without retry");
+        }
+    }
+
+    {
+        // fstat64(2): descriptor resolution, arm64 stat64 encoding, copyout
+        // faults and host contract enforcement.
+        const auto rw = macosarm::Protection::read | macosarm::Protection::write;
+        const auto stat_sentinel_intact = [](macosarm::GuestAddressSpace& space) {
+            std::vector<std::byte> page(static_cast<std::size_t>(kStatPage));
+            return static_cast<bool>(space.read(kStatBase, page)) &&
+                   std::all_of(page.begin(), page.end(),
+                               [](std::byte value) { return value == kStatSentinel; });
+        };
+
+        {
+            // Success writes all 144 bytes at their XNU offsets with zero
+            // padding and spares, returns 0 in x0 and clears a stale carry.
+            macosarm::GuestAddressSpace vm;
+            map_stat_page(vm, rw);
+            StatHost host;
+            host.status = sample_file_status();
+            macosarm::CpuState state{};
+            const auto result = run_fstat64(vm, host, state, 3U, kStatBase);
+            expect(static_cast<bool>(result) && result.action == macosarm::SyscallAction::resume &&
+                       result.syscall_number == macosarm::kDarwinSysFstat64,
+                   "fstat64 dispatch resumes guest and reports its syscall number");
+            expect(state.x[0] == 0 && !carry_is_set(state) &&
+                       host.requests == std::vector<std::int32_t>{3},
+                   "fstat64 success returns 0, clears carry and queries the fd once");
+
+            std::vector<std::byte> record(macosarm::kDarwinStat64Size + 8U);
+            expect(static_cast<bool>(vm.read(kStatBase, record)), "stat64 record reads back");
+            const auto field = [&](std::size_t offset, std::size_t width) {
+                std::uint64_t value = 0;
+                for (std::size_t i = 0; i < width; ++i) {
+                    value |= static_cast<std::uint64_t>(record[offset + i]) << (8U * i);
+                }
+                return value;
+            };
+            expect(field(0, 4) == 0x81020304U && field(4, 2) == 0x81a4U && field(6, 2) == 2U &&
+                       field(8, 8) == 0x0123456789abcdefULL,
+                   "stat64 encodes st_dev, st_mode, st_nlink and st_ino");
+            expect(field(16, 4) == macosarm::kDarwinSyntheticUserId &&
+                       field(20, 4) == macosarm::kDarwinSyntheticGroupId &&
+                       field(24, 4) == 0x0a0b0c0dU && field(28, 4) == 0U,
+                   "stat64 encodes st_uid, st_gid, st_rdev and zero padding");
+            expect(field(32, 8) == 1700000000U && field(40, 8) == 111111111U &&
+                       field(48, 8) == 1700000001U && field(56, 8) == 222222222U &&
+                       field(64, 8) == 1700000002U && field(72, 8) == 333333333U,
+                   "stat64 encodes access, modification and change times");
+            expect(field(80, 8) == ~std::uint64_t{0} && field(88, 8) == 999999999U,
+                   "stat64 sign-extends a pre-epoch birth time");
+            expect(field(96, 8) == 0x0000000100000fffULL && field(104, 8) == 0x2008U &&
+                       field(112, 4) == 4096U && field(116, 4) == 0x8000U,
+                   "stat64 encodes st_size, st_blocks, st_blksize and st_flags");
+            const auto zero = [](std::byte value) { return value == std::byte{0}; };
+            const auto sentinel = [](std::byte value) { return value == kStatSentinel; };
+            expect(std::all_of(record.begin() + 120, record.begin() + 144, zero) &&
+                       std::all_of(record.begin() + 144, record.end(), sentinel),
+                   "stat64 zeroes st_gen and spares and writes nothing past 144 bytes");
+        }
+
+        {
+            // Negative descriptors (taken from w0) fail with EBADF before the
+            // host is consulted; host errors set carry and copy nothing out.
+            macosarm::GuestAddressSpace vm;
+            map_stat_page(vm, rw);
+            StatHost host;
+            host.status = sample_file_status();
+            macosarm::CpuState state{};
+            const std::array<std::uint64_t, 2> negative{0xffffffffULL, 0x80000000ULL};
+            for (const std::uint64_t fd : negative) {
+                const auto rejected = run_fstat64(vm, host, state, fd, kStatBase);
+                expect(static_cast<bool>(rejected) &&
+                           state.x[0] == macosarm::kDarwinErrnoEbadf && carry_is_set(state),
+                       "negative fstat64 descriptor returns EBADF and sets carry");
+            }
+            expect(host.requests.empty(), "negative fstat64 descriptors never reach the host");
+
+            const auto unknown = run_fstat64(vm, host, state, 4U, kStatBase);
+            expect(static_cast<bool>(unknown) && state.x[0] == macosarm::kDarwinErrnoEbadf &&
+                       carry_is_set(state),
+                   "unknown fstat64 descriptor returns the host EBADF");
+            host.next_error = macosarm::kDarwinErrnoEio;
+            const auto failed = run_fstat64(vm, host, state, 3U, kStatBase);
+            expect(static_cast<bool>(failed) && state.x[0] == macosarm::kDarwinErrnoEio &&
+                       carry_is_set(state),
+                   "host fstat64 failure returns its errno and sets carry");
+            expect(host.requests == std::vector<std::int32_t>{4, 3} && stat_sentinel_intact(vm),
+                   "failed fstat64 queries each fd once and writes no guest bytes");
+
+            const auto widened = run_fstat64(vm, host, state, 0xffffffff00000003ULL, kStatBase);
+            expect(static_cast<bool>(widened) && state.x[0] == 0 && !carry_is_set(state),
+                   "fstat64 ignores the upper 32 bits of the descriptor register");
+        }
+
+        {
+            // Copyout faults: the descriptor resolves first, as in XNU, then an
+            // unwritable, unmapped or page-crossing destination fails with
+            // EFAULT before any byte of the record reaches guest memory.
+            const auto check_fault = [&](macosarm::Protection protection, std::uint64_t address,
+                                         const std::string& label) {
+                macosarm::GuestAddressSpace vm;
+                map_stat_page(vm, protection);
+                StatHost host;
+                host.status = sample_file_status();
+                macosarm::CpuState state{};
+                const auto faulted = run_fstat64(vm, host, state, 3U, address);
+                expect(static_cast<bool>(faulted) &&
+                           state.x[0] == macosarm::kDarwinErrnoEfault && carry_is_set(state),
+                       label + " returns EFAULT and sets carry");
+                expect(host.requests == std::vector<std::int32_t>{3} && stat_sentinel_intact(vm),
+                       label + " resolves the fd once and writes no guest bytes");
+            };
+            check_fault(macosarm::Protection::read, kStatBase, "read-only fstat64 buffer");
+            check_fault(rw, 0xdead00000000ULL, "unmapped fstat64 buffer");
+            check_fault(rw, kStatBase + kStatPage - 64U, "fstat64 buffer crossing an unmapped page");
+        }
+
+        {
+            // A malformed host status is a host contract violation: no errno
+            // is delivered and no part of the record is copied to the guest.
+            const auto check_violation = [&](const macosarm::HostFileStatus& status,
+                                             const std::string& label) {
+                macosarm::GuestAddressSpace vm;
+                map_stat_page(vm, rw);
+                StatHost host;
+                host.status = status;
+                macosarm::CpuState state{};
+                const auto result = run_fstat64(vm, host, state, 3U, kStatBase);
+                expect(result.error == macosarm::SyscallDispatchError::host_contract_violation &&
+                           result.syscall_number == macosarm::kDarwinSysFstat64,
+                       label + " is a host contract violation");
+                expect(host.requests.size() == 1U && stat_sentinel_intact(vm),
+                       label + " queries the host once and writes no guest bytes");
+            };
+            auto untyped = sample_file_status();
+            untyped.mode = static_cast<std::uint16_t>(0644U);
+            check_violation(untyped, "fstat64 mode without a file type");
+            auto whiteout = sample_file_status();
+            whiteout.mode = static_cast<std::uint16_t>(0160000U | 0644U); // S_IFWHT
+            check_violation(whiteout, "fstat64 whiteout file type");
+            auto full_second = sample_file_status();
+            full_second.modification_time.nanoseconds = 1000000000;
+            check_violation(full_second, "fstat64 nanoseconds of a full second");
+            auto negative_nanoseconds = sample_file_status();
+            negative_nanoseconds.birth_time.nanoseconds = -1;
+            check_violation(negative_nanoseconds, "fstat64 negative nanoseconds");
         }
     }
 

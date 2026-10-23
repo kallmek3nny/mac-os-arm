@@ -38,6 +38,20 @@ constexpr std::uint64_t kDarwinSysGettimeofday = 116;
 // argument and error contract; only the pthread cancellation point differs.
 constexpr std::uint64_t kDarwinSysClose = 6;
 constexpr std::uint64_t kDarwinSysCloseNocancel = 399;
+// XNU syscalls.master #339: int fstat64(int fd, user_addr_t ub). arm64 has
+// only 64-bit inodes, so libSystem routes fstat(3) to this entry point and
+// XNU copies out the 144-byte arm64 struct stat64 (__DARWIN_STRUCT_STAT64).
+constexpr std::uint64_t kDarwinSysFstat64 = 339;
+constexpr std::size_t kDarwinStat64Size = 144;
+// XNU bsd/sys/_types/_s_ifmt.h: st_mode file-type bits.
+constexpr std::uint16_t kDarwinModeTypeMask = 0170000;    // S_IFMT
+constexpr std::uint16_t kDarwinModeFifo = 0010000;        // S_IFIFO
+constexpr std::uint16_t kDarwinModeCharDevice = 0020000;  // S_IFCHR
+constexpr std::uint16_t kDarwinModeDirectory = 0040000;   // S_IFDIR
+constexpr std::uint16_t kDarwinModeBlockDevice = 0060000; // S_IFBLK
+constexpr std::uint16_t kDarwinModeRegular = 0100000;     // S_IFREG
+constexpr std::uint16_t kDarwinModeSymlink = 0120000;     // S_IFLNK
+constexpr std::uint16_t kDarwinModeSocket = 0140000;      // S_IFSOCK
 constexpr std::uint32_t kDarwinErrnoEio = 5;
 constexpr std::uint32_t kDarwinErrnoEbadf = 9;
 constexpr std::uint32_t kDarwinErrnoEnomem = 12;
@@ -116,6 +130,48 @@ struct HostCloseResult {
     }
 };
 
+// A struct stat64 timestamp: seconds and nanoseconds since the Unix epoch.
+struct DarwinTimespec {
+    std::int64_t seconds{};
+    std::int64_t nanoseconds{};
+};
+
+// Guest-visible metadata for fstat64(2). The dispatcher, not the host,
+// encodes the 144-byte arm64 struct stat64, so no host stat layout ever
+// reaches the guest. Ownership is the translated process's synthetic view,
+// never host credentials. st_gen and the spare fields are not represented;
+// the dispatcher always reports them as zero.
+struct HostFileStatus {
+    std::int32_t device{};              // st_dev
+    std::uint16_t mode{};               // st_mode: S_IF* type plus permission bits
+    std::uint16_t link_count{};         // st_nlink
+    std::uint64_t inode{};              // st_ino
+    std::uint32_t user_id{};            // st_uid
+    std::uint32_t group_id{};           // st_gid
+    std::int32_t special_device{};      // st_rdev
+    DarwinTimespec access_time{};       // st_atimespec
+    DarwinTimespec modification_time{}; // st_mtimespec
+    DarwinTimespec change_time{};       // st_ctimespec
+    DarwinTimespec birth_time{};        // st_birthtimespec
+    std::int64_t size{};                // st_size
+    std::int64_t blocks{};              // st_blocks
+    std::int32_t block_size{};          // st_blksize
+    std::uint32_t flags{};              // st_flags
+};
+
+// Outcome of describing guest descriptor fd for fstat64(2). A successful
+// status names one S_IF* file type in mode and keeps every nanosecond field
+// in [0, 1000000000); the dispatcher treats anything else as a host
+// contract violation and never copies it to the guest.
+struct HostStatResult {
+    HostFileStatus status{};
+    std::uint32_t error{};
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return error == 0;
+    }
+};
+
 class DarwinHostServices {
 public:
     virtual ~DarwinHostServices() = default;
@@ -149,6 +205,16 @@ public:
     // override this have no clock and report ENOSYS, never a fabricated time.
     [[nodiscard]] virtual HostWallClockResult wall_clock() {
         return {0, 0, kDarwinErrnoEnosys};
+    }
+
+    // Describe guest descriptor fd for fstat64(2). The host reports only
+    // guest-visible metadata; the dispatcher validates it and encodes the
+    // arm64 struct stat64 itself. Hosts that do not override this expose no
+    // descriptors to describe and report EBADF, never fabricated metadata.
+    // (Not named fstat, which some host C runtimes define as a macro.)
+    [[nodiscard]] virtual HostStatResult file_status(std::int32_t fd) {
+        static_cast<void>(fd);
+        return {{}, kDarwinErrnoEbadf};
     }
 
     // Release guest descriptor fd for close(2). As in XNU, any result other
