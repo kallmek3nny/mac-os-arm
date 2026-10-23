@@ -36,16 +36,36 @@ constexpr std::uint32_t kGuestErrnoEio = 5;
 constexpr std::uint32_t kGuestErrnoEbadf = 9;
 
 // The guest's stdin, stdout and stderr reach the host's, as raw bytes. No
-// other descriptor exists in the translated process yet, so those report EBADF.
+// other descriptor exists in the translated process yet, so those report
+// EBADF, as does a standard descriptor after the guest has closed it.
 class ConsoleHost final : public macosarm::DarwinHostServices {
+    // Bit n is set while guest descriptor n (stdin, stdout, stderr) is open.
+    unsigned open_descriptors_ = 0b111U;
+
+    [[nodiscard]] bool is_open(std::int32_t fd) const noexcept {
+        return fd >= 0 && fd <= 2 &&
+               (open_descriptors_ & (1U << static_cast<unsigned>(fd))) != 0U;
+    }
+
 public:
+    // close(2) releases only the guest's view of a standard descriptor; the
+    // host's own streams stay open for macho-run diagnostics. A released or
+    // unknown descriptor reports EBADF, so a second close never succeeds.
+    macosarm::HostCloseResult close(std::int32_t fd) override {
+        if (!is_open(fd)) {
+            return {kGuestErrnoEbadf};
+        }
+        open_descriptors_ &= ~(1U << static_cast<unsigned>(fd));
+        return {0};
+    }
+
     // Like a canonical-mode terminal read, return after a newline, a full
     // buffer or end-of-file rather than blocking until the buffer fills.
     // A zero-length request only validates the descriptor and consumes nothing.
     macosarm::HostReadResult read(
         std::int32_t fd,
         std::span<std::byte> bytes) override {
-        if (fd != 0) {
+        if (fd != 0 || !is_open(fd)) {
             return {0, kGuestErrnoEbadf};
         }
         std::size_t received = 0;
@@ -71,7 +91,10 @@ public:
     macosarm::HostWriteResult write(
         std::int32_t fd,
         std::span<const std::byte> bytes) override {
-        std::FILE* const stream = fd == 1 ? stdout : fd == 2 ? stderr : nullptr;
+        // Once the guest closes stdout or stderr, its writes no longer reach
+        // the host stream and report EBADF like any other unknown descriptor.
+        std::FILE* const stream =
+            !is_open(fd) ? nullptr : fd == 1 ? stdout : fd == 2 ? stderr : nullptr;
         if (stream == nullptr) {
             return {0, kGuestErrnoEbadf};
         }

@@ -132,8 +132,34 @@ constexpr std::array<std::uint32_t, 19> kEchoCode{
     0xd4001001U, // svc #0x80
 };
 
+// close(1); write(1, "hello", 5); exit(errno). Once the guest closes stdout,
+// the write must fail with EBADF, so the exit status is that errno and no
+// byte reaches the host stdout. A failed close exits 100 instead, and a
+// write that still succeeds exits 101, so neither can pass for EBADF.
+constexpr std::array<std::uint32_t, 19> kCloseStdoutCode{
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd28000d0U, // mov x16, #6 (close)
+    0xd4001001U, // svc #0x80
+    0x54000142U, // b.cs close_failed (+40)
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd2880001U, // mov x1, #0x4000
+    0xf2c00021U, // movk x1, #1, lsl #32 -> 0x100004000
+    0xd28000a2U, // mov x2, #5
+    0xd2800090U, // mov x16, #4 (write)
+    0xd4001001U, // svc #0x80
+    0x540000c3U, // b.cc write_succeeded (+24)
+    0xd2800030U, // mov x16, #1 (exit) with the write errno still in x0
+    0xd4001001U, // svc #0x80
+    0xd2800c80U, // close_failed: mov x0, #100
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800ca0U, // write_succeeded: mov x0, #101
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+};
+
 int usage() {
-    std::cerr << "usage: macho_run_fixture <hello|argc|echo> <output-path>\n";
+    std::cerr << "usage: macho_run_fixture <hello|argc|echo|close-stdout> <output-path>\n";
     return 2;
 }
 
@@ -151,6 +177,8 @@ int main(int argc, char** argv) {
         bytes = image(kArgcCode);
     } else if (kind == "echo") {
         bytes = image(kEchoCode);
+    } else if (kind == "close-stdout") {
+        bytes = image(kCloseStdoutCode);
     } else {
         return usage();
     }

@@ -667,6 +667,26 @@ SyscallDispatchResult dispatch_darwin_syscall(
         // struct timezone *tzp, uint64_t *mach_absolute_time). Time comes
         // only from the host wall clock; the zone is always synthetic UTC.
         return dispatch_gettimeofday(state, address_space, host, syscall_number);
+    case kDarwinSysClose:
+    case kDarwinSysCloseNocancel: {
+        // XNU bsd/kern/kern_descrip.c: close_nocancel rejects a descriptor
+        // outside the file table with EBADF before releasing anything. A
+        // negative fd can never name a guest descriptor, so it never reaches
+        // the host. Any other host error is reported once and the descriptor
+        // is never closed a second time.
+        const auto fd = static_cast<std::int32_t>(static_cast<std::uint32_t>(state.x[0]));
+        if (fd < 0) {
+            set_error(state, kDarwinErrnoEbadf);
+            return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+        }
+        const HostCloseResult closed = host.close(fd);
+        if (!closed) {
+            set_error(state, closed.error);
+        } else {
+            set_success(state, 0U);
+        }
+        return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    }
     case kDarwinSysGetpid:
         // XNU bsd/kern/syscalls.master: BSD #20, int getpid(void).
         // Process identity belongs to the shared context, never to the host.

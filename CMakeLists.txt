@@ -342,6 +342,19 @@ if(BUILD_TESTING)
                 "-DIMAGE=${CMAKE_CURRENT_BINARY_DIR}/macho-run-echo-eof.bin"
                 -DEXPECTED_EXIT=0
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
+        # close(2) end to end: once the guest closes stdout, its write fails
+        # with EBADF, so the guest exits 9 and no byte reaches the host stdout.
+        # A failed close exits 100 and a write that still succeeds exits 101.
+        add_test(
+            NAME macho-run-close-stdout
+            COMMAND "${CMAKE_COMMAND}"
+                "-DFIXTURE_TOOL=$<TARGET_FILE:macho_run_fixture>"
+                "-DRUNNER=$<TARGET_FILE:macho-run>"
+                -DKIND=close-stdout
+                "-DIMAGE=${CMAKE_CURRENT_BINARY_DIR}/macho-run-close-stdout.bin"
+                -DEXPECTED_EXIT=9
+                "-DEXPECTED_STDOUT="
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
     endif()
 endif()
 

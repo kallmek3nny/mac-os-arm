@@ -34,6 +34,10 @@ constexpr std::uint64_t kDarwinSysGetentropy = 500;
 // XNU syscalls.master #116: int gettimeofday(struct timeval *tp,
 // struct timezone *tzp, uint64_t *mach_absolute_time).
 constexpr std::uint64_t kDarwinSysGettimeofday = 116;
+// XNU syscalls.master #6: int close(int fd). #399 close_nocancel shares its
+// argument and error contract; only the pthread cancellation point differs.
+constexpr std::uint64_t kDarwinSysClose = 6;
+constexpr std::uint64_t kDarwinSysCloseNocancel = 399;
 constexpr std::uint32_t kDarwinErrnoEio = 5;
 constexpr std::uint32_t kDarwinErrnoEbadf = 9;
 constexpr std::uint32_t kDarwinErrnoEnomem = 12;
@@ -101,6 +105,17 @@ struct HostWallClockResult {
     }
 };
 
+// Outcome of releasing a guest descriptor for close(2). There is no byte
+// count; as in XNU, an error other than EBADF may still have released fd,
+// so the dispatcher reports it once and never retries the close.
+struct HostCloseResult {
+    std::uint32_t error{};
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return error == 0;
+    }
+};
+
 class DarwinHostServices {
 public:
     virtual ~DarwinHostServices() = default;
@@ -134,6 +149,15 @@ public:
     // override this have no clock and report ENOSYS, never a fabricated time.
     [[nodiscard]] virtual HostWallClockResult wall_clock() {
         return {0, 0, kDarwinErrnoEnosys};
+    }
+
+    // Release guest descriptor fd for close(2). As in XNU, any result other
+    // than EBADF means fd was released and must not be closed again. Hosts
+    // that do not override this expose no closable descriptors and report
+    // EBADF, never a fabricated success.
+    [[nodiscard]] virtual HostCloseResult close(std::int32_t fd) {
+        static_cast<void>(fd);
+        return {kDarwinErrnoEbadf};
     }
 };
 

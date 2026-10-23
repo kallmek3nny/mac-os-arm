@@ -302,6 +302,54 @@ macosarm::SyscallDispatchResult run_gettimeofday(
     return macosarm::dispatch_darwin_syscall(state, vm, svc(), host);
 }
 
+// Scripted descriptor table for close(2). Every host close is recorded so
+// tests can prove negative descriptors never reach the host and that a
+// descriptor is released at most once, even when the host reports an error
+// after releasing it (as XNU does when the final closef fails).
+struct CloseHost final : macosarm::DarwinHostServices {
+    std::vector<std::int32_t> open_fds;
+    std::vector<std::int32_t> requests;
+    std::uint32_t release_error{};
+
+    macosarm::HostWriteResult write(
+        std::int32_t fd,
+        std::span<const std::byte> bytes) override {
+        static_cast<void>(fd);
+        static_cast<void>(bytes);
+        return {0, macosarm::kDarwinErrnoEbadf};
+    }
+
+    macosarm::HostCloseResult close(std::int32_t fd) override {
+        requests.push_back(fd);
+        const auto open = std::find(open_fds.begin(), open_fds.end(), fd);
+        if (open == open_fds.end()) {
+            return {macosarm::kDarwinErrnoEbadf};
+        }
+        open_fds.erase(open);
+        const std::uint32_t error = release_error;
+        release_error = 0;
+        return {error};
+    }
+};
+
+bool close_host_has_open(const CloseHost& host, std::int32_t fd) {
+    return std::find(host.open_fds.begin(), host.open_fds.end(), fd) != host.open_fds.end();
+}
+
+macosarm::SyscallDispatchResult run_close(
+    macosarm::DarwinHostServices& host,
+    macosarm::CpuState& state,
+    std::uint64_t syscall_number,
+    std::uint64_t fd_register) {
+    macosarm::GuestAddressSpace vm;
+    state = {};
+    state.x[0] = fd_register;
+    state.x[16] = syscall_number;
+    // Preset carry so every success test proves the dispatcher clears it.
+    state.pstate = macosarm::kA64PstateCarry;
+    return macosarm::dispatch_darwin_syscall(state, vm, svc(), host);
+}
+
 } // namespace
 
 int main() {
@@ -1686,6 +1734,92 @@ int main() {
                        seconds == 1700000000U &&
                        read_guest_le(vm, clock_tv + 8U, 4U, microseconds) && microseconds == 42U,
                    "unmapped timezone faults after the timeval copyout, matching XNU order");
+        }
+    }
+
+    {
+        // close(2) / close_nocancel(2): XNU syscalls.master #6 and #399.
+        {
+            CloseHost host;
+            host.open_fds = {3, 4};
+            macosarm::CpuState state{};
+            const auto result = run_close(host, state, macosarm::kDarwinSysClose, 3U);
+            expect(static_cast<bool>(result) &&
+                       result.action == macosarm::SyscallAction::resume &&
+                       result.syscall_number == macosarm::kDarwinSysClose &&
+                       state.x[0] == 0U && !carry_is_set(state) &&
+                       host.requests.size() == 1U && host.requests[0] == 3 &&
+                       !close_host_has_open(host, 3) && close_host_has_open(host, 4),
+                   "close releases only the requested descriptor and clears carry");
+        }
+
+        {
+            CloseHost host;
+            host.open_fds = {5};
+            macosarm::CpuState state{};
+            const auto result =
+                run_close(host, state, macosarm::kDarwinSysCloseNocancel, 5U);
+            expect(static_cast<bool>(result) &&
+                       result.action == macosarm::SyscallAction::resume &&
+                       result.syscall_number == macosarm::kDarwinSysCloseNocancel &&
+                       state.x[0] == 0U && !carry_is_set(state) &&
+                       host.requests.size() == 1U && host.requests[0] == 5 &&
+                       host.open_fds.empty(),
+                   "close_nocancel shares close's descriptor contract");
+        }
+
+        {
+            CloseHost host;
+            host.open_fds = {3};
+            macosarm::CpuState state{};
+            const auto first = run_close(host, state, macosarm::kDarwinSysClose, 3U);
+            const bool first_closed =
+                static_cast<bool>(first) && state.x[0] == 0U && !carry_is_set(state);
+            const auto second = run_close(host, state, macosarm::kDarwinSysClose, 3U);
+            expect(first_closed && static_cast<bool>(second) &&
+                       state.x[0] == macosarm::kDarwinErrnoEbadf && carry_is_set(state) &&
+                       host.requests.size() == 2U,
+                   "closing an already released descriptor reports EBADF");
+        }
+
+        {
+            // A negative descriptor fails before the host is consulted.
+            CloseHost host;
+            host.open_fds = {0};
+            macosarm::CpuState state{};
+            const auto result =
+                run_close(host, state, macosarm::kDarwinSysClose, 0xffffffffULL);
+            expect(static_cast<bool>(result) &&
+                       state.x[0] == macosarm::kDarwinErrnoEbadf && carry_is_set(state) &&
+                       host.requests.empty() && close_host_has_open(host, 0),
+                   "negative descriptor returns EBADF without a host close");
+        }
+
+        {
+            // XNU reads the int fd from the low 32 bits of x0.
+            CloseHost host;
+            host.open_fds = {7};
+            macosarm::CpuState state{};
+            const auto result =
+                run_close(host, state, macosarm::kDarwinSysClose, 0xffffffff00000007ULL);
+            expect(static_cast<bool>(result) && state.x[0] == 0U && !carry_is_set(state) &&
+                       host.requests.size() == 1U && host.requests[0] == 7 &&
+                       host.open_fds.empty(),
+                   "close truncates the descriptor register to a 32-bit int");
+        }
+
+        {
+            // The host may release the descriptor and still report an error;
+            // the error is returned once and the close is never retried.
+            CloseHost host;
+            host.open_fds = {9};
+            host.release_error = macosarm::kDarwinErrnoEio;
+            macosarm::CpuState state{};
+            const auto result = run_close(host, state, macosarm::kDarwinSysClose, 9U);
+            expect(static_cast<bool>(result) &&
+                       state.x[0] == macosarm::kDarwinErrnoEio && carry_is_set(state) &&
+                       host.requests.size() == 1U && !close_host_has_open(host, 9),
+                   "host close error after release is reported once without retry");
         }
     }
 
