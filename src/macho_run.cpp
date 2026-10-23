@@ -14,7 +14,8 @@
 #include <system_error>
 #include <vector>
 
-// getentropy(2) is served only from the host operating system's CSPRNG.
+// Host services: getentropy(2) reads only the host operating system's CSPRNG,
+// and fstat64(2) asks the host only for a standard stream's file type.
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -26,6 +27,7 @@
 #include <bcrypt.h>
 #else
 #include <sys/random.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -34,6 +36,62 @@ namespace {
 // XNU bsd/sys/errno.h values reported to the guest, never host errno values.
 constexpr std::uint32_t kGuestErrnoEio = 5;
 constexpr std::uint32_t kGuestErrnoEbadf = 9;
+
+// st_blksize reported for every guest standard descriptor. Darwin libc sizes
+// stdio buffers from it, so it must be positive; it describes no host file.
+constexpr std::int32_t kGuestBlockSize = 4096;
+
+// The Darwin S_IF* file type of host standard stream fd (0, 1 or 2), or 0
+// when the host cannot classify it. Only the type comes from the host: a
+// terminal is a character device, a pipe a FIFO and a redirected file a
+// regular file, which is what Darwin libc checks to choose stdio buffering.
+std::uint16_t host_stream_type(std::int32_t fd) noexcept {
+    if (fd < 0 || fd > 2) {
+        return 0;
+    }
+#if defined(_WIN32)
+    constexpr DWORD kStandardHandles[] = {STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE};
+    const HANDLE handle = ::GetStdHandle(kStandardHandles[static_cast<std::size_t>(fd)]);
+    if (handle == nullptr || handle == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    switch (::GetFileType(handle)) {
+    case FILE_TYPE_CHAR:
+        return macosarm::kDarwinModeCharDevice;
+    case FILE_TYPE_PIPE:
+        return macosarm::kDarwinModeFifo;
+    case FILE_TYPE_DISK:
+        return macosarm::kDarwinModeRegular;
+    default:
+        return 0;
+    }
+#else
+    struct stat host_status {};
+    if (::fstat(fd, &host_status) != 0) {
+        return 0;
+    }
+    const auto mode = host_status.st_mode;
+    if (S_ISCHR(mode)) {
+        return macosarm::kDarwinModeCharDevice;
+    }
+    if (S_ISFIFO(mode)) {
+        return macosarm::kDarwinModeFifo;
+    }
+    if (S_ISREG(mode)) {
+        return macosarm::kDarwinModeRegular;
+    }
+    if (S_ISDIR(mode)) {
+        return macosarm::kDarwinModeDirectory;
+    }
+    if (S_ISBLK(mode)) {
+        return macosarm::kDarwinModeBlockDevice;
+    }
+    if (S_ISSOCK(mode)) {
+        return macosarm::kDarwinModeSocket;
+    }
+    return 0;
+#endif
+}
 
 // The guest's stdin, stdout and stderr reach the host's, as raw bytes. No
 // other descriptor exists in the translated process yet, so those report
@@ -57,6 +115,29 @@ public:
         }
         open_descriptors_ &= ~(1U << static_cast<unsigned>(fd));
         return {0};
+    }
+
+    // fstat64(2) describes only a standard descriptor the guest still has
+    // open. The host contributes just the file type; ownership is the
+    // translated process's synthetic user, the permissions are owner
+    // read/write, and every other field stays zero, so no host inode, device,
+    // size or timestamp reaches the guest. A stream the host cannot classify
+    // reports EIO rather than a guessed type.
+    macosarm::HostStatResult file_status(std::int32_t fd) override {
+        if (!is_open(fd)) {
+            return {{}, kGuestErrnoEbadf};
+        }
+        const std::uint16_t type = host_stream_type(fd);
+        if (type == 0) {
+            return {{}, kGuestErrnoEio};
+        }
+        macosarm::HostFileStatus status{};
+        status.mode = static_cast<std::uint16_t>(type | 0600U);
+        status.link_count = 1;
+        status.user_id = macosarm::kDarwinSyntheticUserId;
+        status.group_id = macosarm::kDarwinSyntheticGroupId;
+        status.block_size = kGuestBlockSize;
+        return {status, 0};
     }
 
     // Like a canonical-mode terminal read, return after a newline, a full

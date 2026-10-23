@@ -158,8 +158,33 @@ constexpr std::array<std::uint32_t, 19> kCloseStdoutCode{
     0xd4001001U, // svc #0x80
 };
 
+// fstat64(0, buffer); exit(st_mode >> 12). The exit status is the Darwin
+// S_IF* file type of the guest's stdin, which macho_run_check.cmake always
+// redirects from a file, so a correct host reports S_IFREG (8). A failed
+// fstat64 exits 100 instead, so an errno cannot pass for a file type. The
+// buffer address is rebuilt after the call rather than trusting x1 to survive
+// it, and the 144-byte stat64 lands in the zero-filled tail of __DATA.
+constexpr std::array<std::uint32_t, 15> kFstatStdinCode{
+    0xd2800000U, // mov x0, #0 (stdin)
+    0xd2882001U, // mov x1, #0x4100
+    0xf2c00021U, // movk x1, #1, lsl #32 -> 0x100004100
+    0xd2802a70U, // mov x16, #339 (fstat64)
+    0xd4001001U, // svc #0x80
+    0x540000e2U, // b.cs fstat_failed (+28)
+    0xd2882001U, // mov x1, #0x4100
+    0xf2c00021U, // movk x1, #1, lsl #32
+    0x79400820U, // ldrh w0, [x1, #4] -> st_mode
+    0x530c7c00U, // lsr w0, w0, #12 -> S_IF* file type
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800c80U, // fstat_failed: mov x0, #100
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+};
+
 int usage() {
-    std::cerr << "usage: macho_run_fixture <hello|argc|echo|close-stdout> <output-path>\n";
+    std::cerr << "usage: macho_run_fixture <hello|argc|echo|close-stdout|fstat-stdin> "
+                 "<output-path>\n";
     return 2;
 }
 
@@ -179,6 +204,8 @@ int main(int argc, char** argv) {
         bytes = image(kEchoCode);
     } else if (kind == "close-stdout") {
         bytes = image(kCloseStdoutCode);
+    } else if (kind == "fstat-stdin") {
+        bytes = image(kFstatStdinCode);
     } else {
         return usage();
     }

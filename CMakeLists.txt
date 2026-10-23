@@ -355,6 +355,20 @@ if(BUILD_TESTING)
                 -DEXPECTED_EXIT=9
                 "-DEXPECTED_STDOUT="
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
+        # fstat64(2) end to end: macho_run_check.cmake always redirects guest
+        # stdin from a file, so the guest exits with its S_IFREG file type
+        # (st_mode >> 12 == 8) and writes nothing. A failed fstat64 exits 100,
+        # so an errno cannot pass for a file type.
+        add_test(
+            NAME macho-run-fstat-stdin
+            COMMAND "${CMAKE_COMMAND}"
+                "-DFIXTURE_TOOL=$<TARGET_FILE:macho_run_fixture>"
+                "-DRUNNER=$<TARGET_FILE:macho-run>"
+                -DKIND=fstat-stdin
+                "-DIMAGE=${CMAKE_CURRENT_BINARY_DIR}/macho-run-fstat-stdin.bin"
+                -DEXPECTED_EXIT=8
+                "-DEXPECTED_STDOUT="
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
     endif()
 endif()
 
