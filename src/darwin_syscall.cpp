@@ -479,6 +479,60 @@ void set_error(CpuState& state, std::uint32_t error) noexcept {
     return reject(kDarwinErrnoEnosys);
 }
 
+// XNU bsd/dev/random/randomdev.c: getentropy(buffer, size) rejects sizes
+// above its 256-byte kernel buffer with EINVAL (OpenBSD compatibility),
+// fills that buffer from the kernel CSPRNG, then copies it out (EFAULT).
+// There is no short count: success returns 0 with every byte written.
+// The guest destination is probed first so host entropy is never drawn for
+// a buffer that cannot receive it, and the staging copy is scrubbed after.
+[[nodiscard]] SyscallDispatchResult dispatch_getentropy(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    DarwinHostServices& host,
+    std::uint64_t syscall_number) {
+
+    constexpr std::size_t max_entropy_size = 256;
+    const auto finish = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    };
+
+    const std::uint64_t guest_address = state.x[0];
+    const std::uint64_t size = state.x[1];
+    if (size > max_entropy_size) {
+        set_error(state, kDarwinErrnoEinval);
+        return finish();
+    }
+    if (size == 0U) {
+        // XNU copyout returns success for zero bytes before validating the
+        // user address, so even a null buffer succeeds without host entropy.
+        set_success(state, 0U);
+        return finish();
+    }
+    const auto requested = static_cast<std::size_t>(size);
+    if (!address_space.probe_write(guest_address, requested)) {
+        set_error(state, kDarwinErrnoEfault);
+        return finish();
+    }
+
+    std::array<std::byte, max_entropy_size> staging{};
+    const std::span<std::byte> filled(staging.data(), requested);
+    const HostEntropyResult host_result = host.fill_entropy(filled);
+    if (!host_result) {
+        set_error(state, host_result.error);
+    } else if (!address_space.write(guest_address, std::span<const std::byte>(filled))) {
+        set_error(state, kDarwinErrnoEfault);
+    } else {
+        set_success(state, 0U);
+    }
+    // Volatile stores keep the scrub from being elided as a dead write.
+    volatile std::byte* const scrub = staging.data();
+    for (std::size_t i = 0; i < staging.size(); ++i) {
+        scrub[i] = std::byte{0};
+    }
+    return finish();
+}
+
 } // namespace
 
 SyscallDispatchResult dispatch_darwin_syscall(
@@ -521,6 +575,11 @@ SyscallDispatchResult dispatch_darwin_syscall(
         return dispatch_mprotect(state, address_space, syscall_number);
     case kDarwinSysMunmap:
         return dispatch_munmap(state, address_space, syscall_number);
+    case kDarwinSysGetentropy:
+        // XNU syscalls.master #500: int getentropy(void *buffer, size_t size).
+        // libSystem seeds arc4random and malloc/stack guards from it; bytes
+        // come only from the host's secure source, never a fabricated seed.
+        return dispatch_getentropy(state, address_space, host, syscall_number);
     case kDarwinSysGetpid:
         // XNU bsd/kern/syscalls.master: BSD #20, int getpid(void).
         // Process identity belongs to the shared context, never to the host.

@@ -65,6 +65,11 @@ if(MACOSARM_ENABLE_DYNARMIC)
     # and stderr reach the host; every other descriptor reports EBADF.
     add_executable(macho-run src/macho_run.cpp)
     target_link_libraries(macho-run PRIVATE macosarm_dynarmic)
+    # The console host serves guest getentropy(2) from BCryptGenRandom on
+    # Windows; other hosts use libc getentropy and need no extra library.
+    if(WIN32)
+        target_link_libraries(macho-run PRIVATE bcrypt)
+    endif()
     target_compile_options(macho-run PRIVATE
         $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>
         $<$<CXX_COMPILER_ID:MSVC>:/W4;/WX>

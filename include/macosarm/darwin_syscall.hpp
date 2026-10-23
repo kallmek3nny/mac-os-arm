@@ -30,6 +30,7 @@ constexpr std::uint64_t kDarwinSysBsdthreadRegister = 366;
 constexpr std::uint64_t kDarwinSysThreadSelfid = 372;
 constexpr std::uint64_t kDarwinSysReadNocancel = 396;
 constexpr std::uint64_t kDarwinSysWriteNocancel = 397;
+constexpr std::uint64_t kDarwinSysGetentropy = 500;
 constexpr std::uint32_t kDarwinErrnoEio = 5;
 constexpr std::uint32_t kDarwinErrnoEbadf = 9;
 constexpr std::uint32_t kDarwinErrnoEnomem = 12;
@@ -75,6 +76,15 @@ struct HostReadResult {
     }
 };
 
+// Entropy is all-or-nothing: on success every requested byte was filled.
+struct HostEntropyResult {
+    std::uint32_t error{};
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return error == 0;
+    }
+};
+
 class DarwinHostServices {
 public:
     virtual ~DarwinHostServices() = default;
@@ -92,6 +102,15 @@ public:
         static_cast<void>(fd);
         static_cast<void>(bytes);
         return {0, kDarwinErrnoEbadf};
+    }
+
+    // Fill every byte of bytes from a cryptographically secure host source
+    // for getentropy(2), or fail with a Darwin errno. Hosts that do not
+    // override this have no entropy source and report ENOSYS, never
+    // predictable or fabricated bytes.
+    [[nodiscard]] virtual HostEntropyResult fill_entropy(std::span<std::byte> bytes) {
+        static_cast<void>(bytes);
+        return {kDarwinErrnoEnosys};
     }
 };
 

@@ -13,6 +13,21 @@
 #include <system_error>
 #include <vector>
 
+// getentropy(2) is served only from the host operating system's CSPRNG.
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <bcrypt.h>
+#else
+#include <sys/random.h>
+#include <unistd.h>
+#endif
+
 namespace {
 
 // XNU bsd/sys/errno.h values reported to the guest, never host errno values.
@@ -65,6 +80,34 @@ public:
             return {0, kGuestErrnoEio};
         }
         return {written, 0};
+    }
+
+    // getentropy(2) bytes come only from the host operating system's CSPRNG,
+    // drawn in bounded chunks. Any host failure reports EIO; the dispatcher
+    // then discards the staging buffer rather than copying partial output.
+    macosarm::HostEntropyResult fill_entropy(std::span<std::byte> bytes) override {
+        constexpr std::size_t kEntropyChunk = 256;
+        std::size_t offset = 0;
+        while (offset < bytes.size()) {
+            const std::size_t remaining = bytes.size() - offset;
+            const std::size_t count = remaining < kEntropyChunk ? remaining : kEntropyChunk;
+#if defined(_WIN32)
+            const NTSTATUS status = ::BCryptGenRandom(
+                nullptr,
+                reinterpret_cast<PUCHAR>(bytes.data() + offset),
+                static_cast<ULONG>(count),
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+            if (!BCRYPT_SUCCESS(status)) {
+                return {kGuestErrnoEio};
+            }
+#else
+            if (::getentropy(bytes.data() + offset, count) != 0) {
+                return {kGuestErrnoEio};
+            }
+#endif
+            offset += count;
+        }
+        return {0};
     }
 };
 

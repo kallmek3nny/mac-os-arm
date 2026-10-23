@@ -99,6 +99,43 @@ struct ReadHost final : macosarm::DarwinHostServices {
     }
 };
 
+// Scripted entropy source for getentropy(2). It fills a deterministic,
+// position-dependent pattern so tests can prove exactly which guest bytes
+// were written. Every host call is recorded so tests can prove no entropy is
+// drawn when the size or the guest destination is rejected first.
+struct EntropyHost final : macosarm::DarwinHostServices {
+    std::vector<std::size_t> requests;
+    std::uint32_t next_error{};
+
+    static std::byte pattern(std::size_t index) {
+        return static_cast<std::byte>((index * 7U + 3U) & 0xffU);
+    }
+
+    macosarm::HostWriteResult write(
+        std::int32_t fd,
+        std::span<const std::byte> bytes) override {
+        static_cast<void>(fd);
+        static_cast<void>(bytes);
+        return {0, macosarm::kDarwinErrnoEbadf};
+    }
+
+    macosarm::HostEntropyResult fill_entropy(std::span<std::byte> bytes) override {
+        requests.push_back(bytes.size());
+        if (next_error != 0) {
+            const std::uint32_t error = next_error;
+            next_error = 0;
+            // A failing source may leave partial output; the dispatcher must
+            // never copy it to the guest.
+            std::fill(bytes.begin(), bytes.end(), std::byte{0xee});
+            return {error};
+        }
+        for (std::size_t i = 0; i < bytes.size(); ++i) {
+            bytes[i] = pattern(i);
+        }
+        return {0};
+    }
+};
+
 macosarm::ExecutionResult svc(std::uint32_t immediate = macosarm::kDarwinSvcImmediate) {
     return {
         macosarm::StopReason::supervisor_call,
@@ -123,10 +160,176 @@ void load_readable(
     expect(static_cast<bool>(vm.load_bytes(base, bytes)), "test buffer loads");
 }
 
+// getentropy(2) fixtures: one writable guest page pre-filled with a sentinel
+// so tests can prove exactly which guest bytes a dispatch wrote.
+constexpr std::uint64_t kEntropyBase = 0x200000000ULL;
+constexpr std::uint64_t kEntropyPage = macosarm::GuestAddressSpace::kPageSize;
+constexpr std::byte kEntropySentinel{0xcc};
+
+void map_entropy_page(macosarm::GuestAddressSpace& vm) {
+    const std::vector<std::byte> sentinel(kEntropyPage, kEntropySentinel);
+    expect(static_cast<bool>(vm.map(kEntropyBase, kEntropyPage,
+                                    macosarm::Protection::read | macosarm::Protection::write)),
+           "entropy buffer maps writable");
+    expect(static_cast<bool>(vm.load_bytes(kEntropyBase, sentinel)), "entropy sentinel loads");
+}
+
+// True when every entropy-page byte from offset onward is still the sentinel.
+bool entropy_sentinel_from(macosarm::GuestAddressSpace& vm, std::size_t offset) {
+    std::vector<std::byte> bytes(kEntropyPage);
+    if (!vm.read(kEntropyBase, bytes)) {
+        return false;
+    }
+    return std::all_of(bytes.begin() + static_cast<std::ptrdiff_t>(offset), bytes.end(),
+                       [](std::byte value) { return value == kEntropySentinel; });
+}
+
+// True when the first count guest bytes hold EntropyHost's fill pattern.
+bool entropy_pattern_written(macosarm::GuestAddressSpace& vm, std::size_t count) {
+    std::vector<std::byte> bytes(count);
+    if (!vm.read(kEntropyBase, bytes)) {
+        return false;
+    }
+    for (std::size_t i = 0; i < count; ++i) {
+        if (bytes[i] != EntropyHost::pattern(i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+macosarm::SyscallDispatchResult run_getentropy(
+    macosarm::GuestAddressSpace& vm,
+    macosarm::DarwinHostServices& host,
+    macosarm::CpuState& state,
+    std::uint64_t address,
+    std::uint64_t size,
+    bool preset_carry) {
+    state = {};
+    state.x[0] = address;
+    state.x[1] = size;
+    state.x[16] = macosarm::kDarwinSysGetentropy;
+    state.pstate = preset_carry ? macosarm::kA64PstateCarry : 0U;
+    return macosarm::dispatch_darwin_syscall(state, vm, svc(), host);
+}
+
 } // namespace
 
 int main() {
     constexpr std::uint64_t buffer_base = 0x200000000ULL;
+
+    {
+        // getentropy(2) success fills exactly the requested guest bytes,
+        // returns 0 in x0 and clears a stale carry flag.
+        macosarm::GuestAddressSpace vm;
+        map_entropy_page(vm);
+        EntropyHost host;
+        macosarm::CpuState state{};
+        const auto result = run_getentropy(vm, host, state, kEntropyBase, 32, true);
+        expect(static_cast<bool>(result) && result.action == macosarm::SyscallAction::resume,
+               "getentropy dispatch resumes guest");
+        expect(result.syscall_number == macosarm::kDarwinSysGetentropy,
+               "getentropy syscall number reported");
+        expect(state.x[0] == 0 && !carry_is_set(state),
+               "getentropy success returns 0 and clears carry");
+        expect(host.requests == std::vector<std::size_t>{32},
+               "getentropy draws exactly the requested size");
+        expect(entropy_pattern_written(vm, 32), "getentropy copies host entropy to guest");
+        expect(entropy_sentinel_from(vm, 32), "getentropy writes no bytes past the request");
+    }
+
+    {
+        // The 256-byte kernel buffer bound is inclusive. Larger sizes fail
+        // with EINVAL before the destination is validated or entropy drawn,
+        // and 64-bit sizes are never truncated into an accepted length.
+        macosarm::GuestAddressSpace vm;
+        map_entropy_page(vm);
+        EntropyHost host;
+        macosarm::CpuState state{};
+        const auto full = run_getentropy(vm, host, state, kEntropyBase, 256, true);
+        expect(static_cast<bool>(full) && state.x[0] == 0 && !carry_is_set(state),
+               "getentropy accepts the 256-byte maximum");
+        expect(entropy_pattern_written(vm, 256) && entropy_sentinel_from(vm, 256),
+               "maximum getentropy fills exactly 256 bytes");
+
+        macosarm::GuestAddressSpace fresh;
+        map_entropy_page(fresh);
+        EntropyHost rejecting;
+        const std::array<std::uint64_t, 3> oversized{
+            257U, 0x100000000ULL + 16U, ~std::uint64_t{0}};
+        for (const std::uint64_t size : oversized) {
+            const auto rejected =
+                run_getentropy(fresh, rejecting, state, kEntropyBase, size, false);
+            expect(static_cast<bool>(rejected) &&
+                       state.x[0] == macosarm::kDarwinErrnoEinval && carry_is_set(state),
+                   "oversized getentropy returns EINVAL and sets carry");
+        }
+        const auto null_oversized = run_getentropy(fresh, rejecting, state, 0, 257, false);
+        expect(static_cast<bool>(null_oversized) && state.x[0] == macosarm::kDarwinErrnoEinval,
+               "getentropy size check precedes buffer validation");
+        expect(rejecting.requests.empty() && entropy_sentinel_from(fresh, 0),
+               "rejected getentropy draws no entropy and writes no guest bytes");
+    }
+
+    {
+        // Zero bytes succeed even for a null buffer, without host entropy.
+        // Unmapped, page-crossing and read-only destinations fault before
+        // any host entropy is drawn, leaving guest memory untouched.
+        macosarm::GuestAddressSpace vm;
+        map_entropy_page(vm);
+        constexpr std::uint64_t readonly_base = 0x300000000ULL;
+        const std::vector<std::byte> readonly_bytes(64, std::byte{0x11});
+        load_readable(vm, readonly_base, readonly_bytes);
+        EntropyHost host;
+        macosarm::CpuState state{};
+
+        const auto empty = run_getentropy(vm, host, state, 0, 0, true);
+        expect(static_cast<bool>(empty) && state.x[0] == 0 && !carry_is_set(state),
+               "zero-length getentropy succeeds for a null buffer");
+
+        const auto check_fault = [&](std::uint64_t address, std::uint64_t size,
+                                     const std::string& label) {
+            const auto faulted = run_getentropy(vm, host, state, address, size, false);
+            expect(static_cast<bool>(faulted) &&
+                       state.x[0] == macosarm::kDarwinErrnoEfault && carry_is_set(state),
+                   label + " returns EFAULT and sets carry");
+        };
+        check_fault(0, 16, "null getentropy buffer");
+        check_fault(0xdead00000000ULL, 16, "unmapped getentropy buffer");
+        check_fault(kEntropyBase + kEntropyPage - 8U, 16, "page-crossing getentropy buffer");
+        check_fault(readonly_base, 16, "read-only getentropy buffer");
+
+        expect(host.requests.empty() && entropy_sentinel_from(vm, 0),
+               "faulting getentropy draws no entropy and writes no guest bytes");
+        std::vector<std::byte> readonly_after(readonly_bytes.size());
+        expect(static_cast<bool>(vm.read(readonly_base, readonly_after)) &&
+                   readonly_after == readonly_bytes,
+               "read-only getentropy destination stays unchanged");
+    }
+
+    {
+        // A failing host source reports its errno and none of its partial
+        // output reaches the guest; hosts without a source report ENOSYS.
+        macosarm::GuestAddressSpace vm;
+        map_entropy_page(vm);
+        EntropyHost host;
+        host.next_error = macosarm::kDarwinErrnoEio;
+        macosarm::CpuState state{};
+        const auto failed = run_getentropy(vm, host, state, kEntropyBase, 64, false);
+        expect(static_cast<bool>(failed) && state.x[0] == macosarm::kDarwinErrnoEio &&
+                   carry_is_set(state),
+               "host entropy failure returns its errno and sets carry");
+        expect(host.requests == std::vector<std::size_t>{64} && entropy_sentinel_from(vm, 0),
+               "failed host entropy is never copied to the guest");
+
+        CaptureHost no_source;
+        const auto unsupported = run_getentropy(vm, no_source, state, kEntropyBase, 16, false);
+        expect(static_cast<bool>(unsupported) && state.x[0] == macosarm::kDarwinErrnoEnosys &&
+                   carry_is_set(state),
+               "host without an entropy source returns ENOSYS");
+        expect(entropy_sentinel_from(vm, 0) && no_source.fds.empty(),
+               "unsupported getentropy writes no guest bytes");
+    }
 
     {
         macosarm::GuestAddressSpace vm;
