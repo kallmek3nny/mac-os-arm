@@ -383,6 +383,21 @@ if(BUILD_TESTING)
                 -DEXPECTED_EXIT=25
                 "-DEXPECTED_STDOUT="
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
+
+        # writev(1, iov, 3) gathers {"hel", 3}, {"hello", 0} and {"lo", 2} into
+        # the host stdout, so the guest writes "hello", skips the empty middle
+        # vector and exits with the 5-byte total. A failed writev exits 100, so
+        # an errno cannot pass for a byte count.
+        add_test(
+            NAME macho-run-writev-stdout
+            COMMAND "${CMAKE_COMMAND}"
+                "-DFIXTURE_TOOL=$<TARGET_FILE:macho_run_fixture>"
+                "-DRUNNER=$<TARGET_FILE:macho-run>"
+                -DKIND=writev-stdout
+                "-DIMAGE=${CMAKE_CURRENT_BINARY_DIR}/macho-run-writev-stdout.bin"
+                -DEXPECTED_EXIT=5
+                "-DEXPECTED_STDOUT=hello"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
     endif()
 endif()
 

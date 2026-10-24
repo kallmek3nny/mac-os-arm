@@ -203,9 +203,40 @@ constexpr std::array<std::uint32_t, 13> kIoctlStdinCode{
     0xd4001001U, // svc #0x80
 };
 
+// writev(1, iov, 3); exit(bytes written). The three 16-byte arm64 struct
+// iovec records { iov_base; iov_len; } are built in the zero-filled tail of
+// __DATA as {"hel", 3}, {"hello", 0} and {"lo", 2}, so a correct gather writes
+// "hello" to stdout, skips the empty middle vector and exits with the 5-byte
+// total. A failed writev (carry set) exits 100 instead, so an errno cannot
+// pass for a byte count.
+constexpr std::array<std::uint32_t, 21> kWritevStdoutCode{
+    0xd2880009U, // mov x9, #0x4000
+    0xf2c00029U, // movk x9, #1, lsl #32 -> "hello" at 0x100004000
+    0xd288200aU, // mov x10, #0x4100
+    0xf2c0002aU, // movk x10, #1, lsl #32 -> iovec array at 0x100004100
+    0xd280006bU, // mov x11, #3
+    0xa9002d49U, // stp x9, x11, [x10] -> iov[0] = {"hel", 3}
+    0xa9017d49U, // stp x9, xzr, [x10, #16] -> iov[1] = {"hello", 0}
+    0x91000d2cU, // add x12, x9, #3 -> "lo"
+    0xd280004dU, // mov x13, #2
+    0xa902354cU, // stp x12, x13, [x10, #32] -> iov[2] = {"lo", 2}
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xaa0a03e1U, // mov x1, x10 -> iovec array
+    0xd2800062U, // mov x2, #3 (iovcnt)
+    0xd2800f30U, // mov x16, #121 (writev)
+    0xd4001001U, // svc #0x80
+    0x54000062U, // b.cs writev_failed (+12)
+    0xd2800030U, // mov x16, #1 (exit) with the byte count still in x0
+    0xd4001001U, // svc #0x80
+    0xd2800c80U, // writev_failed: mov x0, #100
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+};
+
 int usage() {
     std::cerr << "usage: macho_run_fixture "
-                 "<hello|argc|echo|close-stdout|fstat-stdin|ioctl-stdin> <output-path>\n";
+                 "<hello|argc|echo|close-stdout|fstat-stdin|ioctl-stdin|writev-stdout> "
+                 "<output-path>\n";
     return 2;
 }
 
@@ -229,6 +260,8 @@ int main(int argc, char** argv) {
         bytes = image(kFstatStdinCode);
     } else if (kind == "ioctl-stdin") {
         bytes = image(kIoctlStdinCode);
+    } else if (kind == "writev-stdout") {
+        bytes = image(kWritevStdoutCode);
     } else {
         return usage();
     }
