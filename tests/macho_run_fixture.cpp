@@ -233,9 +233,50 @@ constexpr std::array<std::uint32_t, 21> kWritevStdoutCode{
     0xd4001001U, // svc #0x80
 };
 
+// readv(0, iov, 3); write(1, buffer, n); exit(n). The three 16-byte arm64
+// struct iovec records are built in the zero-filled tail of __DATA as
+// {buffer + 2, 2}, {buffer + 8, 0} and {buffer, 3}, with the buffer past the
+// iovec array. Scattering the 4-byte stdin "ping" stores "pi" at buffer + 2,
+// skips the empty middle vector without touching its base and stores "ng"
+// at buffer, so writing back the n bytes at buffer shows "ngpi" and the exit
+// status is the 4-byte total, short of the 5 bytes requested. A failed readv
+// (carry set) exits 100 instead, so an errno cannot pass for a byte count.
+constexpr std::array<std::uint32_t, 29> kReadvStdinCode{
+    0xd2884009U, // mov x9, #0x4200
+    0xf2c00029U, // movk x9, #1, lsl #32 -> buffer at 0x100004200
+    0xd288200aU, // mov x10, #0x4100
+    0xf2c0002aU, // movk x10, #1, lsl #32 -> iovec array at 0x100004100
+    0x9100092bU, // add x11, x9, #2 -> buffer + 2
+    0xd280004cU, // mov x12, #2
+    0xa900314bU, // stp x11, x12, [x10] -> iov[0] = {buffer + 2, 2}
+    0x9100212dU, // add x13, x9, #8 -> buffer + 8
+    0xa9017d4dU, // stp x13, xzr, [x10, #16] -> iov[1] = {buffer + 8, 0}
+    0xd280006eU, // mov x14, #3
+    0xa9023949U, // stp x9, x14, [x10, #32] -> iov[2] = {buffer, 3}
+    0xd2800000U, // mov x0, #0 (stdin)
+    0xaa0a03e1U, // mov x1, x10 -> iovec array
+    0xd2800062U, // mov x2, #3 (iovcnt)
+    0xd2800f10U, // mov x16, #120 (readv)
+    0xd4001001U, // svc #0x80
+    0x54000142U, // b.cs readv_failed (+40)
+    0xaa0003e2U, // mov x2, x0 -> bytes read
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd2884001U, // mov x1, #0x4200
+    0xf2c00021U, // movk x1, #1, lsl #32 -> buffer
+    0xd2800090U, // mov x16, #4 (write)
+    0xd4001001U, // svc #0x80
+    0xaa0203e0U, // mov x0, x2
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800c80U, // readv_failed: mov x0, #100
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+};
+
 int usage() {
     std::cerr << "usage: macho_run_fixture "
-                 "<hello|argc|echo|close-stdout|fstat-stdin|ioctl-stdin|writev-stdout> "
+                 "<hello|argc|echo|close-stdout|fstat-stdin|ioctl-stdin|writev-stdout|"
+                 "readv-stdin> "
                  "<output-path>\n";
     return 2;
 }
@@ -262,6 +303,8 @@ int main(int argc, char** argv) {
         bytes = image(kIoctlStdinCode);
     } else if (kind == "writev-stdout") {
         bytes = image(kWritevStdoutCode);
+    } else if (kind == "readv-stdin") {
+        bytes = image(kReadvStdinCode);
     } else {
         return usage();
     }

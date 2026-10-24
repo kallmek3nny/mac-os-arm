@@ -398,6 +398,23 @@ if(BUILD_TESTING)
                 -DEXPECTED_EXIT=5
                 "-DEXPECTED_STDOUT=hello"
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
+
+        # readv(0, iov, 3) scatters the 4-byte stdin "ping" as "pi" into
+        # buffer + 2, skips the empty middle vector without touching its base
+        # and stores "ng" at buffer, so the guest writes back "ngpi" and exits
+        # with the 4-byte total, short of the 5 bytes requested. A failed readv
+        # exits 100, so an errno cannot pass for a byte count.
+        add_test(
+            NAME macho-run-readv-stdin
+            COMMAND "${CMAKE_COMMAND}"
+                "-DFIXTURE_TOOL=$<TARGET_FILE:macho_run_fixture>"
+                "-DRUNNER=$<TARGET_FILE:macho-run>"
+                -DKIND=readv-stdin
+                "-DIMAGE=${CMAKE_CURRENT_BINARY_DIR}/macho-run-readv-stdin.bin"
+                -DSTDIN_TEXT=ping
+                -DEXPECTED_EXIT=4
+                "-DEXPECTED_STDOUT=ngpi"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
     endif()
 endif()
 
