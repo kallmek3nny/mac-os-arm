@@ -449,6 +449,24 @@ if(BUILD_TESTING)
                 -DEXPECTED_EXIT=3
                 "-DEXPECTED_STDOUT=tiopositioned"
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
+
+        # fcntl(2) end to end: the guest's stdin starts without FD_CLOEXEC, so
+        # F_GETFD reports 0, F_SETFD sets it and the next F_GETFD reports 1.
+        # macho_run_check.cmake captures guest stdout through a pipe opened
+        # without O_APPEND, so F_GETFL on stdout reports O_WRONLY (1). The guest
+        # exits with before << 6 | after << 4 | getfl == 17 and writes nothing.
+        # Each failed fcntl exits with its own status from 100 to 103, so no
+        # errno can pass for a flag word.
+        add_test(
+            NAME macho-run-fcntl-stdio
+            COMMAND "${CMAKE_COMMAND}"
+                "-DFIXTURE_TOOL=$<TARGET_FILE:macho_run_fixture>"
+                "-DRUNNER=$<TARGET_FILE:macho-run>"
+                -DKIND=fcntl-stdio
+                "-DIMAGE=${CMAKE_CURRENT_BINARY_DIR}/macho-run-fcntl-stdio.bin"
+                -DEXPECTED_EXIT=17
+                "-DEXPECTED_STDOUT="
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
     endif()
 endif()
 

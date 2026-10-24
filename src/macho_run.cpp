@@ -330,6 +330,9 @@ std::int64_t write_host_stream_at(
 class ConsoleHost final : public macosarm::DarwinHostServices {
     // Bit n is set while guest descriptor n (stdin, stdout, stderr) is open.
     unsigned open_descriptors_ = 0b111U;
+    // Bit n is set while guest descriptor n has its close-on-exec flag set. A
+    // process inherits its standard descriptors without FD_CLOEXEC.
+    unsigned close_on_exec_descriptors_ = 0U;
 
     [[nodiscard]] bool is_open(std::int32_t fd) const noexcept {
         return fd >= 0 && fd <= 2 &&
@@ -340,11 +343,15 @@ public:
     // close(2) releases only the guest's view of a standard descriptor; the
     // host's own streams stay open for macho-run diagnostics. A released or
     // unknown descriptor reports EBADF, so a second close never succeeds.
+    // Releasing a descriptor also drops its close-on-exec flag, as XNU clears
+    // a released slot's descriptor flags, so no stale flag outlives it.
     macosarm::HostCloseResult close(std::int32_t fd) override {
         if (!is_open(fd)) {
             return {kGuestErrnoEbadf};
         }
-        open_descriptors_ &= ~(1U << static_cast<unsigned>(fd));
+        const unsigned bit = 1U << static_cast<unsigned>(fd);
+        open_descriptors_ &= ~bit;
+        close_on_exec_descriptors_ &= ~bit;
         return {0};
     }
 
@@ -498,6 +505,53 @@ public:
             return {0, kGuestErrnoEio};
         }
         return {static_cast<std::uint64_t>(written), 0};
+    }
+
+    // fcntl(2) F_GETFD, F_SETFD and F_GETFL describe only a standard
+    // descriptor the guest still has open. The close-on-exec flag is the
+    // guest's own, changed only through F_SETFD. The access mode follows the
+    // direction the guest can use the stream, as for pread(2) and pwrite(2):
+    // stdin is open just for reading and stdout and stderr just for writing.
+    // macho-run never puts a stream in nonblocking, asynchronous or
+    // synchronous mode, so of the host's status flags only O_APPEND can reach
+    // the guest, on a POSIX host whose descriptor really appends every write.
+    // A host that cannot report its flags reports EIO rather than guessed ones.
+    macosarm::HostDescriptorFlagsResult descriptor_flags(std::int32_t fd) override {
+        if (!is_open(fd)) {
+            return {false, 0, kGuestErrnoEbadf};
+        }
+        std::uint32_t status_flags =
+            fd == 0 ? macosarm::kDarwinOpenReadOnly : macosarm::kDarwinOpenWriteOnly;
+#if !defined(_WIN32)
+        const int host_flags = ::fcntl(fd, F_GETFL);
+        if (host_flags < 0) {
+            return {false, 0, kGuestErrnoEio};
+        }
+        if ((host_flags & O_APPEND) != 0) {
+            status_flags |= macosarm::kDarwinOpenAppend;
+        }
+#endif
+        const bool close_on_exec =
+            (close_on_exec_descriptors_ & (1U << static_cast<unsigned>(fd))) != 0U;
+        return {close_on_exec, status_flags, 0};
+    }
+
+    // Set or clear the guest's own close-on-exec flag for fcntl(2) F_SETFD.
+    // The host descriptor's flags never change, so macho-run's own streams
+    // stay as they were for its diagnostics.
+    macosarm::HostSetCloseOnExecResult set_close_on_exec(
+        std::int32_t fd,
+        bool close_on_exec) override {
+        if (!is_open(fd)) {
+            return {kGuestErrnoEbadf};
+        }
+        const unsigned bit = 1U << static_cast<unsigned>(fd);
+        if (close_on_exec) {
+            close_on_exec_descriptors_ |= bit;
+        } else {
+            close_on_exec_descriptors_ &= ~bit;
+        }
+        return {0};
     }
 
     // Like a canonical-mode terminal read, return after a newline, a full

@@ -362,10 +362,60 @@ constexpr std::array<std::uint32_t, 37> kPreadStdinCode{
     0xd4001001U, // svc #0x80
 };
 
+// fcntl(0, F_GETFD); fcntl(0, F_SETFD, FD_CLOEXEC); fcntl(0, F_GETFD);
+// fcntl(1, F_GETFL); exit(before << 6 | after << 4 | getfl). The standard
+// streams start without FD_CLOEXEC, so F_GETFD reports 0 before the F_SETFD
+// and 1 after it. macho_run_check.cmake captures guest stdout through a pipe
+// opened without O_APPEND, so F_GETFL reports O_WRONLY (1) and a correct host
+// exits 17. Each failed fcntl (carry set) exits with its own status from 100
+// to 103, so no errno can pass for a flag word. The two F_GETFD results are
+// kept in x19 and x20 across the later calls.
+constexpr std::array<std::uint32_t, 39> kFcntlStdioCode{
+    0xd2800000U, // mov x0, #0 (stdin)
+    0xd2800021U, // mov x1, #1 (F_GETFD)
+    0xd2800b90U, // mov x16, #92 (fcntl)
+    0xd4001001U, // svc #0x80
+    0x540002e2U, // b.cs first_getfd_failed (+92)
+    0xaa0003f3U, // mov x19, x0 -> descriptor flags before F_SETFD
+    0xd2800000U, // mov x0, #0 (stdin)
+    0xd2800041U, // mov x1, #2 (F_SETFD)
+    0xd2800022U, // mov x2, #1 (FD_CLOEXEC)
+    0xd2800b90U, // mov x16, #92 (fcntl)
+    0xd4001001U, // svc #0x80
+    0x54000262U, // b.cs setfd_failed (+76)
+    0xd2800000U, // mov x0, #0 (stdin)
+    0xd2800021U, // mov x1, #1 (F_GETFD)
+    0xd2800b90U, // mov x16, #92 (fcntl)
+    0xd4001001U, // svc #0x80
+    0x54000222U, // b.cs second_getfd_failed (+68)
+    0xaa0003f4U, // mov x20, x0 -> descriptor flags after F_SETFD
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd2800061U, // mov x1, #3 (F_GETFL)
+    0xd2800b90U, // mov x16, #92 (fcntl)
+    0xd4001001U, // svc #0x80
+    0x540001c2U, // b.cs getfl_failed (+56)
+    0xaa141000U, // orr x0, x0, x20, lsl #4 -> after << 4 | getfl
+    0xaa131800U, // orr x0, x0, x19, lsl #6 -> before << 6
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800c80U, // first_getfd_failed: mov x0, #100
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800ca0U, // setfd_failed: mov x0, #101
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800cc0U, // second_getfd_failed: mov x0, #102
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800ce0U, // getfl_failed: mov x0, #103
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+};
+
 int usage() {
     std::cerr << "usage: macho_run_fixture "
                  "<hello|argc|echo|close-stdout|fstat-stdin|ioctl-stdin|writev-stdout|"
-                 "readv-stdin|lseek-stdin|pread-stdin> "
+                 "readv-stdin|lseek-stdin|pread-stdin|fcntl-stdio> "
                  "<output-path>\n";
     return 2;
 }
@@ -398,6 +448,8 @@ int main(int argc, char** argv) {
         bytes = image(kLseekStdinCode);
     } else if (kind == "pread-stdin") {
         bytes = image(kPreadStdinCode);
+    } else if (kind == "fcntl-stdio") {
+        bytes = image(kFcntlStdioCode);
     } else {
         return usage();
     }
