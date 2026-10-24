@@ -1801,6 +1801,32 @@ SyscallDispatchResult dispatch_darwin_syscall(
         }
         return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
     }
+    case kDarwinSysDup: {
+        // XNU syscalls.master #41: int dup(u_int fd). sys_dup looks fd up with
+        // fp_lookup, which rejects a descriptor outside the file table with
+        // EBADF, then fdalloc takes the lowest free descriptor at or above 0
+        // (EMFILE when the table is full) and finishdup points it at fd's
+        // open file description with close-on-exec clear. A u_int that is
+        // negative as an int can never name a guest descriptor, so it never
+        // reaches the host. A host success that is negative or fd itself is a
+        // host contract violation and never reaches the guest.
+        const auto fd = static_cast<std::int32_t>(static_cast<std::uint32_t>(state.x[0]));
+        if (fd < 0) {
+            set_error(state, kDarwinErrnoEbadf);
+            return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+        }
+        const HostDuplicateResult duplicated = host.duplicate(fd);
+        if (!duplicated) {
+            set_error(state, duplicated.error);
+            return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+        }
+        if (duplicated.descriptor < 0 || duplicated.descriptor == fd) {
+            return {SyscallDispatchError::host_contract_violation,
+                    SyscallAction::resume, syscall_number, 0};
+        }
+        set_success(state, static_cast<std::uint64_t>(duplicated.descriptor));
+        return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    }
     case kDarwinSysGetpid:
         // XNU bsd/kern/syscalls.master: BSD #20, int getpid(void).
         // Process identity belongs to the shared context, never to the host.

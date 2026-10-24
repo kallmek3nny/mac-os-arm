@@ -178,6 +178,19 @@ constexpr std::uint64_t kDarwinSysSetrlimit = 195;
 // that cannot report the limit fails closed with its error, never a
 // fabricated table size.
 constexpr std::uint64_t kDarwinSysGetdtablesize = 89;
+// XNU syscalls.master #41: int dup(u_int fd). sys_dup in
+// bsd/kern/kern_descrip.c resolves the descriptor through fp_lookup, which
+// takes the u_int as an int, so only w0 counts and a value with bit 31 set
+// is a negative descriptor and EBADF. fdalloc then takes the lowest free
+// slot at or above 0 that lies below the soft RLIMIT_NOFILE limit, or fails
+// with EMFILE, and finishdup points that slot at the same open file
+// description with the new descriptor's own close-on-exec flag clear, as
+// it passes no FP_CLOEXEC. The host owns the descriptor table and performs
+// both steps; the dispatcher returns the new descriptor in x0. A host
+// result that is negative, or that names fd itself, which is still open and
+// so never the lowest free slot, is a host contract violation rather than a
+// descriptor the guest could be handed.
+constexpr std::uint64_t kDarwinSysDup = 41;
 // XNU syscalls.master #92: int fcntl(int fd, int cmd, long arg), and #406
 // fcntl_nocancel with the same argument and error contract; only the
 // pthread cancellation point differs. fd and cmd are ints, so only w0 and
@@ -230,6 +243,7 @@ constexpr std::uint32_t kDarwinErrnoEbadf = 9;
 constexpr std::uint32_t kDarwinErrnoEnomem = 12;
 constexpr std::uint32_t kDarwinErrnoEacces = 13;
 constexpr std::uint32_t kDarwinErrnoEinval = 22;
+constexpr std::uint32_t kDarwinErrnoEmfile = 24;
 constexpr std::uint32_t kDarwinErrnoEfbig = 27;
 constexpr std::uint32_t kDarwinErrnoEspipe = 29;
 constexpr std::uint32_t kDarwinErrnoEoverflow = 84;
@@ -330,6 +344,23 @@ struct HostSetResourceLimitResult {
 // count; as in XNU, an error other than EBADF may still have released fd,
 // so the dispatcher reports it once and never retries the close.
 struct HostCloseResult {
+    std::uint32_t error{};
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return error == 0;
+    }
+};
+
+// Outcome of duplicating guest descriptor fd for dup(2), as fdalloc and
+// finishdup do together: the lowest free descriptor at or above 0 and below
+// the soft RLIMIT_NOFILE limit now names the same open file description as
+// fd, with its own close-on-exec flag clear. EBADF reports an fd the guest
+// does not have open and EMFILE a full descriptor table; on error no
+// descriptor was allocated. A successful result is never negative and never
+// fd itself; the dispatcher treats anything else as a host contract
+// violation rather than handing it to the guest.
+struct HostDuplicateResult {
+    std::int32_t descriptor{};
     std::uint32_t error{};
 
     [[nodiscard]] explicit operator bool() const noexcept {
@@ -581,6 +612,19 @@ public:
     [[nodiscard]] virtual HostCloseResult close(std::int32_t fd) {
         static_cast<void>(fd);
         return {kDarwinErrnoEbadf};
+    }
+
+    // Duplicate guest descriptor fd for dup(2), as fdalloc and finishdup do
+    // together: allocate the lowest free descriptor at or above 0 and below
+    // the soft RLIMIT_NOFILE limit, point it at fd's open file description
+    // and leave its own close-on-exec flag clear. The dispatcher calls this
+    // only for an fd that is not negative. Report EBADF for an fd the guest
+    // does not have open and EMFILE for a full descriptor table; on error no
+    // descriptor is allocated. Hosts that do not override this expose no
+    // descriptors and report EBADF, never a fabricated descriptor.
+    [[nodiscard]] virtual HostDuplicateResult duplicate(std::int32_t fd) {
+        static_cast<void>(fd);
+        return {0, kDarwinErrnoEbadf};
     }
 
     // Describe terminal descriptor fd for ioctl(2) TIOCGETA and TIOCGWINSZ.

@@ -3300,6 +3300,152 @@ int main() {
     }
 
     {
+        // dup(2): XNU syscalls.master #41. fd is a u_int, so only w0 counts;
+        // a value negative as an int is EBADF before the host sees it. The
+        // host's descriptor reaches the guest as is, including one below fd,
+        // but a negative descriptor or fd itself is a host contract violation.
+        struct DupHost final : macosarm::DarwinHostServices {
+            std::vector<std::int32_t> open_fds{0, 1, 2};
+            std::vector<std::int32_t> requests;
+            std::int32_t table_size{256};
+            bool forced{false};
+            std::int32_t forced_descriptor{};
+
+            macosarm::HostWriteResult write(std::int32_t,
+                                            std::span<const std::byte>) override {
+                return {0, macosarm::kDarwinErrnoEbadf};
+            }
+            macosarm::HostDuplicateResult duplicate(std::int32_t fd) override {
+                requests.push_back(fd);
+                if (std::find(open_fds.begin(), open_fds.end(), fd) == open_fds.end()) {
+                    return {0, macosarm::kDarwinErrnoEbadf};
+                }
+                if (forced) {
+                    return {forced_descriptor, 0};
+                }
+                for (std::int32_t candidate = 0; candidate < table_size; ++candidate) {
+                    if (std::find(open_fds.begin(), open_fds.end(), candidate) ==
+                        open_fds.end()) {
+                        open_fds.push_back(candidate);
+                        return {candidate, 0};
+                    }
+                }
+                return {0, macosarm::kDarwinErrnoEmfile};
+            }
+        };
+        const auto run_dup = [](macosarm::DarwinHostServices& host,
+                                macosarm::CpuState& state,
+                                std::uint64_t x0,
+                                bool preset_carry) {
+            // An empty address space proves no guest memory is touched.
+            macosarm::GuestAddressSpace vm;
+            state = {};
+            state.x[0] = x0;
+            state.x[1] = 0x0123456789abcdefULL;
+            state.x[16] = macosarm::kDarwinSysDup;
+            if (preset_carry) {
+                state.pstate = macosarm::kA64PstateCarry;
+            }
+            return macosarm::dispatch_darwin_syscall(state, vm, svc(), host);
+        };
+
+        {
+            DupHost host;
+            macosarm::CpuState state{};
+            const auto result = run_dup(host, state, 1U, true);
+            expect(static_cast<bool>(result) &&
+                       result.action == macosarm::SyscallAction::resume &&
+                       result.syscall_number == macosarm::kDarwinSysDup &&
+                       state.x[0] == 3U && !carry_is_set(state) &&
+                       host.requests == std::vector<std::int32_t>{1},
+                   "dup returns the host's new descriptor and clears carry");
+        }
+
+        {
+            DupHost host;
+            macosarm::CpuState state{};
+            const auto result = run_dup(host, state, 0xffffffff00000002ULL, true);
+            expect(static_cast<bool>(result) && state.x[0] == 3U && !carry_is_set(state) &&
+                       host.requests == std::vector<std::int32_t>{2},
+                   "dup reads only w0 for its u_int descriptor");
+        }
+
+        {
+            DupHost host;
+            host.open_fds = {0, 2, 3};
+            macosarm::CpuState state{};
+            const auto result = run_dup(host, state, 3U, true);
+            expect(static_cast<bool>(result) && state.x[0] == 1U && !carry_is_set(state),
+                   "dup passes through a lowest free descriptor below fd");
+        }
+
+        {
+            const std::uint64_t negatives[] = {0x80000000ULL, 0xfffffffeULL, 0xffffffffULL};
+            bool all_rejected = true;
+            for (const std::uint64_t x0 : negatives) {
+                DupHost host;
+                macosarm::CpuState state{};
+                const auto result = run_dup(host, state, x0, false);
+                all_rejected = all_rejected && static_cast<bool>(result) &&
+                               state.x[0] == macosarm::kDarwinErrnoEbadf &&
+                               carry_is_set(state) && host.requests.empty();
+            }
+            expect(all_rejected, "dup rejects a negative descriptor with EBADF before the host");
+        }
+
+        {
+            DupHost host;
+            macosarm::CpuState state{};
+            const auto result = run_dup(host, state, 7U, false);
+            expect(static_cast<bool>(result) &&
+                       state.x[0] == macosarm::kDarwinErrnoEbadf && carry_is_set(state) &&
+                       host.requests == std::vector<std::int32_t>{7} &&
+                       host.open_fds.size() == 3U,
+                   "dup reports the host's EBADF for a descriptor that is not open");
+        }
+
+        {
+            DupHost host;
+            host.table_size = 3;
+            macosarm::CpuState state{};
+            const auto result = run_dup(host, state, 0U, false);
+            expect(static_cast<bool>(result) &&
+                       state.x[0] == macosarm::kDarwinErrnoEmfile && carry_is_set(state) &&
+                       host.open_fds.size() == 3U,
+                   "dup reports EMFILE for a full descriptor table");
+        }
+
+        {
+            DupHost negative;
+            negative.forced = true;
+            negative.forced_descriptor = -1;
+            macosarm::CpuState state{};
+            const auto negative_result = run_dup(negative, state, 1U, false);
+            DupHost same;
+            same.forced = true;
+            same.forced_descriptor = 2;
+            const auto same_result = run_dup(same, state, 2U, false);
+            expect(!static_cast<bool>(negative_result) && !static_cast<bool>(same_result),
+                   "dup rejects a negative descriptor or fd itself from the host");
+        }
+
+        {
+            struct NoDupHost final : macosarm::DarwinHostServices {
+                macosarm::HostWriteResult write(std::int32_t,
+                                                std::span<const std::byte>) override {
+                    return {0, macosarm::kDarwinErrnoEbadf};
+                }
+            };
+            NoDupHost host;
+            macosarm::CpuState state{};
+            const auto result = run_dup(host, state, 1U, false);
+            expect(static_cast<bool>(result) &&
+                       state.x[0] == macosarm::kDarwinErrnoEbadf && carry_is_set(state),
+                   "default hosts report EBADF for dup");
+        }
+    }
+
+    {
         // close(2) / close_nocancel(2): XNU syscalls.master #6 and #399.
         {
             CloseHost host;
