@@ -467,6 +467,25 @@ if(BUILD_TESTING)
                 -DEXPECTED_EXIT=17
                 "-DEXPECTED_STDOUT="
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
+
+        # fcntl(2) F_SETFL end to end: handing stdout's F_GETFL flags back to
+        # F_SETFL changes nothing and succeeds with 0, while asking for
+        # O_NONBLOCK fails with ENOTSUP (45) because macho-run's standard
+        # streams only do blocking I/O. A second F_GETFL proves the flags are
+        # still O_WRONLY (1), as the pipe macho_run_check.cmake opens is not
+        # O_APPEND. The guest exits with getfl << 6 | errno == 109 and writes
+        # nothing; every other outcome exits with its own status from 100 to
+        # 104.
+        add_test(
+            NAME macho-run-fcntl-setfl-stdio
+            COMMAND "${CMAKE_COMMAND}"
+                "-DFIXTURE_TOOL=$<TARGET_FILE:macho_run_fixture>"
+                "-DRUNNER=$<TARGET_FILE:macho-run>"
+                -DKIND=fcntl-setfl-stdio
+                "-DIMAGE=${CMAKE_CURRENT_BINARY_DIR}/macho-run-fcntl-setfl-stdio.bin"
+                -DEXPECTED_EXIT=109
+                "-DEXPECTED_STDOUT="
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
     endif()
 endif()
 

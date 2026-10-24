@@ -412,10 +412,70 @@ constexpr std::array<std::uint32_t, 39> kFcntlStdioCode{
     0xd4001001U, // svc #0x80
 };
 
+// fcntl(1, F_GETFL); fcntl(1, F_SETFL, flags); fcntl(1, F_SETFL, flags |
+// O_NONBLOCK); fcntl(1, F_GETFL); exit(getfl << 6 | errno). Handing F_SETFL
+// back the flags F_GETFL reported changes nothing, so it succeeds with 0.
+// macho-run's standard streams only do blocking I/O, so the O_NONBLOCK
+// request fails, and the second F_GETFL proves it left the flags unchanged.
+// macho_run_check.cmake captures guest stdout through a pipe opened without
+// O_APPEND, so F_GETFL reports O_WRONLY (1), the O_NONBLOCK request fails
+// with ENOTSUP (45) and a correct host exits 109. Every other outcome has its
+// own status from 100 to 104: a failed first F_GETFL, a failed or nonzero
+// unchanged F_SETFL, an O_NONBLOCK request that succeeds, a failed second
+// F_GETFL and flags that changed. The first F_GETFL result and the errno
+// are kept in x19 and x20 across the later calls.
+constexpr std::array<std::uint32_t, 45> kFcntlSetflStdioCode{
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd2800061U, // mov x1, #3 (F_GETFL)
+    0xd2800b90U, // mov x16, #92 (fcntl)
+    0xd4001001U, // svc #0x80
+    0x54000342U, // b.cs first_getfl_failed (+104)
+    0xaa0003f3U, // mov x19, x0 -> status flags before F_SETFL
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd2800081U, // mov x1, #4 (F_SETFL)
+    0xaa1303e2U, // mov x2, x19 (the flags F_GETFL reported)
+    0xd2800b90U, // mov x16, #92 (fcntl)
+    0xd4001001U, // svc #0x80
+    0x540002c2U, // b.cs same_setfl_failed (+88)
+    0xb50002a0U, // cbnz x0, same_setfl_failed (+84)
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd2800081U, // mov x1, #4 (F_SETFL)
+    0xb27e0262U, // orr x2, x19, #0x4 (O_NONBLOCK)
+    0xd2800b90U, // mov x16, #92 (fcntl)
+    0xd4001001U, // svc #0x80
+    0x54000243U, // b.cc nonblock_setfl_succeeded (+72)
+    0xaa0003f4U, // mov x20, x0 -> errno of the O_NONBLOCK request
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd2800061U, // mov x1, #3 (F_GETFL)
+    0xd2800b90U, // mov x16, #92 (fcntl)
+    0xd4001001U, // svc #0x80
+    0x540001e2U, // b.cs second_getfl_failed (+60)
+    0xeb13001fU, // cmp x0, x19
+    0x54000201U, // b.ne flags_changed (+64)
+    0xaa131a80U, // orr x0, x20, x19, lsl #6 -> getfl << 6 | errno
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800c80U, // first_getfl_failed: mov x0, #100
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800ca0U, // same_setfl_failed: mov x0, #101
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800cc0U, // nonblock_setfl_succeeded: mov x0, #102
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800ce0U, // second_getfl_failed: mov x0, #103
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800d00U, // flags_changed: mov x0, #104
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+};
+
 int usage() {
     std::cerr << "usage: macho_run_fixture "
                  "<hello|argc|echo|close-stdout|fstat-stdin|ioctl-stdin|writev-stdout|"
-                 "readv-stdin|lseek-stdin|pread-stdin|fcntl-stdio> "
+                 "readv-stdin|lseek-stdin|pread-stdin|fcntl-stdio|fcntl-setfl-stdio> "
                  "<output-path>\n";
     return 2;
 }
@@ -450,6 +510,8 @@ int main(int argc, char** argv) {
         bytes = image(kPreadStdinCode);
     } else if (kind == "fcntl-stdio") {
         bytes = image(kFcntlStdioCode);
+    } else if (kind == "fcntl-setfl-stdio") {
+        bytes = image(kFcntlSetflStdioCode);
     } else {
         return usage();
     }

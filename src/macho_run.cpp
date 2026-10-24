@@ -45,6 +45,7 @@ constexpr std::uint32_t kGuestErrnoEnxio = 6;
 constexpr std::uint32_t kGuestErrnoEbadf = 9;
 constexpr std::uint32_t kGuestErrnoEnotty = 25;
 constexpr std::uint32_t kGuestErrnoEspipe = 29;
+constexpr std::uint32_t kGuestErrnoEnotsup = 45;
 
 // st_blksize reported for every guest standard descriptor. Darwin libc sizes
 // stdio buffers from it, so it must be positive; it describes no host file.
@@ -552,6 +553,50 @@ public:
             close_on_exec_descriptors_ &= ~bit;
         }
         return {0};
+    }
+
+    // fcntl(2) F_SETFL can only keep a standard stream's status flags as
+    // descriptor_flags reports them. Any change would have to reach the
+    // host's open file description, which macho-run shares with its own
+    // diagnostics and with the process that launched it, and the streams
+    // cannot honor nonblocking, asynchronous or synchronous I/O. A request
+    // to change them reports ENOTSUP, never a fabricated success, and leaves
+    // the flags as they were, so a later F_GETFL still tells the truth.
+    macosarm::HostSetStatusFlagsResult set_status_flags(
+        std::int32_t fd,
+        std::uint32_t status_flags) override {
+        const macosarm::HostDescriptorFlagsResult current = descriptor_flags(fd);
+        if (!current) {
+            return {current.error};
+        }
+        if (status_flags != current.status_flags) {
+            return {kGuestErrnoEnotsup};
+        }
+        return {0};
+    }
+
+    // Every standard stream does blocking I/O, so the FIONBIO step of
+    // fcntl(2) F_SETFL can only confirm that mode; asking for nonblocking
+    // I/O reports ENOTSUP rather than a mode the stream would not honor.
+    macosarm::HostFileModeResult set_nonblocking_io(
+        std::int32_t fd,
+        bool nonblocking) override {
+        if (!is_open(fd)) {
+            return {kGuestErrnoEbadf};
+        }
+        return {nonblocking ? kGuestErrnoEnotsup : 0U};
+    }
+
+    // No standard stream ever raises SIGIO, so the FIOASYNC step of fcntl(2)
+    // F_SETFL can only confirm ordinary I/O; asking for asynchronous I/O
+    // reports ENOTSUP.
+    macosarm::HostFileModeResult set_async_io(
+        std::int32_t fd,
+        bool asynchronous) override {
+        if (!is_open(fd)) {
+            return {kGuestErrnoEbadf};
+        }
+        return {asynchronous ? kGuestErrnoEnotsup : 0U};
     }
 
     // Like a canonical-mode terminal read, return after a newline, a full
