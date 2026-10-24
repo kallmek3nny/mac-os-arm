@@ -1095,6 +1095,73 @@ void set_error(CpuState& state, std::uint32_t error) noexcept {
     return finish();
 }
 
+// XNU bsd/kern/kern_descrip.c: sys_fcntl_nocancel(fd, cmd, arg) resolves fd
+// through fp_lookup before it looks at cmd, so a negative or unknown
+// descriptor reports EBADF for every command. Only F_GETFD, F_SETFD and
+// F_GETFL are modeled; any other command reports ENOSYS once the descriptor
+// resolves, never a fabricated success. The host supplies only the
+// descriptor's close-on-exec flag and OFLAGS(f_flag); the dispatcher
+// validates those flags and encodes every result itself.
+[[nodiscard]] SyscallDispatchResult dispatch_fcntl(
+    CpuState& state,
+    DarwinHostServices& host,
+    std::uint64_t syscall_number) {
+
+    constexpr std::uint32_t reportable_status_flags =
+        kDarwinOpenAccessMode | kDarwinOpenNonblock | kDarwinOpenAppend |
+        kDarwinOpenAsync | kDarwinOpenFsync | kDarwinOpenDsync;
+    const auto finish = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    };
+
+    const auto fd = static_cast<std::int32_t>(static_cast<std::uint32_t>(state.x[0]));
+    const auto command = static_cast<std::uint32_t>(state.x[1]);
+    const std::uint64_t argument = state.x[2];
+    if (fd < 0) {
+        set_error(state, kDarwinErrnoEbadf);
+        return finish();
+    }
+    const HostDescriptorFlagsResult described = host.descriptor_flags(fd);
+    if (!described) {
+        set_error(state, described.error);
+        return finish();
+    }
+    // OFLAGS(f_flag) always holds exactly one access mode and only FMASK
+    // bits; anything else is a host contract violation, never guest data.
+    if ((described.status_flags & ~reportable_status_flags) != 0 ||
+        (described.status_flags & kDarwinOpenAccessMode) == kDarwinOpenAccessMode) {
+        return SyscallDispatchResult{
+            SyscallDispatchError::host_contract_violation,
+            SyscallAction::resume, syscall_number, 0};
+    }
+
+    switch (command) {
+    case kDarwinFcntlGetfd:
+        set_success(state, described.close_on_exec ? kDarwinFdCloexec : 0U);
+        return finish();
+    case kDarwinFcntlSetfd: {
+        // Only bit 0 of arg (FD_CLOEXEC) is consulted; other bits are ignored.
+        const HostSetCloseOnExecResult updated =
+            host.set_close_on_exec(fd, (argument & kDarwinFdCloexec) != 0);
+        if (!updated) {
+            set_error(state, updated.error);
+            return finish();
+        }
+        set_success(state, 0U);
+        return finish();
+    }
+    case kDarwinFcntlGetfl:
+        set_success(state, described.status_flags);
+        return finish();
+    default:
+        // F_DUPFD, F_SETFL and every other command need descriptor-table or
+        // file-description state that is not modeled yet.
+        set_error(state, kDarwinErrnoEnosys);
+        return finish();
+    }
+}
+
 // XNU bsd/dev/random/randomdev.c: getentropy(buffer, size) rejects sizes
 // above its 256-byte kernel buffer with EINVAL (OpenBSD compatibility),
 // fills that buffer from the kernel CSPRNG, then copies it out (EFAULT).
@@ -1433,6 +1500,15 @@ SyscallDispatchResult dispatch_darwin_syscall(
         // TIOCGETA; terminal state comes only from the host's view of the
         // guest descriptor and the dispatcher encodes every record itself.
         return dispatch_ioctl(state, address_space, host, syscall_number);
+    case kDarwinSysFcntl:
+    case kDarwinSysFcntlNocancel:
+        // XNU syscalls.master #92 fcntl / #406 fcntl_nocancel: int fcntl(int
+        // fd, int cmd, long arg). libSystem's fcntl(3) traps here. Descriptor
+        // flags come only from the host's view of the guest descriptor; the
+        // dispatcher validates them and encodes every result itself. No guest
+        // pthread can be cancelled yet, so both entry points share one
+        // handler.
+        return dispatch_fcntl(state, host, syscall_number);
     case kDarwinSysPread:
     case kDarwinSysPreadNocancel:
         // XNU syscalls.master #153 pread / #414 pread_nocancel: user_ssize_t

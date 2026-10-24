@@ -770,6 +770,101 @@ macosarm::SyscallDispatchResult run_positioned(
     return macosarm::dispatch_darwin_syscall(state, vm, svc(), host);
 }
 
+// One fcntl(2) F_SETFD request that reached the host, recorded in call order.
+struct CloseOnExecUpdate {
+    std::int32_t fd{};
+    bool close_on_exec{};
+};
+
+// Scripted guest descriptors for fcntl(2). Each entry of descriptors is an
+// open descriptor with its own close-on-exec flag and its open file
+// description's OFLAGS(f_flag) status flags; every other descriptor is
+// EBADF. status_flags is reported verbatim, so tests can hand the
+// dispatcher flags that break the host contract. A nonzero update_error
+// fails the next set_close_on_exec once and leaves the flag unchanged.
+// Every host call is recorded so tests can prove a negative descriptor never
+// reaches the host and a rejected request changes nothing.
+struct DescriptorFlagsHost final : macosarm::DarwinHostServices {
+    struct Descriptor {
+        std::int32_t fd{};
+        bool close_on_exec{};
+        std::uint32_t status_flags{};
+    };
+
+    std::vector<Descriptor> descriptors;
+    std::uint32_t update_error{};
+    std::vector<std::int32_t> described;
+    std::vector<CloseOnExecUpdate> updates;
+
+    [[nodiscard]] Descriptor* find(std::int32_t fd) noexcept {
+        const auto found = std::find_if(descriptors.begin(), descriptors.end(),
+                                        [fd](const Descriptor& entry) { return entry.fd == fd; });
+        return found == descriptors.end() ? nullptr : &*found;
+    }
+
+    macosarm::HostWriteResult write(
+        std::int32_t fd,
+        std::span<const std::byte> bytes) override {
+        static_cast<void>(fd);
+        static_cast<void>(bytes);
+        return {0, macosarm::kDarwinErrnoEbadf};
+    }
+
+    macosarm::HostDescriptorFlagsResult descriptor_flags(std::int32_t fd) override {
+        described.push_back(fd);
+        if (const Descriptor* entry = find(fd); entry != nullptr) {
+            return {entry->close_on_exec, entry->status_flags, 0};
+        }
+        return {false, 0, macosarm::kDarwinErrnoEbadf};
+    }
+
+    macosarm::HostSetCloseOnExecResult set_close_on_exec(
+        std::int32_t fd,
+        bool close_on_exec) override {
+        updates.push_back({fd, close_on_exec});
+        Descriptor* entry = find(fd);
+        if (entry == nullptr) {
+            return {macosarm::kDarwinErrnoEbadf};
+        }
+        if (update_error != 0) {
+            const std::uint32_t failure = update_error;
+            update_error = 0;
+            return {failure};
+        }
+        entry->close_on_exec = close_on_exec;
+        return {0};
+    }
+
+    // True when descriptor fd is scripted with exactly this close-on-exec flag.
+    [[nodiscard]] bool close_on_exec_is(std::int32_t fd, bool expected) noexcept {
+        const Descriptor* entry = find(fd);
+        return entry != nullptr && entry->close_on_exec == expected;
+    }
+};
+
+macosarm::SyscallDispatchResult run_fcntl(
+    macosarm::GuestAddressSpace& vm,
+    macosarm::DarwinHostServices& host,
+    macosarm::CpuState& state,
+    std::uint64_t syscall_number,
+    std::uint64_t fd_register,
+    std::uint64_t command_register,
+    std::uint64_t argument_register) {
+    state = {};
+    state.x[0] = fd_register;
+    state.x[1] = command_register;
+    state.x[2] = argument_register;
+    state.x[16] = syscall_number;
+    // Preset carry so every success test proves the dispatcher clears it.
+    state.pstate = macosarm::kA64PstateCarry;
+    return macosarm::dispatch_darwin_syscall(state, vm, svc(), host);
+}
+
+// True when the last syscall failed with error: carry set and errno in x0.
+bool fcntl_failed_with(const macosarm::CpuState& state, std::uint32_t error) {
+    return carry_is_set(state) && state.x[0] == error;
+}
+
 } // namespace
 
 int main() {
@@ -3465,6 +3560,122 @@ int main() {
                    truncated.transfers.size() == 1U && truncated.transfers[0].size == chunk &&
                    truncated.contents.size() == chunk,
                "a pwrite source fault after the first chunk reports the bytes already written");
+    }
+
+    {
+        // fcntl(2) F_GETFD reports FD_CLOEXEC from the descriptor's own flag,
+        // F_SETFD consults only bit 0 of arg, and F_GETFL reports the open
+        // file description's OFLAGS(f_flag) as-is. fcntl and fcntl_nocancel
+        // share one handler, and only w0 and w1 count.
+        macosarm::GuestAddressSpace vm;
+        macosarm::CpuState state{};
+        DescriptorFlagsHost host;
+        host.descriptors = {
+            {0, false, macosarm::kDarwinOpenReadOnly},
+            {1, true, macosarm::kDarwinOpenWriteOnly | macosarm::kDarwinOpenAppend},
+            {3, false,
+             macosarm::kDarwinOpenReadWrite | macosarm::kDarwinOpenNonblock |
+                 macosarm::kDarwinOpenDsync},
+        };
+
+        const auto plain = run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl, 0U,
+                                     macosarm::kDarwinFcntlGetfd, 0U);
+        expect(static_cast<bool>(plain) && !carry_is_set(state) && state.x[0] == 0U &&
+                   plain.syscall_number == macosarm::kDarwinSysFcntl,
+               "fcntl F_GETFD reports 0 for a descriptor without close-on-exec");
+
+        const auto marked = run_fcntl(vm, host, state, macosarm::kDarwinSysFcntlNocancel,
+                                      0xFFFFFFFF00000001ULL,
+                                      0xABCD000000000000ULL | macosarm::kDarwinFcntlGetfd, 0U);
+        expect(static_cast<bool>(marked) && !carry_is_set(state) &&
+                   state.x[0] == macosarm::kDarwinFdCloexec &&
+                   marked.syscall_number == macosarm::kDarwinSysFcntlNocancel &&
+                   host.described.back() == 1,
+               "fcntl_nocancel F_GETFD reports FD_CLOEXEC and reads only w0 and w1");
+
+        static_cast<void>(run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl, 0U,
+                                    macosarm::kDarwinFcntlSetfd, 0xFFFFFFFFFFFFFFF1ULL));
+        expect(!carry_is_set(state) && state.x[0] == 0U && host.close_on_exec_is(0, true),
+               "fcntl F_SETFD sets close-on-exec from bit 0 of arg");
+
+        static_cast<void>(run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl, 0U,
+                                    macosarm::kDarwinFcntlSetfd, 0xFFFFFFFFFFFFFFFEULL));
+        expect(!carry_is_set(state) && state.x[0] == 0U && host.close_on_exec_is(0, false) &&
+                   host.updates.size() == 2U && host.updates[1].fd == 0 &&
+                   !host.updates[1].close_on_exec,
+               "fcntl F_SETFD clears close-on-exec and ignores every other bit of arg");
+
+        static_cast<void>(run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl, 1U,
+                                    macosarm::kDarwinFcntlGetfl, 0U));
+        expect(!carry_is_set(state) &&
+                   state.x[0] == (macosarm::kDarwinOpenWriteOnly | macosarm::kDarwinOpenAppend),
+               "fcntl F_GETFL reports the access mode and O_APPEND");
+
+        static_cast<void>(run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl, 3U,
+                                    macosarm::kDarwinFcntlGetfl, 0U));
+        expect(!carry_is_set(state) &&
+                   state.x[0] == (macosarm::kDarwinOpenReadWrite | macosarm::kDarwinOpenNonblock |
+                                  macosarm::kDarwinOpenDsync),
+               "fcntl F_GETFL reports O_RDWR with O_NONBLOCK and O_DSYNC");
+    }
+
+    {
+        // fcntl resolves the descriptor before it looks at the command: a
+        // negative fd is EBADF without asking the host, an unknown one is the
+        // host's EBADF, and a command that is not modeled reports ENOSYS on
+        // an open descriptor, never a fabricated success.
+        macosarm::GuestAddressSpace vm;
+        macosarm::CpuState state{};
+        DescriptorFlagsHost host;
+        host.descriptors = {{2, false, macosarm::kDarwinOpenWriteOnly}};
+
+        static_cast<void>(run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl, 0xFFFFFFFFU,
+                                    macosarm::kDarwinFcntlGetfd, 0U));
+        expect(fcntl_failed_with(state, macosarm::kDarwinErrnoEbadf) && host.described.empty(),
+               "fcntl on a negative descriptor reports EBADF without asking the host");
+
+        static_cast<void>(run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl, 9U,
+                                    macosarm::kDarwinFcntlDupfd, 0U));
+        expect(fcntl_failed_with(state, macosarm::kDarwinErrnoEbadf) &&
+                   host.described == std::vector<std::int32_t>{9},
+               "fcntl on an unknown descriptor reports EBADF before the command");
+
+        const std::array<std::uint64_t, 3> unmodeled{
+            macosarm::kDarwinFcntlDupfd, macosarm::kDarwinFcntlSetfl, 0x7fffffffU};
+        for (const std::uint64_t command : unmodeled) {
+            static_cast<void>(
+                run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl, 2U, command, 1U));
+            expect(fcntl_failed_with(state, macosarm::kDarwinErrnoEnosys) && host.updates.empty(),
+                   "fcntl reports ENOSYS for a command it does not model");
+        }
+
+        host.update_error = macosarm::kDarwinErrnoEio;
+        static_cast<void>(run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl, 2U,
+                                    macosarm::kDarwinFcntlSetfd, macosarm::kDarwinFdCloexec));
+        expect(fcntl_failed_with(state, macosarm::kDarwinErrnoEio) &&
+                   host.close_on_exec_is(2, false) && host.updates.size() == 1U,
+               "a host F_SETFD failure is reported and leaves close-on-exec unchanged");
+    }
+
+    {
+        // OFLAGS(f_flag) always holds exactly one access mode and only FMASK
+        // status bits, so the dispatcher refuses anything else as a host
+        // contract violation before any command reaches the guest or host.
+        macosarm::GuestAddressSpace vm;
+        macosarm::CpuState state{};
+        DescriptorFlagsHost host;
+        host.descriptors = {{3, false, macosarm::kDarwinOpenAccessMode},
+                            {4, false, macosarm::kDarwinOpenReadOnly | 0x0010U}};
+        const std::array<std::int32_t, 2> violating{3, 4};
+        for (const std::int32_t fd : violating) {
+            const auto violated =
+                run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl,
+                          static_cast<std::uint64_t>(fd), macosarm::kDarwinFcntlSetfd,
+                          macosarm::kDarwinFdCloexec);
+            expect(violated.error == macosarm::SyscallDispatchError::host_contract_violation &&
+                       host.updates.empty() && host.close_on_exec_is(fd, false),
+                   "fcntl rejects host status flags outside OFLAGS(f_flag)");
+        }
     }
 
     if (failures != 0) {

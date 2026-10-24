@@ -135,6 +135,37 @@ constexpr std::uint64_t kDarwinSysPread = 153;
 constexpr std::uint64_t kDarwinSysPwrite = 154;
 constexpr std::uint64_t kDarwinSysPreadNocancel = 414;
 constexpr std::uint64_t kDarwinSysPwriteNocancel = 415;
+// XNU syscalls.master #92: int fcntl(int fd, int cmd, long arg), and #406
+// fcntl_nocancel with the same argument and error contract; only the
+// pthread cancellation point differs. fd and cmd are ints, so only w0 and
+// w1 count; arg arrives whole in x2. sys_fcntl_nocancel in
+// bsd/kern/kern_descrip.c first resolves the descriptor through fp_lookup
+// (EBADF, also for a negative fd). F_GETFD then returns FD_CLOEXEC while
+// the descriptor's own close-on-exec flag is set, F_SETFD sets or clears
+// that flag from bit 0 of arg alone, and F_GETFL returns the open file
+// description's status flags in open(2) form, OFLAGS(f_flag). Every other
+// command, including F_DUPFD and F_SETFL (whose FIONBIO and FIOASYNC
+// requests are not modeled either), reports ENOSYS once the descriptor
+// resolves, never a fabricated success.
+constexpr std::uint64_t kDarwinSysFcntl = 92;
+constexpr std::uint64_t kDarwinSysFcntlNocancel = 406;
+constexpr std::uint32_t kDarwinFcntlDupfd = 0; // F_DUPFD
+constexpr std::uint32_t kDarwinFcntlGetfd = 1; // F_GETFD
+constexpr std::uint32_t kDarwinFcntlSetfd = 2; // F_SETFD
+constexpr std::uint32_t kDarwinFcntlGetfl = 3; // F_GETFL
+constexpr std::uint32_t kDarwinFcntlSetfl = 4; // F_SETFL
+constexpr std::uint32_t kDarwinFdCloexec = 1;  // FD_CLOEXEC
+// XNU bsd/sys/fcntl.h status flags F_GETFL can report: an access mode plus
+// FMASK's O_NONBLOCK, O_APPEND, O_ASYNC, O_FSYNC and O_DSYNC.
+constexpr std::uint32_t kDarwinOpenReadOnly = 0x0000;   // O_RDONLY
+constexpr std::uint32_t kDarwinOpenWriteOnly = 0x0001;  // O_WRONLY
+constexpr std::uint32_t kDarwinOpenReadWrite = 0x0002;  // O_RDWR
+constexpr std::uint32_t kDarwinOpenAccessMode = 0x0003; // O_ACCMODE
+constexpr std::uint32_t kDarwinOpenNonblock = 0x0004;   // O_NONBLOCK
+constexpr std::uint32_t kDarwinOpenAppend = 0x0008;     // O_APPEND
+constexpr std::uint32_t kDarwinOpenAsync = 0x0040;      // O_ASYNC
+constexpr std::uint32_t kDarwinOpenFsync = 0x0080;      // O_FSYNC
+constexpr std::uint32_t kDarwinOpenDsync = 0x400000;    // O_DSYNC
 constexpr std::uint32_t kDarwinErrnoEio = 5;
 constexpr std::uint32_t kDarwinErrnoEnxio = 6;
 constexpr std::uint32_t kDarwinErrnoEbadf = 9;
@@ -327,6 +358,35 @@ struct HostRandomAccessResult {
     }
 };
 
+// Guest-visible flags of descriptor fd for fcntl(2) F_GETFD, F_SETFD and
+// F_GETFL, as sys_fcntl_nocancel sees them once fp_lookup resolves fd. An
+// unknown descriptor reports EBADF. Otherwise the host reports the
+// descriptor's own close-on-exec flag and the open file description's status
+// flags in open(2) form, OFLAGS(f_flag): exactly one of O_RDONLY, O_WRONLY or
+// O_RDWR plus any of O_NONBLOCK, O_APPEND, O_ASYNC, O_FSYNC and O_DSYNC. On
+// success, an O_ACCMODE access mode or any other bit is a host contract
+// violation and never reaches the guest.
+struct HostDescriptorFlagsResult {
+    bool close_on_exec{};         // close-on-exec flag of the descriptor itself
+    std::uint32_t status_flags{}; // OFLAGS(f_flag) of the open file description
+    std::uint32_t error{};
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return error == 0;
+    }
+};
+
+// Outcome of setting (close_on_exec true) or clearing descriptor fd's
+// close-on-exec flag for fcntl(2) F_SETFD. On error the flag stays
+// unchanged.
+struct HostSetCloseOnExecResult {
+    std::uint32_t error{};
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return error == 0;
+    }
+};
+
 class DarwinHostServices {
 public:
     virtual ~DarwinHostServices() = default;
@@ -452,6 +512,29 @@ public:
         static_cast<void>(bytes);
         static_cast<void>(offset);
         return {0, kDarwinErrnoEbadf};
+    }
+
+    // Describe descriptor fd for fcntl(2) F_GETFD and F_GETFL, and resolve
+    // it before F_SETFD, as fp_lookup does in sys_fcntl_nocancel: the
+    // descriptor's own close-on-exec flag and the open file description's
+    // OFLAGS(f_flag) status flags. The dispatcher validates the flags itself.
+    // Hosts that do not override this expose no descriptors and report
+    // EBADF, never fabricated flags.
+    [[nodiscard]] virtual HostDescriptorFlagsResult descriptor_flags(std::int32_t fd) {
+        static_cast<void>(fd);
+        return {false, 0, kDarwinErrnoEbadf};
+    }
+
+    // Set (close_on_exec true) or clear descriptor fd's close-on-exec flag
+    // for fcntl(2) F_SETFD. The dispatcher calls this only after
+    // descriptor_flags resolves fd. On error the flag stays unchanged. Hosts
+    // that do not override this report EBADF, never a fabricated success.
+    [[nodiscard]] virtual HostSetCloseOnExecResult set_close_on_exec(
+        std::int32_t fd,
+        bool close_on_exec) {
+        static_cast<void>(fd);
+        static_cast<void>(close_on_exec);
+        return {kDarwinErrnoEbadf};
     }
 };
 
