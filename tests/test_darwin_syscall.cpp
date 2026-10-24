@@ -835,6 +835,72 @@ struct DescriptorFlagsHost final : macosarm::DarwinHostServices {
         return {0};
     }
 
+    // One fcntl(2) F_SETFL step that reached the host, recorded in call order
+    // across set_status_flags, set_nonblocking_io and set_async_io. value is
+    // the committed OFLAGS(f_flag) for a status_flags step and 1 or 0 for the
+    // mode an I/O mode step asked for.
+    struct Step {
+        enum class Kind { status_flags, nonblocking_io, async_io };
+
+        Kind kind{};
+        std::int32_t fd{};
+        std::uint32_t value{};
+
+        friend bool operator==(const Step&, const Step&) = default;
+    };
+
+    // A nonzero status_error, nonblocking_error or async_error fails the next
+    // set_status_flags, set_nonblocking_io or set_async_io call once, leaving
+    // that state unchanged. A successful set_status_flags replaces the
+    // descriptor's status_flags, so a later F_GETFL reports what F_SETFL
+    // committed.
+    std::uint32_t status_error{};
+    std::uint32_t nonblocking_error{};
+    std::uint32_t async_error{};
+    std::vector<Step> steps;
+
+    // Report and clear a one-shot scripted failure.
+    [[nodiscard]] static std::uint32_t take(std::uint32_t& error) noexcept {
+        const std::uint32_t failure = error;
+        error = 0;
+        return failure;
+    }
+
+    macosarm::HostSetStatusFlagsResult set_status_flags(
+        std::int32_t fd,
+        std::uint32_t status_flags) override {
+        steps.push_back({Step::Kind::status_flags, fd, status_flags});
+        Descriptor* entry = find(fd);
+        if (entry == nullptr) {
+            return {macosarm::kDarwinErrnoEbadf};
+        }
+        if (status_error != 0) {
+            return {take(status_error)};
+        }
+        entry->status_flags = status_flags;
+        return {0};
+    }
+
+    macosarm::HostFileModeResult set_nonblocking_io(
+        std::int32_t fd,
+        bool nonblocking) override {
+        steps.push_back({Step::Kind::nonblocking_io, fd, nonblocking ? 1U : 0U});
+        if (find(fd) == nullptr) {
+            return {macosarm::kDarwinErrnoEbadf};
+        }
+        return {take(nonblocking_error)};
+    }
+
+    macosarm::HostFileModeResult set_async_io(
+        std::int32_t fd,
+        bool asynchronous) override {
+        steps.push_back({Step::Kind::async_io, fd, asynchronous ? 1U : 0U});
+        if (find(fd) == nullptr) {
+            return {macosarm::kDarwinErrnoEbadf};
+        }
+        return {take(async_error)};
+    }
+
     // True when descriptor fd is scripted with exactly this close-on-exec flag.
     [[nodiscard]] bool close_on_exec_is(std::int32_t fd, bool expected) noexcept {
         const Descriptor* entry = find(fd);
@@ -3640,12 +3706,12 @@ int main() {
                    host.described == std::vector<std::int32_t>{9},
                "fcntl on an unknown descriptor reports EBADF before the command");
 
-        const std::array<std::uint64_t, 3> unmodeled{
-            macosarm::kDarwinFcntlDupfd, macosarm::kDarwinFcntlSetfl, 0x7fffffffU};
+        const std::array<std::uint64_t, 2> unmodeled{macosarm::kDarwinFcntlDupfd, 0x7fffffffU};
         for (const std::uint64_t command : unmodeled) {
             static_cast<void>(
                 run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl, 2U, command, 1U));
-            expect(fcntl_failed_with(state, macosarm::kDarwinErrnoEnosys) && host.updates.empty(),
+            expect(fcntl_failed_with(state, macosarm::kDarwinErrnoEnosys) &&
+                       host.updates.empty() && host.steps.empty(),
                    "fcntl reports ENOSYS for a command it does not model");
         }
 
@@ -3676,6 +3742,144 @@ int main() {
                        host.updates.empty() && host.close_on_exec_is(fd, false),
                    "fcntl rejects host status flags outside OFLAGS(f_flag)");
         }
+    }
+
+    {
+        // fcntl(2) F_SETFL replaces every FCNTLFLAGS bit with FFLAGS((int)arg)
+        // and keeps the access mode, then hands the file its O_NONBLOCK state
+        // through FIONBIO and its O_ASYNC state through FIOASYNC, in that
+        // order. A later F_GETFL reports exactly what F_SETFL committed.
+        using Step = DescriptorFlagsHost::Step;
+        using Kind = Step::Kind;
+        macosarm::GuestAddressSpace vm;
+        macosarm::CpuState state{};
+        DescriptorFlagsHost host;
+        host.descriptors = {
+            {0, false, macosarm::kDarwinOpenReadOnly},
+            {1, false, macosarm::kDarwinOpenWriteOnly | macosarm::kDarwinOpenAppend},
+        };
+        const std::uint32_t nonblocking_writer =
+            macosarm::kDarwinOpenWriteOnly | macosarm::kDarwinOpenNonblock;
+
+        const auto plain = run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl, 1U,
+                                     macosarm::kDarwinFcntlSetfl, macosarm::kDarwinOpenNonblock);
+        expect(static_cast<bool>(plain) && !carry_is_set(state) && state.x[0] == 0U &&
+                   plain.syscall_number == macosarm::kDarwinSysFcntl &&
+                   (host.steps == std::vector<Step>{{Kind::status_flags, 1, nonblocking_writer},
+                                                    {Kind::nonblocking_io, 1, 1U},
+                                                    {Kind::async_io, 1, 0U}}),
+               "fcntl F_SETFL sets O_NONBLOCK, drops O_APPEND, then FIONBIO and FIOASYNC");
+
+        static_cast<void>(run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl, 1U,
+                                    macosarm::kDarwinFcntlGetfl, 0U));
+        expect(!carry_is_set(state) && state.x[0] == nonblocking_writer,
+               "fcntl F_GETFL reports the status flags F_SETFL committed");
+
+        host.steps.clear();
+        const auto nocancel =
+            run_fcntl(vm, host, state, macosarm::kDarwinSysFcntlNocancel, 0xFFFFFFFF00000000ULL,
+                      macosarm::kDarwinFcntlSetfl,
+                      macosarm::kDarwinOpenWriteOnly | macosarm::kDarwinOpenAsync);
+        expect(static_cast<bool>(nocancel) && !carry_is_set(state) && state.x[0] == 0U &&
+                   nocancel.syscall_number == macosarm::kDarwinSysFcntlNocancel &&
+                   (host.steps == std::vector<Step>{
+                        {Kind::status_flags, 0, macosarm::kDarwinOpenAsync},
+                        {Kind::nonblocking_io, 0, 0U},
+                        {Kind::async_io, 0, 1U}}),
+               "fcntl_nocancel F_SETFL sets O_ASYNC, keeps O_RDONLY and reads only w0");
+
+        host.steps.clear();
+        static_cast<void>(run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl, 0U,
+                                    macosarm::kDarwinFcntlSetfl, macosarm::kDarwinOpenAccessMode));
+        expect(!carry_is_set(state) && state.x[0] == 0U &&
+                   (host.steps == std::vector<Step>{
+                        {Kind::status_flags, 0, macosarm::kDarwinOpenNonblock},
+                        {Kind::nonblocking_io, 0, 1U},
+                        {Kind::async_io, 0, 0U}}),
+               "fcntl F_SETFL carries an O_ACCMODE arg into O_NONBLOCK as FFLAGS does");
+
+        host.steps.clear();
+        static_cast<void>(run_fcntl(
+            vm, host, state, macosarm::kDarwinSysFcntl, 1U, macosarm::kDarwinFcntlSetfl,
+            macosarm::kDarwinOpenAccessMode | macosarm::kDarwinOpenNonblock));
+        expect(!carry_is_set(state) && state.x[0] == 0U &&
+                   (host.steps == std::vector<Step>{
+                        {Kind::status_flags, 1,
+                         macosarm::kDarwinOpenWriteOnly | macosarm::kDarwinOpenAppend},
+                        {Kind::nonblocking_io, 1, 0U},
+                        {Kind::async_io, 1, 0U}}),
+               "fcntl F_SETFL lets the FFLAGS carry ripple past O_NONBLOCK into O_APPEND");
+
+        host.steps.clear();
+        static_cast<void>(run_fcntl(
+            vm, host, state, macosarm::kDarwinSysFcntl, 1U, macosarm::kDarwinFcntlSetfl,
+            macosarm::kDarwinOpenExec | macosarm::kDarwinOpenAccessMode |
+                macosarm::kDarwinOpenNonblock));
+        expect(!carry_is_set(state) && state.x[0] == 0U &&
+                   (host.steps == std::vector<Step>{{Kind::status_flags, 1, nonblocking_writer},
+                                                    {Kind::nonblocking_io, 1, 1U},
+                                                    {Kind::async_io, 1, 0U}}),
+               "fcntl F_SETFL with O_EXEC clears the access mode bits instead of adding one");
+    }
+
+    {
+        // A failed F_SETFL step stops where XNU stops: a set_status_flags
+        // failure changes nothing, a FIONBIO failure is reported with the new
+        // status flags already committed, and a FIOASYNC failure clears
+        // O_NONBLOCK again, returns the file to blocking I/O and reports the
+        // FIOASYNC error rather than either undo step's result.
+        using Step = DescriptorFlagsHost::Step;
+        using Kind = Step::Kind;
+        macosarm::GuestAddressSpace vm;
+        macosarm::CpuState state{};
+        DescriptorFlagsHost host;
+        host.descriptors = {{2, false, macosarm::kDarwinOpenWriteOnly}};
+        const std::uint64_t requested = macosarm::kDarwinOpenNonblock | macosarm::kDarwinOpenAsync;
+        const std::uint32_t committed = macosarm::kDarwinOpenWriteOnly |
+                                        macosarm::kDarwinOpenNonblock | macosarm::kDarwinOpenAsync;
+        const std::uint32_t asynchronous_writer =
+            macosarm::kDarwinOpenWriteOnly | macosarm::kDarwinOpenAsync;
+
+        host.status_error = macosarm::kDarwinErrnoEio;
+        static_cast<void>(run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl, 2U,
+                                    macosarm::kDarwinFcntlSetfl, requested));
+        expect(fcntl_failed_with(state, macosarm::kDarwinErrnoEio) &&
+                   (host.steps == std::vector<Step>{{Kind::status_flags, 2, committed}}),
+               "a host F_SETFL status flags failure is reported before FIONBIO");
+        static_cast<void>(run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl, 2U,
+                                    macosarm::kDarwinFcntlGetfl, 0U));
+        expect(!carry_is_set(state) && state.x[0] == macosarm::kDarwinOpenWriteOnly,
+               "a failed F_SETFL commit leaves the status flags unchanged");
+
+        host.steps.clear();
+        host.nonblocking_error = macosarm::kDarwinErrnoEnxio;
+        static_cast<void>(run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl, 2U,
+                                    macosarm::kDarwinFcntlSetfl, requested));
+        expect(fcntl_failed_with(state, macosarm::kDarwinErrnoEnxio) &&
+                   (host.steps == std::vector<Step>{{Kind::status_flags, 2, committed},
+                                                    {Kind::nonblocking_io, 2, 1U}}),
+               "a host FIONBIO failure is reported and FIOASYNC is never asked");
+        static_cast<void>(run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl, 2U,
+                                    macosarm::kDarwinFcntlGetfl, 0U));
+        expect(!carry_is_set(state) && state.x[0] == committed,
+               "a FIONBIO failure leaves the status flags F_SETFL committed");
+
+        host.steps.clear();
+        host.async_error = macosarm::kDarwinErrnoEio;
+        static_cast<void>(run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl, 2U,
+                                    macosarm::kDarwinFcntlSetfl, requested));
+        expect(fcntl_failed_with(state, macosarm::kDarwinErrnoEio) &&
+                   (host.steps == std::vector<Step>{
+                        {Kind::status_flags, 2, committed},
+                        {Kind::nonblocking_io, 2, 1U},
+                        {Kind::async_io, 2, 1U},
+                        {Kind::status_flags, 2, asynchronous_writer},
+                        {Kind::nonblocking_io, 2, 0U}}),
+               "a host FIOASYNC failure clears O_NONBLOCK and restores blocking I/O");
+        static_cast<void>(run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl, 2U,
+                                    macosarm::kDarwinFcntlGetfl, 0U));
+        expect(!carry_is_set(state) && state.x[0] == asynchronous_writer,
+               "after a FIOASYNC failure F_GETFL reports O_ASYNC without O_NONBLOCK");
     }
 
     if (failures != 0) {

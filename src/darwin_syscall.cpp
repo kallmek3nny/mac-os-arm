@@ -1097,11 +1097,12 @@ void set_error(CpuState& state, std::uint32_t error) noexcept {
 
 // XNU bsd/kern/kern_descrip.c: sys_fcntl_nocancel(fd, cmd, arg) resolves fd
 // through fp_lookup before it looks at cmd, so a negative or unknown
-// descriptor reports EBADF for every command. Only F_GETFD, F_SETFD and
-// F_GETFL are modeled; any other command reports ENOSYS once the descriptor
-// resolves, never a fabricated success. The host supplies only the
-// descriptor's close-on-exec flag and OFLAGS(f_flag); the dispatcher
-// validates those flags and encodes every result itself.
+// descriptor reports EBADF for every command. Only F_GETFD, F_SETFD,
+// F_GETFL and F_SETFL are modeled; any other command reports ENOSYS once the
+// descriptor resolves, never a fabricated success. The host supplies only
+// the descriptor's close-on-exec flag and OFLAGS(f_flag) and applies the
+// changes F_SETFD and F_SETFL ask for; the dispatcher validates the flags,
+// computes every new flag word and encodes every result itself.
 [[nodiscard]] SyscallDispatchResult dispatch_fcntl(
     CpuState& state,
     DarwinHostServices& host,
@@ -1154,8 +1155,48 @@ void set_error(CpuState& state, std::uint32_t error) noexcept {
     case kDarwinFcntlGetfl:
         set_success(state, described.status_flags);
         return finish();
+    case kDarwinFcntlSetfl: {
+        // fp->f_flag &= ~FCNTLFLAGS; fp->f_flag |= FFLAGS((int)arg) & FCNTLFLAGS.
+        // Only the int low half of arg is read. FFLAGS adds one, which can
+        // carry O_ACCMODE into O_NONBLOCK, unless O_EXEC is set, in which case
+        // it clears the access mode bits instead. FCNTLFLAGS bits share their
+        // open(2) positions, so the result stays in OFLAGS form and keeps the
+        // access mode descriptor_flags reported.
+        const auto requested = static_cast<std::uint32_t>(argument);
+        const std::uint32_t kernel_flags = (requested & kDarwinOpenExec) != 0
+                                               ? (requested & ~kDarwinOpenAccessMode)
+                                               : (requested + 1U);
+        const std::uint32_t status_flags =
+            (described.status_flags & ~kDarwinFcntlSettableFlags) |
+            (kernel_flags & kDarwinFcntlSettableFlags);
+        const HostSetStatusFlagsResult committed = host.set_status_flags(fd, status_flags);
+        if (!committed) {
+            set_error(state, committed.error);
+            return finish();
+        }
+        // fo_ioctl(FIONBIO): a failure is reported with f_flag already changed.
+        const HostFileModeResult nonblocking =
+            host.set_nonblocking_io(fd, (status_flags & kDarwinOpenNonblock) != 0);
+        if (!nonblocking) {
+            set_error(state, nonblocking.error);
+            return finish();
+        }
+        // fo_ioctl(FIOASYNC): on failure XNU clears FNONBLOCK, returns the file
+        // to blocking I/O and reports the FIOASYNC error. Both undo steps
+        // ignore their own errors, as XNU's (void)fo_ioctl does.
+        const HostFileModeResult asynchronous =
+            host.set_async_io(fd, (status_flags & kDarwinOpenAsync) != 0);
+        if (!asynchronous) {
+            static_cast<void>(host.set_status_flags(fd, status_flags & ~kDarwinOpenNonblock));
+            static_cast<void>(host.set_nonblocking_io(fd, false));
+            set_error(state, asynchronous.error);
+            return finish();
+        }
+        set_success(state, 0U);
+        return finish();
+    }
     default:
-        // F_DUPFD, F_SETFL and every other command need descriptor-table or
+        // F_DUPFD and every other command need descriptor-table or
         // file-description state that is not modeled yet.
         set_error(state, kDarwinErrnoEnosys);
         return finish();

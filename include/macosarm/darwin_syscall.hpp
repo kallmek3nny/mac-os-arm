@@ -143,9 +143,16 @@ constexpr std::uint64_t kDarwinSysPwriteNocancel = 415;
 // (EBADF, also for a negative fd). F_GETFD then returns FD_CLOEXEC while
 // the descriptor's own close-on-exec flag is set, F_SETFD sets or clears
 // that flag from bit 0 of arg alone, and F_GETFL returns the open file
-// description's status flags in open(2) form, OFLAGS(f_flag). Every other
-// command, including F_DUPFD and F_SETFL (whose FIONBIO and FIOASYNC
-// requests are not modeled either), reports ENOSYS once the descriptor
+// description's status flags in open(2) form, OFLAGS(f_flag). F_SETFL
+// reads only the int low half of arg and converts it with FFLAGS: plus one,
+// or with O_EXEC set the access mode bits cleared instead. The plus one can
+// carry, so an arg of O_ACCMODE sets O_NONBLOCK exactly as on XNU. Only the
+// FCNTLFLAGS bits of f_flag change and the access mode never does. F_SETFL
+// then hands the new O_NONBLOCK state to the file through FIONBIO and the
+// new O_ASYNC state through FIOASYNC. A FIONBIO failure is reported with
+// f_flag already changed; a FIOASYNC failure clears O_NONBLOCK again,
+// returns the file to blocking I/O and reports the FIOASYNC error. Every
+// other command, including F_DUPFD, reports ENOSYS once the descriptor
 // resolves, never a fabricated success.
 constexpr std::uint64_t kDarwinSysFcntl = 92;
 constexpr std::uint64_t kDarwinSysFcntlNocancel = 406;
@@ -166,6 +173,13 @@ constexpr std::uint32_t kDarwinOpenAppend = 0x0008;     // O_APPEND
 constexpr std::uint32_t kDarwinOpenAsync = 0x0040;      // O_ASYNC
 constexpr std::uint32_t kDarwinOpenFsync = 0x0080;      // O_FSYNC
 constexpr std::uint32_t kDarwinOpenDsync = 0x400000;    // O_DSYNC
+// O_EXEC never reaches F_GETFL here; it only steers FFLAGS for F_SETFL.
+constexpr std::uint32_t kDarwinOpenExec = 0x40000000;   // O_EXEC
+// XNU bsd/sys/fcntl.h FCNTLFLAGS: the f_flag bits F_SETFL may change. These
+// kernel F-flags share their open(2) bit positions.
+constexpr std::uint32_t kDarwinFcntlSettableFlags =
+    kDarwinOpenNonblock | kDarwinOpenAppend | kDarwinOpenAsync | kDarwinOpenFsync |
+    kDarwinOpenDsync;
 constexpr std::uint32_t kDarwinErrnoEio = 5;
 constexpr std::uint32_t kDarwinErrnoEnxio = 6;
 constexpr std::uint32_t kDarwinErrnoEbadf = 9;
@@ -387,6 +401,28 @@ struct HostSetCloseOnExecResult {
     }
 };
 
+// Outcome of committing new OFLAGS(f_flag) status flags to descriptor fd's
+// open file description for fcntl(2) F_SETFL. On error the flags stay
+// unchanged.
+struct HostSetStatusFlagsResult {
+    std::uint32_t error{};
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return error == 0;
+    }
+};
+
+// Outcome of handing the file behind descriptor fd its new non-blocking
+// (FIONBIO) or asynchronous I/O (FIOASYNC) state, as fo_ioctl does for
+// fcntl(2) F_SETFL. On error the file keeps its previous I/O state.
+struct HostFileModeResult {
+    std::uint32_t error{};
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return error == 0;
+    }
+};
+
 class DarwinHostServices {
 public:
     virtual ~DarwinHostServices() = default;
@@ -534,6 +570,47 @@ public:
         bool close_on_exec) {
         static_cast<void>(fd);
         static_cast<void>(close_on_exec);
+        return {kDarwinErrnoEbadf};
+    }
+
+    // Commit status_flags as the OFLAGS(f_flag) status flags of descriptor
+    // fd's open file description for fcntl(2) F_SETFL. The dispatcher calls
+    // this only after descriptor_flags resolves fd, keeping the access mode
+    // it reported and changing only FCNTLFLAGS bits. On error the flags stay
+    // unchanged. Hosts that do not override this report EBADF, never a
+    // fabricated success.
+    [[nodiscard]] virtual HostSetStatusFlagsResult set_status_flags(
+        std::int32_t fd,
+        std::uint32_t status_flags) {
+        static_cast<void>(fd);
+        static_cast<void>(status_flags);
+        return {kDarwinErrnoEbadf};
+    }
+
+    // Switch the file behind descriptor fd to non-blocking (nonblocking
+    // true) or blocking I/O, as fo_ioctl(FIONBIO) does for fcntl(2) F_SETFL.
+    // The dispatcher calls this only after set_status_flags succeeds, and
+    // again with nonblocking false to undo O_NONBLOCK when set_async_io
+    // fails. Hosts that do not override this report EBADF, never a
+    // fabricated success.
+    [[nodiscard]] virtual HostFileModeResult set_nonblocking_io(
+        std::int32_t fd,
+        bool nonblocking) {
+        static_cast<void>(fd);
+        static_cast<void>(nonblocking);
+        return {kDarwinErrnoEbadf};
+    }
+
+    // Switch the file behind descriptor fd to asynchronous (SIGIO-driven,
+    // asynchronous true) or ordinary I/O, as fo_ioctl(FIOASYNC) does for
+    // fcntl(2) F_SETFL. The dispatcher calls this only after
+    // set_nonblocking_io succeeds. Hosts that do not override this report
+    // EBADF, never a fabricated success.
+    [[nodiscard]] virtual HostFileModeResult set_async_io(
+        std::int32_t fd,
+        bool asynchronous) {
+        static_cast<void>(fd);
+        static_cast<void>(asynchronous);
         return {kDarwinErrnoEbadf};
     }
 };
