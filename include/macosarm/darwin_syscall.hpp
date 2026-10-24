@@ -100,11 +100,29 @@ constexpr std::size_t kDarwinIovecSize = 16;
 // descriptor (EBADF).
 constexpr std::uint64_t kDarwinSysReadv = 120;
 constexpr std::uint64_t kDarwinSysReadvNocancel = 411;
+// XNU syscalls.master #199: off_t lseek(int fd, off_t offset, int whence).
+// The 64-bit offset arrives whole in x1 and the new offset returns whole in
+// x0. fd and whence are ints, so only w0 and w2 count. lseek in
+// bsd/vfs/vfs_syscalls.c resolves the descriptor first (EBADF). It then
+// rejects a non-vnode descriptor such as a pipe or socket, a FIFO or a
+// terminal (ESPIPE), and only after that checks whence (EINVAL). A positive
+// offset whose sum wraps negative is EOVERFLOW. Any other negative result
+// is EINVAL, except on a character device. Slot #19 is the retired old
+// lseek (ENOSYS).
+constexpr std::uint64_t kDarwinSysLseek = 199;
+// XNU bsd/sys/_types/_seek_set.h whence values.
+constexpr std::uint32_t kDarwinSeekSet = 0;  // SEEK_SET (L_SET)
+constexpr std::uint32_t kDarwinSeekCur = 1;  // SEEK_CUR (L_INCR)
+constexpr std::uint32_t kDarwinSeekEnd = 2;  // SEEK_END (L_XTND)
+constexpr std::uint32_t kDarwinSeekHole = 3; // SEEK_HOLE
+constexpr std::uint32_t kDarwinSeekData = 4; // SEEK_DATA
 constexpr std::uint32_t kDarwinErrnoEio = 5;
 constexpr std::uint32_t kDarwinErrnoEbadf = 9;
 constexpr std::uint32_t kDarwinErrnoEnomem = 12;
 constexpr std::uint32_t kDarwinErrnoEacces = 13;
 constexpr std::uint32_t kDarwinErrnoEinval = 22;
+constexpr std::uint32_t kDarwinErrnoEspipe = 29;
+constexpr std::uint32_t kDarwinErrnoEoverflow = 84;
 constexpr std::uint32_t kDarwinErrnoEnotty = 25;
 constexpr std::uint32_t kDarwinErrnoEfault = 14;
 constexpr std::uint32_t kDarwinErrnoEnosys = 78;
@@ -240,6 +258,39 @@ struct HostTerminalResult {
     }
 };
 
+// Guest-visible seek state of descriptor fd for lseek(2). As in XNU's
+// fp_getfvp and vnode checks, a descriptor that names no guest file reports
+// EBADF, and one that cannot seek (a pipe, socket, FIFO or terminal) reports
+// ESPIPE. Otherwise the host reports the open file description's current
+// offset and the file size. A nonzero size_error means the size is unknown;
+// like a failed vnode_size, it fails only SEEK_END. The dispatcher applies
+// XNU's whence arithmetic and range checks itself and commits a new offset
+// through set_offset only after every check passes. On success, a negative
+// size without size_error is a host contract violation, as is a negative
+// offset on anything but a character device, the only kind of file whose
+// offset XNU lets go negative.
+struct HostSeekResult {
+    std::int64_t offset{};      // fg_offset of the open file description
+    std::int64_t size{};        // vnode_size, consulted only by SEEK_END
+    std::uint32_t size_error{}; // nonzero: size unknown, fails SEEK_END only
+    bool character_device{};    // VCHR: negative offsets are allowed
+    std::uint32_t error{};
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return error == 0;
+    }
+};
+
+// Outcome of committing a validated lseek(2) offset to descriptor fd. On
+// error the host leaves the descriptor's offset unchanged.
+struct HostSetOffsetResult {
+    std::uint32_t error{};
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return error == 0;
+    }
+};
+
 class DarwinHostServices {
 public:
     virtual ~DarwinHostServices() = default;
@@ -301,6 +352,26 @@ public:
     [[nodiscard]] virtual HostTerminalResult terminal_status(std::int32_t fd) {
         static_cast<void>(fd);
         return {0, 0, 0, 0, kDarwinErrnoEbadf};
+    }
+
+    // Describe the seek state of guest descriptor fd for lseek(2): the open
+    // file description's current offset and the file size, or EBADF for an
+    // unknown descriptor and ESPIPE for one that cannot seek. Hosts that do
+    // not override this expose no seekable descriptors and report EBADF,
+    // never a fabricated offset.
+    [[nodiscard]] virtual HostSeekResult seek_status(std::int32_t fd) {
+        static_cast<void>(fd);
+        return {0, 0, 0, false, kDarwinErrnoEbadf};
+    }
+
+    // Commit offset as descriptor fd's new file offset for lseek(2). The
+    // dispatcher calls this only after XNU's whence arithmetic and range
+    // checks pass. On error the offset stays unchanged. Hosts that do not
+    // override this report EBADF, never a fabricated success.
+    [[nodiscard]] virtual HostSetOffsetResult set_offset(std::int32_t fd, std::int64_t offset) {
+        static_cast<void>(fd);
+        static_cast<void>(offset);
+        return {kDarwinErrnoEbadf};
     }
 };
 

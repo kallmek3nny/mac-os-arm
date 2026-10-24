@@ -813,6 +813,96 @@ void set_error(CpuState& state, std::uint32_t error) noexcept {
     return finish();
 }
 
+// XNU bsd/vfs/vfs_syscalls.c: lseek(fd, offset, whence) resolves the
+// descriptor first (EBADF), refuses a pipe, socket, FIFO or terminal
+// (ESPIPE), and only then checks whence (EINVAL). The new offset uses
+// XNU's wrapping off_t arithmetic: a positive request whose result wraps
+// negative is EOVERFLOW, and any other negative result is EINVAL except
+// on a character device. The host commits nothing until every check
+// passes, so a failed lseek never moves the descriptor's offset.
+[[nodiscard]] SyscallDispatchResult dispatch_lseek(
+    CpuState& state,
+    DarwinHostServices& host,
+    std::uint64_t syscall_number) {
+
+    const auto finish = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    };
+    // off_t addition as XNU performs it: two's-complement wrap, never UB.
+    const auto wrapping_add = [](std::int64_t lhs, std::int64_t rhs) {
+        return static_cast<std::int64_t>(
+            static_cast<std::uint64_t>(lhs) + static_cast<std::uint64_t>(rhs));
+    };
+
+    const auto fd = static_cast<std::int32_t>(static_cast<std::uint32_t>(state.x[0]));
+    const auto requested = static_cast<std::int64_t>(state.x[1]);
+    const auto whence = static_cast<std::uint32_t>(state.x[2]);
+    if (fd < 0) {
+        set_error(state, kDarwinErrnoEbadf);
+        return finish();
+    }
+    const HostSeekResult described = host.seek_status(fd);
+    if (!described) {
+        set_error(state, described.error);
+        return finish();
+    }
+    // A known size is never negative, and only a character device may
+    // already sit at a negative offset.
+    if ((described.size_error == 0 && described.size < 0) ||
+        (described.offset < 0 && !described.character_device)) {
+        return SyscallDispatchResult{
+            SyscallDispatchError::host_contract_violation,
+            SyscallAction::resume, syscall_number, 0};
+    }
+
+    std::int64_t offset = requested;
+    std::uint32_t error = 0;
+    switch (whence) {
+    case kDarwinSeekCur:
+        offset = wrapping_add(offset, described.offset);
+        break;
+    case kDarwinSeekEnd:
+        if (described.size_error != 0) {
+            error = described.size_error;
+            break;
+        }
+        offset = wrapping_add(offset, described.size);
+        break;
+    case kDarwinSeekSet:
+        break;
+    case kDarwinSeekHole:
+    case kDarwinSeekData:
+        // XNU asks the filesystem through VNOP_IOCTL(FSIOC_FIOSEEKHOLE or
+        // FSIOC_FIOSEEKDATA). Hole maps are not modeled, so, like a vnode
+        // whose filesystem lacks those requests, the query fails with
+        // ENOTTY rather than reporting a fabricated hole layout.
+        error = kDarwinErrnoEnotty;
+        break;
+    default:
+        error = kDarwinErrnoEinval;
+        break;
+    }
+    if (error == 0) {
+        if (requested > 0 && offset < 0) {
+            error = kDarwinErrnoEoverflow;
+        } else if (offset < 0 && !described.character_device) {
+            error = kDarwinErrnoEinval;
+        }
+    }
+    if (error != 0) {
+        set_error(state, error);
+        return finish();
+    }
+    const HostSetOffsetResult committed = host.set_offset(fd, offset);
+    if (!committed) {
+        set_error(state, committed.error);
+        return finish();
+    }
+    set_success(state, static_cast<std::uint64_t>(offset));
+    return finish();
+}
+
 // XNU bsd/dev/random/randomdev.c: getentropy(buffer, size) rejects sizes
 // above its 256-byte kernel buffer with EINVAL (OpenBSD compatibility),
 // fills that buffer from the kernel CSPRNG, then copies it out (EFAULT).
@@ -1151,6 +1241,14 @@ SyscallDispatchResult dispatch_darwin_syscall(
         // TIOCGETA; terminal state comes only from the host's view of the
         // guest descriptor and the dispatcher encodes every record itself.
         return dispatch_ioctl(state, address_space, host, syscall_number);
+    case kDarwinSysLseek:
+        // XNU syscalls.master #199: off_t lseek(int fd, off_t offset, int whence).
+        // libSystem's lseek(3) traps here, and stdio's fseeko(3), ftello(3) and
+        // rewind(3) reach it through __sseek. arm64 passes the whole off_t in
+        // x1 and returns the new offset in x0. The current offset and size
+        // come only from the host's view of the guest descriptor; the
+        // dispatcher applies XNU's whence arithmetic and range checks itself.
+        return dispatch_lseek(state, host, syscall_number);
     case kDarwinSysGetentropy:
         // XNU syscalls.master #500: int getentropy(void *buffer, size_t size).
         // libSystem seeds arc4random and malloc/stack guards from it; bytes

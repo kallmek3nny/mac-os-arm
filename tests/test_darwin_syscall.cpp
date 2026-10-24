@@ -504,6 +504,85 @@ macosarm::SyscallDispatchResult run_ioctl(
     return macosarm::dispatch_darwin_syscall(state, vm, svc(), host);
 }
 
+// One committed lseek(2) offset, recorded in call order.
+struct SeekCommit {
+    std::int32_t fd{};
+    std::int64_t offset{};
+};
+
+// Scripted seek state for lseek(2). file_fd is a regular file at the
+// scripted offset and size, device_fd a character device whose offset may
+// go negative, pipe_fd cannot seek (ESPIPE), and every other descriptor
+// reports EBADF. Every host call is recorded so tests can prove negative
+// descriptors never reach the host and a failed check commits nothing.
+struct SeekHost final : macosarm::DarwinHostServices {
+    std::int32_t file_fd{3};
+    std::int32_t device_fd{4};
+    std::int32_t pipe_fd{5};
+    std::int64_t file_offset{0x100};
+    std::int64_t file_size{0x1000};
+    std::uint32_t size_error{0};
+    std::int64_t device_offset{0};
+    std::uint32_t commit_error{0};
+    std::vector<std::int32_t> requests;
+    std::vector<SeekCommit> commits;
+
+    macosarm::HostWriteResult write(
+        std::int32_t fd,
+        std::span<const std::byte> bytes) override {
+        static_cast<void>(fd);
+        static_cast<void>(bytes);
+        return {0, macosarm::kDarwinErrnoEbadf};
+    }
+
+    macosarm::HostSeekResult seek_status(std::int32_t fd) override {
+        requests.push_back(fd);
+        if (fd == file_fd) {
+            return {file_offset, file_size, size_error, false, 0};
+        }
+        if (fd == device_fd) {
+            return {device_offset, 0, 0, true, 0};
+        }
+        if (fd == pipe_fd) {
+            return {0, 0, 0, false, macosarm::kDarwinErrnoEspipe};
+        }
+        return {0, 0, 0, false, macosarm::kDarwinErrnoEbadf};
+    }
+
+    macosarm::HostSetOffsetResult set_offset(std::int32_t fd, std::int64_t offset) override {
+        commits.push_back({fd, offset});
+        if (commit_error != 0) {
+            return {commit_error};
+        }
+        if (fd == file_fd) {
+            file_offset = offset;
+            return {0};
+        }
+        if (fd == device_fd) {
+            device_offset = offset;
+            return {0};
+        }
+        return {macosarm::kDarwinErrnoEbadf};
+    }
+};
+
+macosarm::SyscallDispatchResult run_lseek(
+    macosarm::GuestAddressSpace& vm,
+    macosarm::DarwinHostServices& host,
+    macosarm::CpuState& state,
+    std::uint64_t fd_register,
+    std::uint64_t offset_register,
+    std::uint64_t whence_register) {
+    state = {};
+    state.x[0] = fd_register;
+    state.x[1] = offset_register;
+    state.x[2] = whence_register;
+    state.x[16] = macosarm::kDarwinSysLseek;
+    // Preset carry so every success test proves the dispatcher clears it.
+    state.pstate = macosarm::kA64PstateCarry;
+    return macosarm::dispatch_darwin_syscall(state, vm, svc(), host);
+}
+
 } // namespace
 
 int main() {
@@ -2650,6 +2729,134 @@ int main() {
                        ioctl_sentinel_from(vm, 0),
                    "unrecognized ioctl requests reach the device and write nothing");
         }
+    }
+
+    // An lseek failure reports its errno in x0 with carry set.
+    const auto failed_with = [](const macosarm::CpuState& cpu, std::uint32_t error) {
+        return cpu.x[0] == error && carry_is_set(cpu);
+    };
+
+    {
+        // lseek(2) on a regular file: SEEK_SET, SEEK_CUR and SEEK_END return the
+        // new offset in x0 with carry clear and commit it once each. Only w0
+        // names the descriptor and only w2 the whence value.
+        macosarm::GuestAddressSpace vm;
+        SeekHost host;
+        macosarm::CpuState state{};
+        const auto from_set = run_lseek(vm, host, state, 3U, 0x40U, macosarm::kDarwinSeekSet);
+        expect(static_cast<bool>(from_set) && !carry_is_set(state) && state.x[0] == 0x40U,
+               "lseek SEEK_SET returns the requested offset");
+        const auto from_cur = run_lseek(vm, host, state, 3U,
+                                        static_cast<std::uint64_t>(std::int64_t{-0x10}),
+                                        macosarm::kDarwinSeekCur);
+        expect(static_cast<bool>(from_cur) && !carry_is_set(state) && state.x[0] == 0x30U,
+               "lseek SEEK_CUR adds a negative delta to the current offset");
+        constexpr std::uint64_t high = std::uint64_t{1} << 32U;
+        const auto from_end = run_lseek(vm, host, state, high | 3U, 0x20U,
+                                        high | macosarm::kDarwinSeekEnd);
+        expect(static_cast<bool>(from_end) && !carry_is_set(state) && state.x[0] == 0x1020U,
+               "lseek SEEK_END adds to the size and ignores upper fd and whence bits");
+        expect(host.commits.size() == 3U && host.commits[0].offset == 0x40 &&
+                   host.commits[1].offset == 0x30 && host.commits[2].fd == 3 &&
+                   host.commits[2].offset == 0x1020 && host.file_offset == 0x1020,
+               "lseek commits each successful offset exactly once");
+    }
+
+    {
+        // Descriptor checks come first: a negative fd never reaches the host,
+        // an unknown fd is EBADF and a pipe is ESPIPE whatever whence says.
+        // Then an unknown whence is EINVAL, and SEEK_HOLE and SEEK_DATA report
+        // ENOTTY because hole maps are not modeled. None of them commit.
+        macosarm::GuestAddressSpace vm;
+        SeekHost host;
+        macosarm::CpuState state{};
+        static_cast<void>(run_lseek(vm, host, state, 0xffffffffU, 0U, macosarm::kDarwinSeekSet));
+        expect(failed_with(state, macosarm::kDarwinErrnoEbadf) && host.requests.empty(),
+               "lseek on a negative fd reports EBADF without querying the host");
+        static_cast<void>(run_lseek(vm, host, state, 7U, 0U, macosarm::kDarwinSeekSet));
+        expect(failed_with(state, macosarm::kDarwinErrnoEbadf), "lseek on an unknown fd reports EBADF");
+        static_cast<void>(run_lseek(vm, host, state, 5U, 0U, 9U));
+        expect(failed_with(state, macosarm::kDarwinErrnoEspipe),
+               "lseek on a pipe reports ESPIPE before validating whence");
+        static_cast<void>(run_lseek(vm, host, state, 3U, 0U, 9U));
+        expect(failed_with(state, macosarm::kDarwinErrnoEinval),
+               "lseek with an unknown whence reports EINVAL");
+        static_cast<void>(run_lseek(vm, host, state, 3U, 0U, macosarm::kDarwinSeekHole));
+        const bool hole = failed_with(state, macosarm::kDarwinErrnoEnotty);
+        static_cast<void>(run_lseek(vm, host, state, 3U, 0U, macosarm::kDarwinSeekData));
+        expect(hole && failed_with(state, macosarm::kDarwinErrnoEnotty),
+               "lseek SEEK_HOLE and SEEK_DATA report ENOTTY");
+        expect(host.requests == std::vector<std::int32_t>{7, 5, 3, 3, 3} &&
+                   host.commits.empty() && host.file_offset == 0x100,
+               "rejected lseek requests resolve the fd once each and commit nothing");
+    }
+
+    {
+        // XNU's wrapping off_t arithmetic: a positive request that wraps
+        // negative is EOVERFLOW, any other negative result on a regular file
+        // is EINVAL, and an unknown size fails SEEK_END with the host's error.
+        macosarm::GuestAddressSpace vm;
+        SeekHost host;
+        macosarm::CpuState state{};
+        static_cast<void>(run_lseek(vm, host, state, 3U, 0x7fffffffffffffffULL,
+                                    macosarm::kDarwinSeekCur));
+        expect(failed_with(state, macosarm::kDarwinErrnoEoverflow),
+               "lseek SEEK_CUR past the off_t maximum reports EOVERFLOW");
+        static_cast<void>(run_lseek(vm, host, state, 3U,
+                                    static_cast<std::uint64_t>(std::int64_t{-0x200}),
+                                    macosarm::kDarwinSeekCur));
+        expect(failed_with(state, macosarm::kDarwinErrnoEinval),
+               "lseek SEEK_CUR before the start of a regular file reports EINVAL");
+        static_cast<void>(run_lseek(vm, host, state, 3U,
+                                    static_cast<std::uint64_t>(std::int64_t{-1}),
+                                    macosarm::kDarwinSeekSet));
+        expect(failed_with(state, macosarm::kDarwinErrnoEinval),
+               "lseek SEEK_SET to a negative offset on a regular file reports EINVAL");
+        host.size_error = macosarm::kDarwinErrnoEio;
+        static_cast<void>(run_lseek(vm, host, state, 3U, 0U, macosarm::kDarwinSeekEnd));
+        expect(failed_with(state, macosarm::kDarwinErrnoEio),
+               "lseek SEEK_END with an unknown size reports the host size error");
+        expect(host.commits.empty() && host.file_offset == 0x100,
+               "out-of-range lseek requests leave the offset unchanged");
+        const auto still_set = run_lseek(vm, host, state, 3U, 0x80U, macosarm::kDarwinSeekSet);
+        expect(static_cast<bool>(still_set) && !carry_is_set(state) && state.x[0] == 0x80U,
+               "an unknown size fails only SEEK_END");
+    }
+
+    {
+        // A character device may seek to a negative offset, yet a positive
+        // request that wraps is still EOVERFLOW. A failed host commit is
+        // reported as-is, and a negative size, or a negative offset on
+        // anything but a character device, violates the host contract.
+        macosarm::GuestAddressSpace vm;
+        SeekHost host;
+        macosarm::CpuState state{};
+        const auto negative = run_lseek(vm, host, state, 4U,
+                                        static_cast<std::uint64_t>(std::int64_t{-8}),
+                                        macosarm::kDarwinSeekSet);
+        expect(static_cast<bool>(negative) && !carry_is_set(state) &&
+                   state.x[0] == static_cast<std::uint64_t>(std::int64_t{-8}) &&
+                   host.device_offset == -8,
+               "lseek moves a character device to a negative offset");
+        host.device_offset = 1;
+        static_cast<void>(run_lseek(vm, host, state, 4U, 0x7fffffffffffffffULL,
+                                    macosarm::kDarwinSeekCur));
+        expect(failed_with(state, macosarm::kDarwinErrnoEoverflow) && host.device_offset == 1,
+               "lseek on a character device still reports EOVERFLOW on wrap");
+        host.commit_error = macosarm::kDarwinErrnoEio;
+        static_cast<void>(run_lseek(vm, host, state, 3U, 0x10U, macosarm::kDarwinSeekSet));
+        expect(failed_with(state, macosarm::kDarwinErrnoEio) && host.file_offset == 0x100,
+               "a failed lseek commit reports the host error and keeps the offset");
+        host.commit_error = 0;
+        host.file_offset = -1;
+        const auto bad_offset = run_lseek(vm, host, state, 3U, 0U, macosarm::kDarwinSeekSet);
+        host.file_offset = 0x100;
+        host.file_size = -1;
+        const auto bad_size = run_lseek(vm, host, state, 3U, 0U, macosarm::kDarwinSeekSet);
+        expect(bad_offset.error == macosarm::SyscallDispatchError::host_contract_violation &&
+                   bad_size.error == macosarm::SyscallDispatchError::host_contract_violation,
+               "lseek rejects a negative regular-file offset or size from the host");
+        expect(host.commits.size() == 2U, "lseek commits only after every check passes");
     }
 
     if (failures != 0) {
