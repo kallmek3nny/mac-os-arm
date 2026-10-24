@@ -1319,6 +1319,83 @@ void set_error(CpuState& state, std::uint32_t error) noexcept {
     return finish();
 }
 
+// XNU bsd/kern/kern_resource.c: setrlimit(which, rlp) copies the 16-byte
+// LP64 struct rlimit { rlim_t rlim_cur; rlim_t rlim_max; } in first, so a bad
+// rlp is EFAULT whatever which is. dosetrlimit then strips
+// _RLIMIT_POSIX_FLAG from the u_int which (only w0 counts) and reports
+// EINVAL for a resource at or above RLIM_NLIMITS before it snapshots the
+// current limits. A new soft limit above the new hard limit is EINVAL;
+// otherwise raising either limit above the snapshot's hard limit needs
+// suser(), which the synthetic non-root user never passes, so it is EPERM.
+// The snapshot comes from the host's resource_limit and is held to the
+// getrlimit contract: a host error is reported as is, and an inverted or
+// out-of-range snapshot is a host contract violation. Only a request that
+// passes every check reaches set_resource_limit, whose error is reported as
+// is. Success returns 0 in x0 and nothing is copied back out.
+[[nodiscard]] SyscallDispatchResult dispatch_setrlimit(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    DarwinHostServices& host,
+    std::uint64_t syscall_number) {
+
+    const auto finish = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    };
+    const auto fail = [&](std::uint32_t error) {
+        set_error(state, error);
+        return finish();
+    };
+
+    // { rlim_t rlim_cur; rlim_t rlim_max; }, each a little-endian uint64.
+    std::array<std::byte, kDarwinRlimitSize> limit_record{};
+    if (!address_space.read(state.x[1], std::span<std::byte>(limit_record))) {
+        return fail(kDarwinErrnoEfault);
+    }
+    std::uint64_t new_soft = 0;
+    std::uint64_t new_hard = 0;
+    for (std::size_t i = 0; i < 8U; ++i) {
+        new_soft |= static_cast<std::uint64_t>(
+                        std::to_integer<unsigned char>(limit_record[i]))
+                    << (8U * i);
+        new_hard |= static_cast<std::uint64_t>(
+                        std::to_integer<unsigned char>(limit_record[8U + i]))
+                    << (8U * i);
+    }
+
+    const std::uint32_t resource =
+        static_cast<std::uint32_t>(state.x[0]) & ~kDarwinRlimitPosixFlag;
+    if (resource >= kDarwinRlimNlimits) {
+        return fail(kDarwinErrnoEinval);
+    }
+
+    const HostResourceLimitResult current = host.resource_limit(resource);
+    if (!current) {
+        return fail(current.error);
+    }
+    if (current.soft_limit > current.hard_limit ||
+        current.hard_limit > kDarwinRlimInfinity) {
+        return SyscallDispatchResult{
+            SyscallDispatchError::host_contract_violation,
+            SyscallAction::resume, syscall_number, 0};
+    }
+
+    if (new_soft > new_hard) {
+        return fail(kDarwinErrnoEinval);
+    }
+    if (new_soft > current.hard_limit || new_hard > current.hard_limit) {
+        return fail(kDarwinErrnoEperm);
+    }
+
+    const HostSetResourceLimitResult committed =
+        host.set_resource_limit(resource, new_soft, new_hard);
+    if (!committed) {
+        return fail(committed.error);
+    }
+    set_success(state, 0U);
+    return finish();
+}
+
 // XNU bsd/kern/kern_time.c: gettimeofday(tp, tzp, mach_absolute_time)
 // samples the clock only when tp or mach_absolute_time is requested, then
 // copies out a 64-bit timeval (tv_sec cast through uint32_t to match the
@@ -1652,6 +1729,14 @@ SyscallDispatchResult dispatch_darwin_syscall(
         // from it; limits come only from the host's view of the translated
         // process, and the dispatcher encodes the LP64 struct rlimit itself.
         return dispatch_getrlimit(state, address_space, host, syscall_number);
+    case kDarwinSysSetrlimit:
+        // XNU syscalls.master #195: int setrlimit(u_int which, struct rlimit
+        // *rlp). libSystem's setrlimit(3) traps here; programs commonly lower
+        // RLIMIT_CORE or raise the soft RLIMIT_NOFILE through it. The
+        // dispatcher copies the LP64 struct rlimit in and applies XNU's
+        // EINVAL and EPERM checks against the host's current limits; only a
+        // request that passes them reaches the host.
+        return dispatch_setrlimit(state, address_space, host, syscall_number);
     case kDarwinSysClose:
     case kDarwinSysCloseNocancel: {
         // XNU bsd/kern/kern_descrip.c: close_nocancel rejects a descriptor

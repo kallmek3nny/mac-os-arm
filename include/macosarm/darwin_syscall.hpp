@@ -157,6 +157,17 @@ constexpr std::uint32_t kDarwinRlimitNofile = 8;         // RLIMIT_NOFILE
 constexpr std::uint32_t kDarwinRlimNlimits = 9;          // RLIM_NLIMITS
 constexpr std::uint64_t kDarwinRlimInfinity = (std::uint64_t{1} << 63U) - 1U; // RLIM_INFINITY
 constexpr std::size_t kDarwinRlimitSize = 16;            // LP64 struct rlimit
+// XNU syscalls.master #195: int setrlimit(u_int which, struct rlimit *rlp).
+// setrlimit in bsd/kern/kern_resource.c copies the 16-byte LP64 struct
+// rlimit in before anything else, so a bad rlp is EFAULT whatever which is.
+// dosetrlimit then strips _RLIMIT_POSIX_FLAG from the u_int which (only w0
+// counts) and reports EINVAL for a resource at or above RLIM_NLIMITS. Against
+// a snapshot of the current limits, a new soft limit above the new hard limit
+// is EINVAL, and raising either limit above the current hard limit needs
+// suser(), which the synthetic non-root user never passes, so it is EPERM.
+// Only a request that passes every check reaches the host, which applies any
+// resource-specific effect and commits the limits as proc_limitupdate does.
+constexpr std::uint64_t kDarwinSysSetrlimit = 195;
 // XNU syscalls.master #92: int fcntl(int fd, int cmd, long arg), and #406
 // fcntl_nocancel with the same argument and error contract; only the
 // pthread cancellation point differs. fd and cmd are ints, so only w0 and
@@ -202,6 +213,7 @@ constexpr std::uint32_t kDarwinOpenExec = 0x40000000;   // O_EXEC
 constexpr std::uint32_t kDarwinFcntlSettableFlags =
     kDarwinOpenNonblock | kDarwinOpenAppend | kDarwinOpenAsync | kDarwinOpenFsync |
     kDarwinOpenDsync;
+constexpr std::uint32_t kDarwinErrnoEperm = 1;
 constexpr std::uint32_t kDarwinErrnoEio = 5;
 constexpr std::uint32_t kDarwinErrnoEnxio = 6;
 constexpr std::uint32_t kDarwinErrnoEbadf = 9;
@@ -283,6 +295,20 @@ struct HostWallClockResult {
 struct HostResourceLimitResult {
     std::uint64_t soft_limit{};
     std::uint64_t hard_limit{};
+    std::uint32_t error{};
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return error == 0;
+    }
+};
+
+// Outcome of committing new soft and hard limits for one resource of the
+// translated process for setrlimit(2), as dosetrlimit's resource-specific
+// step and proc_limitupdate do together. The dispatcher has already checked
+// the request against the current limits, so the host only reports a failure
+// of the resource-specific effect (for example growing the stack mapping for
+// RLIMIT_STACK). On error the previous limits stay in effect.
+struct HostSetResourceLimitResult {
     std::uint32_t error{};
 
     [[nodiscard]] explicit operator bool() const noexcept {
@@ -505,6 +531,27 @@ public:
     [[nodiscard]] virtual HostResourceLimitResult resource_limit(std::uint32_t resource) {
         static_cast<void>(resource);
         return {0, 0, kDarwinErrnoEnosys};
+    }
+
+    // Commit new soft and hard limits for resource for setrlimit(2), applying
+    // any resource-specific effect as dosetrlimit does before
+    // proc_limitupdate. The dispatcher calls this only after it has stripped
+    // _RLIMIT_POSIX_FLAG, rejected resources at or above kDarwinRlimNlimits,
+    // read the current limits through resource_limit and checked the request
+    // against them (EPERM for raising either limit above the current hard
+    // limit, then EINVAL for a soft limit above the new hard limit), so
+    // soft_limit never exceeds hard_limit and hard_limit never exceeds
+    // kDarwinRlimInfinity. On error the previous limits stay in effect. Hosts
+    // that do not override this have no limits to change and return ENOSYS,
+    // never a fabricated success.
+    [[nodiscard]] virtual HostSetResourceLimitResult set_resource_limit(
+        std::uint32_t resource,
+        std::uint64_t soft_limit,
+        std::uint64_t hard_limit) {
+        static_cast<void>(resource);
+        static_cast<void>(soft_limit);
+        static_cast<void>(hard_limit);
+        return {kDarwinErrnoEnosys};
     }
 
     // Describe guest descriptor fd for fstat64(2). The host reports only

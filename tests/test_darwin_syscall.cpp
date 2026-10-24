@@ -328,7 +328,63 @@ struct LimitHost final : macosarm::DarwinHostServices {
         }
         return {soft_limit, hard_limit, 0};
     }
+
+    // setrlimit(2) commits, recorded as (resource, soft, hard) so tests can
+    // prove rejected requests never reach the host. A successful commit
+    // replaces the scripted limits so a later getrlimit sees the new values.
+    struct Commit {
+        std::uint32_t resource{};
+        std::uint64_t soft{};
+        std::uint64_t hard{};
+
+        bool operator==(const Commit&) const = default;
+    };
+    std::vector<Commit> commits;
+    std::uint32_t commit_error{};
+
+    macosarm::HostSetResourceLimitResult set_resource_limit(
+        std::uint32_t resource,
+        std::uint64_t soft,
+        std::uint64_t hard) override {
+        commits.push_back({resource, soft, hard});
+        if (commit_error != 0) {
+            const std::uint32_t error = commit_error;
+            commit_error = 0;
+            return {error};
+        }
+        soft_limit = soft;
+        hard_limit = hard;
+        return {};
+    }
 };
+
+// Store a little-endian LP64 struct rlimit { rlim_cur; rlim_max; } at address.
+bool write_guest_rlimit(macosarm::GuestAddressSpace& vm,
+                        std::uint64_t address,
+                        std::uint64_t soft,
+                        std::uint64_t hard) {
+    std::vector<std::byte> bytes(macosarm::kDarwinRlimitSize);
+    for (std::size_t i = 0; i < 8U; ++i) {
+        bytes[i] = static_cast<std::byte>((soft >> (8U * i)) & 0xffU);
+        bytes[8U + i] = static_cast<std::byte>((hard >> (8U * i)) & 0xffU);
+    }
+    return static_cast<bool>(vm.load_bytes(address, bytes));
+}
+
+macosarm::SyscallDispatchResult run_setrlimit(
+    macosarm::GuestAddressSpace& vm,
+    macosarm::DarwinHostServices& host,
+    macosarm::CpuState& state,
+    std::uint64_t which,
+    std::uint64_t limit_address) {
+    state = {};
+    state.x[0] = which;
+    state.x[1] = limit_address;
+    state.x[16] = macosarm::kDarwinSysSetrlimit;
+    // Preset carry so every success test proves the dispatcher clears it.
+    state.pstate = macosarm::kA64PstateCarry;
+    return macosarm::dispatch_darwin_syscall(state, vm, svc(), host);
+}
 
 macosarm::SyscallDispatchResult run_getrlimit(
     macosarm::GuestAddressSpace& vm,
@@ -2841,6 +2897,284 @@ int main() {
                        state.x[0] == macosarm::kDarwinErrnoEnosys && carry_is_set(state) &&
                        clock_sentinel_at(vm, kClockBase, kClockPage),
                    "the default host reports ENOSYS for getrlimit");
+        }
+    }
+
+    {
+        // setrlimit(2): XNU syscalls.master #195. The struct rlimit is copied
+        // in first, so a bad rlp is EFAULT whatever which is. Only w0 selects
+        // the resource and _RLIMIT_POSIX_FLAG is stripped before the host is
+        // asked. The synthetic non-root guest may lower either limit but never
+        // raise one above the current hard limit, and nothing is copied out.
+        constexpr std::uint64_t limit_buffer = kClockBase;
+        constexpr std::uint64_t limit_unmapped = 0xdead00000000ULL;
+        const auto limit_rw = macosarm::Protection::read | macosarm::Protection::write;
+        using Commit = LimitHost::Commit;
+
+        {
+            macosarm::GuestAddressSpace vm;
+            map_clock_page(vm, limit_rw);
+            LimitHost host;
+            host.soft_limit = 256U;
+            host.hard_limit = 10240U;
+            macosarm::CpuState state{};
+            expect(write_guest_rlimit(vm, limit_buffer, 1024U, 10240U), "setrlimit request stores");
+            const auto result =
+                run_setrlimit(vm, host, state, macosarm::kDarwinRlimitNofile, limit_buffer);
+            std::uint64_t soft = 0;
+            std::uint64_t hard = 0;
+            expect(static_cast<bool>(result) &&
+                       result.action == macosarm::SyscallAction::resume &&
+                       result.syscall_number == macosarm::kDarwinSysSetrlimit &&
+                       state.x[0] == 0U && !carry_is_set(state) &&
+                       host.queries == std::vector<std::uint32_t>{macosarm::kDarwinRlimitNofile} &&
+                       host.commits ==
+                           std::vector<Commit>{Commit{macosarm::kDarwinRlimitNofile, 1024U, 10240U}} &&
+                       read_guest_le(vm, limit_buffer, 8U, soft) && soft == 1024U &&
+                       read_guest_le(vm, limit_buffer + 8U, 8U, hard) && hard == 10240U &&
+                       clock_sentinel_at(vm, limit_buffer + macosarm::kDarwinRlimitSize,
+                                         kClockPage - macosarm::kDarwinRlimitSize),
+                   "setrlimit raises the soft limit within the hard limit and copies nothing out");
+
+            const auto readback = run_getrlimit(vm, host, state, macosarm::kDarwinRlimitNofile,
+                                                limit_buffer + macosarm::kDarwinRlimitSize);
+            expect(static_cast<bool>(readback) && state.x[0] == 0U && !carry_is_set(state) &&
+                       read_guest_le(vm, limit_buffer + macosarm::kDarwinRlimitSize, 8U, soft) &&
+                       soft == 1024U &&
+                       read_guest_le(vm, limit_buffer + macosarm::kDarwinRlimitSize + 8U, 8U,
+                                     hard) &&
+                       hard == 10240U,
+                   "getrlimit reports the limits a successful setrlimit committed");
+
+            host.queries.clear();
+            host.commits.clear();
+            expect(write_guest_rlimit(vm, limit_buffer, 512U, 2048U), "setrlimit request stores");
+            const std::uint64_t which = 0xffffffff00000000ULL |
+                                        macosarm::kDarwinRlimitPosixFlag |
+                                        macosarm::kDarwinRlimitNofile;
+            const auto lowered = run_setrlimit(vm, host, state, which, limit_buffer);
+            expect(static_cast<bool>(lowered) && state.x[0] == 0U && !carry_is_set(state) &&
+                       host.queries == std::vector<std::uint32_t>{macosarm::kDarwinRlimitNofile} &&
+                       host.commits ==
+                           std::vector<Commit>{Commit{macosarm::kDarwinRlimitNofile, 512U, 2048U}},
+                   "setrlimit ignores the upper half of x0, strips _RLIMIT_POSIX_FLAG and "
+                   "lowers the hard limit");
+
+            host.queries.clear();
+            host.commits.clear();
+            expect(write_guest_rlimit(vm, limit_buffer, 512U, 10240U), "setrlimit request stores");
+            const auto raised =
+                run_setrlimit(vm, host, state, macosarm::kDarwinRlimitNofile, limit_buffer);
+            expect(static_cast<bool>(raised) && state.x[0] == macosarm::kDarwinErrnoEperm &&
+                       carry_is_set(state) &&
+                       host.queries == std::vector<std::uint32_t>{macosarm::kDarwinRlimitNofile} &&
+                       host.commits.empty() && host.soft_limit == 512U && host.hard_limit == 2048U,
+                   "a lowered hard limit can never be raised again by the non-root guest");
+        }
+
+        {
+            // The copyin comes first: a bad rlp faults even for an out-of-range
+            // resource. Neither a fault nor an out-of-range resource reaches
+            // the host.
+            macosarm::GuestAddressSpace vm;
+            map_clock_page(vm, limit_rw);
+            LimitHost host;
+            macosarm::CpuState state{};
+            const auto unmapped =
+                run_setrlimit(vm, host, state, macosarm::kDarwinRlimitCore, limit_unmapped);
+            const bool unmapped_faults = static_cast<bool>(unmapped) &&
+                                         state.x[0] == macosarm::kDarwinErrnoEfault &&
+                                         carry_is_set(state);
+            const auto past_end_unmapped =
+                run_setrlimit(vm, host, state, macosarm::kDarwinRlimNlimits, limit_unmapped);
+            const bool past_end_faults = static_cast<bool>(past_end_unmapped) &&
+                                         state.x[0] == macosarm::kDarwinErrnoEfault &&
+                                         carry_is_set(state);
+            const auto crossing = run_setrlimit(vm, host, state, macosarm::kDarwinRlimitCore,
+                                                kClockBase + kClockPage - 8U);
+            expect(unmapped_faults && past_end_faults && static_cast<bool>(crossing) &&
+                       state.x[0] == macosarm::kDarwinErrnoEfault && carry_is_set(state) &&
+                       host.queries.empty() && host.commits.empty(),
+                   "an unmapped or page-crossing struct rlimit faults before EINVAL "
+                   "or any host query");
+
+            expect(write_guest_rlimit(vm, limit_buffer, 0U, 0U), "setrlimit request stores");
+            const auto past_end =
+                run_setrlimit(vm, host, state, macosarm::kDarwinRlimNlimits, limit_buffer);
+            const bool past_end_rejected = static_cast<bool>(past_end) &&
+                                           state.x[0] == macosarm::kDarwinErrnoEinval &&
+                                           carry_is_set(state);
+            const auto flagged = run_setrlimit(
+                vm, host, state, macosarm::kDarwinRlimitPosixFlag | macosarm::kDarwinRlimNlimits,
+                limit_buffer);
+            expect(past_end_rejected && static_cast<bool>(flagged) &&
+                       state.x[0] == macosarm::kDarwinErrnoEinval && carry_is_set(state) &&
+                       host.queries.empty() && host.commits.empty(),
+                   "resources at or above RLIM_NLIMITS report EINVAL without a host query");
+        }
+
+        {
+            // Every request that copies in and names a valid resource is
+            // checked against one snapshot of the current limits: an inverted
+            // request is EINVAL even when it would also raise the hard limit,
+            // and raising either limit above the current hard limit is EPERM.
+            // No rejected request commits anything.
+            struct Rejection {
+                std::uint64_t soft;
+                std::uint64_t hard;
+                std::uint32_t error;
+            };
+            const std::array<Rejection, 4> rejections{{
+                {2048U, 1024U, macosarm::kDarwinErrnoEinval},
+                {8192U, 4096U, macosarm::kDarwinErrnoEinval},
+                {8192U, 8192U, macosarm::kDarwinErrnoEperm},
+                {256U, 8192U, macosarm::kDarwinErrnoEperm},
+            }};
+            for (const Rejection& rejection : rejections) {
+                macosarm::GuestAddressSpace vm;
+                map_clock_page(vm, limit_rw);
+                LimitHost host;
+                host.soft_limit = 256U;
+                host.hard_limit = 4096U;
+                macosarm::CpuState state{};
+                expect(write_guest_rlimit(vm, limit_buffer, rejection.soft, rejection.hard),
+                       "setrlimit request stores");
+                const auto rejected =
+                    run_setrlimit(vm, host, state, macosarm::kDarwinRlimitNofile, limit_buffer);
+                expect(static_cast<bool>(rejected) && state.x[0] == rejection.error &&
+                           carry_is_set(state) &&
+                           host.queries ==
+                               std::vector<std::uint32_t>{macosarm::kDarwinRlimitNofile} &&
+                           host.commits.empty() && host.soft_limit == 256U &&
+                           host.hard_limit == 4096U,
+                       "setrlimit rejects inverted requests with EINVAL and raised limits "
+                       "with EPERM");
+            }
+
+            macosarm::GuestAddressSpace vm;
+            map_clock_page(vm, limit_rw);
+            LimitHost host;
+            host.soft_limit = 256U;
+            host.hard_limit = 4096U;
+            macosarm::CpuState state{};
+            expect(write_guest_rlimit(vm, limit_buffer, 4096U, 4096U), "setrlimit request stores");
+            const auto at_hard =
+                run_setrlimit(vm, host, state, macosarm::kDarwinRlimitNofile, limit_buffer);
+            const bool at_hard_accepted =
+                static_cast<bool>(at_hard) && state.x[0] == 0U && !carry_is_set(state) &&
+                host.commits ==
+                    std::vector<Commit>{Commit{macosarm::kDarwinRlimitNofile, 4096U, 4096U}};
+
+            host.soft_limit = macosarm::kDarwinRlimInfinity;
+            host.hard_limit = macosarm::kDarwinRlimInfinity;
+            host.commits.clear();
+            expect(write_guest_rlimit(vm, limit_buffer, macosarm::kDarwinRlimInfinity,
+                                      macosarm::kDarwinRlimInfinity),
+                   "setrlimit request stores");
+            const auto unlimited =
+                run_setrlimit(vm, host, state, macosarm::kDarwinRlimitCpu, limit_buffer);
+            expect(at_hard_accepted && static_cast<bool>(unlimited) && state.x[0] == 0U &&
+                       !carry_is_set(state) &&
+                       host.commits == std::vector<Commit>{Commit{macosarm::kDarwinRlimitCpu,
+                                                                  macosarm::kDarwinRlimInfinity,
+                                                                  macosarm::kDarwinRlimInfinity}},
+                   "setrlimit accepts limits equal to the current hard limit, including "
+                   "RLIM_INFINITY");
+        }
+
+        {
+            // A host error from the current-limits snapshot or from the commit
+            // is reported as is, and a failed commit keeps the previous limits.
+            macosarm::GuestAddressSpace vm;
+            map_clock_page(vm, limit_rw);
+            LimitHost host;
+            host.soft_limit = 256U;
+            host.hard_limit = 4096U;
+            host.next_error = macosarm::kDarwinErrnoEio;
+            macosarm::CpuState state{};
+            expect(write_guest_rlimit(vm, limit_buffer, 512U, 4096U), "setrlimit request stores");
+            const auto snapshot_failed =
+                run_setrlimit(vm, host, state, macosarm::kDarwinRlimitNofile, limit_buffer);
+            const bool snapshot_error_reported =
+                static_cast<bool>(snapshot_failed) && state.x[0] == macosarm::kDarwinErrnoEio &&
+                carry_is_set(state) && host.queries.size() == 1U && host.commits.empty();
+
+            host.queries.clear();
+            host.commit_error = macosarm::kDarwinErrnoEio;
+            const auto commit_failed =
+                run_setrlimit(vm, host, state, macosarm::kDarwinRlimitNofile, limit_buffer);
+            expect(snapshot_error_reported && static_cast<bool>(commit_failed) &&
+                       state.x[0] == macosarm::kDarwinErrnoEio && carry_is_set(state) &&
+                       host.queries == std::vector<std::uint32_t>{macosarm::kDarwinRlimitNofile} &&
+                       host.commits ==
+                           std::vector<Commit>{Commit{macosarm::kDarwinRlimitNofile, 512U, 4096U}} &&
+                       host.soft_limit == 256U && host.hard_limit == 4096U,
+                   "host snapshot and commit errors are reported as is and keep the previous "
+                   "limits");
+        }
+
+        {
+            // An inverted or out-of-range current-limits snapshot is a host
+            // contract violation, and nothing is committed.
+            struct Violation {
+                std::uint64_t soft;
+                std::uint64_t hard;
+            };
+            const std::array<Violation, 2> violations{{
+                {512U, 256U},
+                {macosarm::kDarwinRlimInfinity, ~std::uint64_t{0}},
+            }};
+            for (const Violation& violation : violations) {
+                macosarm::GuestAddressSpace vm;
+                map_clock_page(vm, limit_rw);
+                LimitHost host;
+                host.soft_limit = violation.soft;
+                host.hard_limit = violation.hard;
+                macosarm::CpuState state{};
+                expect(write_guest_rlimit(vm, limit_buffer, 0U, 0U), "setrlimit request stores");
+                const auto violated =
+                    run_setrlimit(vm, host, state, macosarm::kDarwinRlimitNofile, limit_buffer);
+                expect(violated.error == macosarm::SyscallDispatchError::host_contract_violation &&
+                           host.queries.size() == 1U && host.commits.empty(),
+                       "setrlimit rejects an inverted or out-of-range current-limits snapshot");
+            }
+        }
+
+        {
+            // A host that cannot report limits fails with ENOSYS before any
+            // commit, and a host that reports limits but cannot change them
+            // reports ENOSYS from the commit: never a fabricated success.
+            struct NoLimitHost final : macosarm::DarwinHostServices {
+                macosarm::HostWriteResult write(std::int32_t,
+                                                std::span<const std::byte>) override {
+                    return {0, macosarm::kDarwinErrnoEbadf};
+                }
+            };
+            struct FixedLimitHost final : macosarm::DarwinHostServices {
+                macosarm::HostWriteResult write(std::int32_t,
+                                                std::span<const std::byte>) override {
+                    return {0, macosarm::kDarwinErrnoEbadf};
+                }
+                macosarm::HostResourceLimitResult resource_limit(std::uint32_t) override {
+                    return {256U, 4096U, 0};
+                }
+            };
+            macosarm::GuestAddressSpace vm;
+            map_clock_page(vm, limit_rw);
+            expect(write_guest_rlimit(vm, limit_buffer, 128U, 4096U), "setrlimit request stores");
+            NoLimitHost no_limits;
+            macosarm::CpuState state{};
+            const auto unreported =
+                run_setrlimit(vm, no_limits, state, macosarm::kDarwinRlimitNofile, limit_buffer);
+            const bool unreported_enosys = static_cast<bool>(unreported) &&
+                                           state.x[0] == macosarm::kDarwinErrnoEnosys &&
+                                           carry_is_set(state);
+            FixedLimitHost fixed_limits;
+            const auto unchangeable =
+                run_setrlimit(vm, fixed_limits, state, macosarm::kDarwinRlimitNofile, limit_buffer);
+            expect(unreported_enosys && static_cast<bool>(unchangeable) &&
+                       state.x[0] == macosarm::kDarwinErrnoEnosys && carry_is_set(state),
+                   "default hosts report ENOSYS for setrlimit");
         }
     }
 
