@@ -81,6 +81,17 @@ constexpr std::uint64_t kDarwinIoctlFiogetown = 0x4004667b; // _IOR('f', 123, in
 constexpr std::uint64_t kDarwinIoctlFiosetown = 0x8004667c; // _IOW('f', 124, int)
 constexpr std::uint64_t kDarwinIoctlFioasync = 0x8004667d;  // _IOW('f', 125, int)
 constexpr std::uint64_t kDarwinIoctlFionbio = 0x8004667e;   // _IOW('f', 126, int)
+// XNU syscalls.master #121: user_ssize_t writev(int fd, struct iovec *iovp,
+// u_int iovcnt). #412 writev_nocancel shares its argument and error
+// contract; only the pthread cancellation point differs. iovcnt is a u_int,
+// so only w2 counts, and it must lie in [1, UIO_MAXIOV] (bsd/sys/uio.h).
+// Each LP64 struct iovec is a 16-byte {iov_base, iov_len} pair. After the
+// descriptor resolves, no iov_len and no running total of them may exceed
+// SSIZE_MAX (uio_calculateresid_user in bsd/kern/kern_subr.c, EINVAL).
+constexpr std::uint64_t kDarwinSysWritev = 121;
+constexpr std::uint64_t kDarwinSysWritevNocancel = 412;
+constexpr std::uint32_t kDarwinIovMax = 1024; // UIO_MAXIOV
+constexpr std::size_t kDarwinIovecSize = 16;
 constexpr std::uint32_t kDarwinErrnoEio = 5;
 constexpr std::uint32_t kDarwinErrnoEbadf = 9;
 constexpr std::uint32_t kDarwinErrnoEnomem = 12;

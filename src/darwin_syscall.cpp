@@ -88,6 +88,126 @@ void set_error(CpuState& state, std::uint32_t error) noexcept {
     return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
 }
 
+// XNU bsd/kern/sys_generic.c: writev_nocancel rejects iovcnt outside
+// [1, UIO_MAXIOV] (EINVAL) and copies the whole iovec array in (EFAULT),
+// then uio_calculateresid_user rejects any iov_len or running total above
+// SSIZE_MAX (EINVAL), all before fp_lookup resolves the descriptor (EBADF).
+// A zero-length host write resolves it without emitting bytes, so a bad
+// descriptor wins over a bad iov_base even when every vector is empty. The
+// vectors are then written in order and empty ones are skipped without
+// touching their bases. Like this dispatcher's write(2), a short host write
+// ends the call, and a later fault or host error reports the bytes already
+// written; an error is reported only when none were.
+[[nodiscard]] SyscallDispatchResult dispatch_writev(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    DarwinHostServices& host,
+    std::uint64_t syscall_number) {
+
+    static_assert(kDarwinIovecSize == 16U, "LP64 struct iovec is 16 bytes");
+    const auto finish = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    };
+    const auto fail = [&](std::uint32_t error) {
+        set_error(state, error);
+        return finish();
+    };
+    const auto contract_violation = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::host_contract_violation,
+            SyscallAction::resume, syscall_number, 0};
+    };
+
+    const auto fd = static_cast<std::int32_t>(static_cast<std::uint32_t>(state.x[0]));
+    const std::uint64_t vector_address = state.x[1];
+    const auto count = static_cast<std::uint32_t>(state.x[2]);
+    if (count == 0U || count > kDarwinIovMax) {
+        return fail(kDarwinErrnoEinval);
+    }
+
+    std::array<std::byte, kDarwinIovMax * kDarwinIovecSize> vectors{};
+    const std::size_t vector_bytes = static_cast<std::size_t>(count) * kDarwinIovecSize;
+    if (!address_space.read(vector_address, std::span<std::byte>(vectors.data(), vector_bytes))) {
+        return fail(kDarwinErrnoEfault);
+    }
+    // Little-endian { iov_base, iov_len } fields of the vector at index.
+    const auto field = [&](std::size_t index, std::size_t offset) {
+        std::uint64_t value = 0;
+        for (std::size_t i = 0; i < sizeof(std::uint64_t); ++i) {
+            value |= static_cast<std::uint64_t>(std::to_integer<unsigned char>(
+                         vectors[index * kDarwinIovecSize + offset + i]))
+                     << (8U * i);
+        }
+        return value;
+    };
+
+    constexpr auto ssize_max =
+        static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+    std::uint64_t total = 0;
+    for (std::size_t index = 0; index < count; ++index) {
+        const std::uint64_t length = field(index, 8U);
+        if (length > ssize_max - total) {
+            return fail(kDarwinErrnoEinval);
+        }
+        total += length;
+    }
+
+    if (fd < 0) {
+        return fail(kDarwinErrnoEbadf);
+    }
+    const HostWriteResult probe = host.write(fd, std::span<const std::byte>{});
+    if (probe.bytes_written != 0U) {
+        return contract_violation();
+    }
+    if (!probe) {
+        return fail(probe.error);
+    }
+
+    std::uint64_t total_written = 0;
+    const auto stop = [&](std::uint32_t error) {
+        if (total_written == 0U) {
+            set_error(state, error);
+        } else {
+            set_success(state, total_written);
+        }
+        return finish();
+    };
+    std::array<std::byte, kIoChunkSize> chunk{};
+    for (std::size_t index = 0; index < count; ++index) {
+        std::uint64_t guest_address = field(index, 0U);
+        std::uint64_t remaining = field(index, 8U);
+        while (remaining != 0U) {
+            const auto requested = static_cast<std::size_t>(
+                std::min<std::uint64_t>(remaining, chunk.size()));
+            if (!address_space.read(guest_address, std::span<std::byte>(chunk.data(), requested))) {
+                return stop(kDarwinErrnoEfault);
+            }
+            const HostWriteResult written = host.write(
+                fd, std::span<const std::byte>(chunk.data(), requested));
+            if (!written) {
+                return stop(written.error);
+            }
+            if (written.bytes_written > requested) {
+                return contract_violation();
+            }
+            total_written += written.bytes_written;
+            if (written.bytes_written != requested) {
+                set_success(state, total_written);
+                return finish();
+            }
+            remaining -= requested;
+            if (remaining != 0U &&
+                guest_address > std::numeric_limits<std::uint64_t>::max() - requested) {
+                return stop(kDarwinErrnoEfault);
+            }
+            guest_address += requested;
+        }
+    }
+    set_success(state, total_written);
+    return finish();
+}
+
 // XNU bsd/kern/sys_generic.c: read_nocancel resolves the descriptor (EBADF)
 // before dofileread rejects nbyte > INT_MAX (EINVAL) or copyout faults
 // (EFAULT). A read may legally return fewer bytes than requested, so issue
@@ -876,6 +996,13 @@ SyscallDispatchResult dispatch_darwin_syscall(
     case kDarwinSysWriteNocancel:
         // XNU syscalls.master #397 write_nocancel likewise aliases write.
         return dispatch_write(state, address_space, host, syscall_number);
+    case kDarwinSysWritev:
+    case kDarwinSysWritevNocancel:
+        // XNU syscalls.master #121 writev / #412 writev_nocancel gather the
+        // guest's iovec array; each vector reaches the host only through the
+        // same bounded write path, in order. No guest pthread can be
+        // cancelled yet, so both entry points share one handler.
+        return dispatch_writev(state, address_space, host, syscall_number);
     case kDarwinSysMmap:
         return dispatch_mmap(state, address_space, syscall_number);
     case kDarwinSysMprotect:

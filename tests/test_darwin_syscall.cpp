@@ -1708,6 +1708,119 @@ int main() {
     }
 
     {
+        // XNU syscalls.master #121 writev / #412 writev_nocancel validate the
+        // whole LP64 iovec array before resolving the descriptor, then write
+        // each vector in order through the bounded host write path.
+        constexpr std::uint64_t data_base = 0xB00000000ULL;
+        constexpr std::uint64_t vector_ok = 0xC00000000ULL;
+        constexpr std::uint64_t vector_overflow = 0xC00100000ULL;
+        constexpr std::uint64_t vector_bad_base = 0xC00200000ULL;
+        constexpr std::uint64_t vector_partial = 0xC00300000ULL;
+        constexpr std::uint64_t unmapped_base = 0xD00000000ULL;
+        constexpr std::uint64_t bad_fd = 0xffffffffULL;
+        const auto encode = [](const std::vector<std::uint64_t>& fields) {
+            std::vector<std::byte> bytes;
+            for (const std::uint64_t value : fields) {
+                for (std::size_t i = 0; i < sizeof(std::uint64_t); ++i) {
+                    bytes.push_back(static_cast<std::byte>((value >> (8U * i)) & 0xffU));
+                }
+            }
+            return bytes;
+        };
+        const auto run_writev = [](macosarm::GuestAddressSpace& space, CaptureHost& target,
+                                   std::uint64_t number, std::uint64_t fd,
+                                   std::uint64_t vectors, std::uint64_t count,
+                                   macosarm::CpuState& cpu) {
+            cpu = {};
+            cpu.pstate = macosarm::kA64PstateCarry;
+            cpu.x[16] = number;
+            cpu.x[0] = fd;
+            cpu.x[1] = vectors;
+            cpu.x[2] = count;
+            return macosarm::dispatch_darwin_syscall(cpu, space, svc(), target);
+        };
+        const auto writev_failed = [](const macosarm::SyscallDispatchResult& outcome,
+                                      const macosarm::CpuState& cpu, std::uint32_t error) {
+            return static_cast<bool>(outcome) && carry_is_set(cpu) && cpu.x[0] == error;
+        };
+
+        macosarm::GuestAddressSpace vm;
+        const std::vector<std::byte> data{std::byte{'a'}, std::byte{'b'}, std::byte{'c'},
+                                          std::byte{'d'}, std::byte{'e'}, std::byte{'f'}};
+        load_readable(vm, data_base, data);
+        load_readable(vm, vector_ok, encode({data_base, 2U, 0U, 0U, data_base + 2U, 4U}));
+        load_readable(vm, vector_overflow,
+                      encode({data_base, 0x7fffffffffffffffULL, data_base, 1U}));
+        load_readable(vm, vector_bad_base, encode({unmapped_base, 1U}));
+        load_readable(vm, vector_partial, encode({data_base, 2U, unmapped_base, 1U}));
+        macosarm::CpuState state{};
+
+        CaptureHost host;
+        const auto gathered =
+            run_writev(vm, host, macosarm::kDarwinSysWritev, 1U, vector_ok, 3U, state);
+        expect(static_cast<bool>(gathered) && !carry_is_set(state) &&
+                   state.x[0] == data.size() &&
+                   gathered.syscall_number == macosarm::kDarwinSysWritev &&
+                   host.captured == data && host.fds == std::vector<std::int32_t>{1, 1, 1},
+               "writev writes vectors in order and skips empty ones");
+
+        CaptureHost nocancel_host;
+        const auto nocancel = run_writev(
+            vm, nocancel_host, macosarm::kDarwinSysWritevNocancel, 2U, vector_ok, 3U, state);
+        expect(static_cast<bool>(nocancel) && !carry_is_set(state) &&
+                   state.x[0] == data.size() &&
+                   nocancel.syscall_number == macosarm::kDarwinSysWritevNocancel &&
+                   nocancel_host.captured == data &&
+                   nocancel_host.fds == std::vector<std::int32_t>{2, 2, 2},
+               "writev_nocancel gathers vectors like writev");
+
+        CaptureHost idle;
+        const auto no_vectors =
+            run_writev(vm, idle, macosarm::kDarwinSysWritev, 1U, vector_ok, 0U, state);
+        expect(writev_failed(no_vectors, state, macosarm::kDarwinErrnoEinval),
+               "writev with no vectors is EINVAL");
+        const auto too_many = run_writev(vm, idle, macosarm::kDarwinSysWritev, 1U, vector_ok,
+                                         macosarm::kDarwinIovMax + 1U, state);
+        expect(writev_failed(too_many, state, macosarm::kDarwinErrnoEinval),
+               "writev above UIO_MAXIOV vectors is EINVAL");
+        const auto unreadable =
+            run_writev(vm, idle, macosarm::kDarwinSysWritev, 1U, unmapped_base, 1U, state);
+        expect(writev_failed(unreadable, state, macosarm::kDarwinErrnoEfault),
+               "writev with an unmapped iovec array is EFAULT");
+        const auto oversized =
+            run_writev(vm, idle, macosarm::kDarwinSysWritev, bad_fd, vector_overflow, 2U, state);
+        expect(writev_failed(oversized, state, macosarm::kDarwinErrnoEinval),
+               "writev total above SSIZE_MAX is EINVAL before descriptor checks");
+        const auto negative =
+            run_writev(vm, idle, macosarm::kDarwinSysWritev, bad_fd, vector_bad_base, 1U, state);
+        expect(writev_failed(negative, state, macosarm::kDarwinErrnoEbadf) && idle.fds.empty(),
+               "writev argument errors and negative descriptors never reach the host");
+
+        CaptureHost closed;
+        closed.next_error = macosarm::kDarwinErrnoEbadf;
+        const auto bad_descriptor =
+            run_writev(vm, closed, macosarm::kDarwinSysWritev, 5U, vector_bad_base, 1U, state);
+        expect(writev_failed(bad_descriptor, state, macosarm::kDarwinErrnoEbadf) &&
+                   closed.fds == std::vector<std::int32_t>{5} && closed.captured.empty(),
+               "bad writev descriptor wins over an unmapped iov_base");
+        const auto bad_base =
+            run_writev(vm, closed, macosarm::kDarwinSysWritev, 1U, vector_bad_base, 1U, state);
+        expect(writev_failed(bad_base, state, macosarm::kDarwinErrnoEfault) &&
+                   closed.fds == std::vector<std::int32_t>{5, 1} && closed.captured.empty(),
+               "unmapped iov_base with nothing written is EFAULT");
+        const auto partial =
+            run_writev(vm, closed, macosarm::kDarwinSysWritev, 1U, vector_partial, 2U, state);
+        expect(static_cast<bool>(partial) && !carry_is_set(state) && state.x[0] == 2U &&
+                   closed.captured == std::vector<std::byte>{data[0], data[1]},
+               "writev reports bytes written before a later fault");
+        closed.violate_contract = true;
+        const auto violated =
+            run_writev(vm, closed, macosarm::kDarwinSysWritev, 1U, vector_ok, 3U, state);
+        expect(violated.error == macosarm::SyscallDispatchError::host_contract_violation,
+               "nonzero writev descriptor probe count is rejected");
+    }
+
+    {
         // XNU bsd/kern/kern_time.c gettimeofday: a 64-bit process receives a
         // 16-byte struct user64_timeval { int64 tv_sec; int32 tv_usec; } with
         // zeroed tail padding and an 8-byte struct timezone. Success returns 0
