@@ -519,6 +519,22 @@ if(BUILD_TESTING)
                 -DEXPECTED_EXIT=78
                 "-DEXPECTED_STDOUT="
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
+
+        # getdtablesize(2) end to end: the call reports the soft RLIMIT_NOFILE
+        # limit, and macho-run enforces no descriptor limit, so it fails with
+        # ENOSYS (78) exactly as getrlimit(RLIMIT_NOFILE) does. The guest exits
+        # with that errno and writes nothing; a getdtablesize that succeeds
+        # exits 100, so no table size can pass for the errno.
+        add_test(
+            NAME macho-run-getdtablesize
+            COMMAND "${CMAKE_COMMAND}"
+                "-DFIXTURE_TOOL=$<TARGET_FILE:macho_run_fixture>"
+                "-DRUNNER=$<TARGET_FILE:macho-run>"
+                -DKIND=getdtablesize
+                "-DIMAGE=${CMAKE_CURRENT_BINARY_DIR}/macho-run-getdtablesize.bin"
+                -DEXPECTED_EXIT=78
+                "-DEXPECTED_STDOUT="
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
     endif()
 endif()
 

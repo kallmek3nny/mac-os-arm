@@ -610,11 +610,27 @@ constexpr std::array<std::uint32_t, 81> kSetrlimitStackCode{
     0xd4001001U, // svc #0x80
 };
 
+// getdtablesize(); exit(errno). getdtablesize(2) reports the soft
+// RLIMIT_NOFILE limit, and macho-run enforces no descriptor limit, so the
+// call fails with ENOSYS (78) exactly as getrlimit(RLIMIT_NOFILE) does and a
+// correct host exits 78. A getdtablesize that succeeds exits 100, so no table
+// size can pass for the errno.
+constexpr std::array<std::uint32_t, 8> kGetdtablesizeCode{
+    0xd2800b30U, // mov x16, #89 (getdtablesize)
+    0xd4001001U, // svc #0x80
+    0x54000063U, // b.cc succeeded (+12)
+    0xd2800030U, // mov x16, #1 (exit) -> exit(errno of getdtablesize)
+    0xd4001001U, // svc #0x80
+    0xd2800c80U, // succeeded: mov x0, #100
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+};
+
 int usage() {
     std::cerr << "usage: macho_run_fixture "
                  "<hello|argc|echo|close-stdout|fstat-stdin|ioctl-stdin|writev-stdout|"
                  "readv-stdin|lseek-stdin|pread-stdin|fcntl-stdio|fcntl-setfl-stdio|"
-                 "getrlimit-stack|setrlimit-stack> "
+                 "getrlimit-stack|setrlimit-stack|getdtablesize> "
                  "<output-path>\n";
     return 2;
 }
@@ -655,6 +671,8 @@ int main(int argc, char** argv) {
         bytes = image(kGetrlimitStackCode);
     } else if (kind == "setrlimit-stack") {
         bytes = image(kSetrlimitStackCode);
+    } else if (kind == "getdtablesize") {
+        bytes = image(kGetdtablesizeCode);
     } else {
         return usage();
     }
