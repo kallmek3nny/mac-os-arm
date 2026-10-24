@@ -515,11 +515,106 @@ constexpr std::array<std::uint32_t, 32> kGetrlimitStackCode{
     0xd4001001U, // svc #0x80
 };
 
+// getrlimit(RLIMIT_STACK, sp); setrlimit(RLIMIT_STACK, sp) to restate, lower
+// and raise the limit; getrlimit(RLIMIT_STACK, sp) again;
+// setrlimit(RLIMIT_NOFILE, sp); exit(errno). macho-run reports its fixed 8 MiB
+// main-thread stack mapping as both RLIMIT_STACK limits, so restating them
+// succeeds. Lowering the soft limit to 4 MiB fails with EINVAL (22) because
+// the mapping cannot shrink, and raising both limits to 16 MiB fails with
+// EPERM (1) because the synthetic user is not root. Neither failure changes
+// the limits, so the second getrlimit still reports 8 MiB for both.
+// RLIMIT_NOFILE is not enforced, so it fails with ENOSYS (78) and a correct
+// host exits 78. Every other outcome has its own status from 100 to 108. The
+// struct rlimit lands in 16 bytes reserved below the startup stack pointer.
+constexpr std::array<std::uint32_t, 81> kSetrlimitStackCode{
+    0xd10043ffU, // sub sp, sp, #16 (struct rlimit)
+    0xd2800060U, // mov x0, #3 (RLIMIT_STACK)
+    0x910003e1U, // mov x1, sp
+    0xd2801850U, // mov x16, #194 (getrlimit)
+    0xd4001001U, // svc #0x80
+    0x54000622U, // b.cs getrlimit_failed (+196)
+    0xa9402be9U, // ldp x9, x10, [sp] -> rlim_cur, rlim_max
+    0xd2a0100bU, // mov x11, #0x800000 (8 MiB)
+    0xeb0b013fU, // cmp x9, x11
+    0x54000601U, // b.ne wrong_limits (+192)
+    0xeb0b015fU, // cmp x10, x11
+    0x540005c1U, // b.ne wrong_limits (+184)
+    0xd2800060U, // mov x0, #3 (RLIMIT_STACK)
+    0x910003e1U, // mov x1, sp -> { 8 MiB, 8 MiB }
+    0xd2801870U, // mov x16, #195 (setrlimit)
+    0xd4001001U, // svc #0x80
+    0x54000582U, // b.cs restate_failed (+176)
+    0xb5000560U, // cbnz x0, restate_failed (+172)
+    0xd2a0080cU, // mov x12, #0x400000 (4 MiB)
+    0xf90003ecU, // str x12, [sp] -> { 4 MiB, 8 MiB }
+    0xd2800060U, // mov x0, #3 (RLIMIT_STACK)
+    0x910003e1U, // mov x1, sp
+    0xd2801870U, // mov x16, #195 (setrlimit)
+    0xd4001001U, // svc #0x80
+    0x540004e3U, // b.cc lower_succeeded (+156)
+    0xf100581fU, // cmp x0, #22 (EINVAL)
+    0x54000501U, // b.ne lower_wrong_errno (+160)
+    0xd2a0200dU, // mov x13, #0x1000000 (16 MiB)
+    0xa90037edU, // stp x13, x13, [sp] -> { 16 MiB, 16 MiB }
+    0xd2800060U, // mov x0, #3 (RLIMIT_STACK)
+    0x910003e1U, // mov x1, sp
+    0xd2801870U, // mov x16, #195 (setrlimit)
+    0xd4001001U, // svc #0x80
+    0x54000483U, // b.cc raise_succeeded (+144)
+    0xf100041fU, // cmp x0, #1 (EPERM)
+    0x540004a1U, // b.ne raise_wrong_errno (+148)
+    0xd2800060U, // mov x0, #3 (RLIMIT_STACK)
+    0x910003e1U, // mov x1, sp
+    0xd2801850U, // mov x16, #194 (getrlimit)
+    0xd4001001U, // svc #0x80
+    0x540001c2U, // b.cs getrlimit_failed (+56)
+    0xa9402be9U, // ldp x9, x10, [sp] -> rlim_cur, rlim_max
+    0xd2a0100bU, // mov x11, #0x800000 (8 MiB)
+    0xeb0b013fU, // cmp x9, x11
+    0x540003e1U, // b.ne limits_changed (+124)
+    0xeb0b015fU, // cmp x10, x11
+    0x540003a1U, // b.ne limits_changed (+116)
+    0xd2800100U, // mov x0, #8 (RLIMIT_NOFILE)
+    0x910003e1U, // mov x1, sp
+    0xd2801870U, // mov x16, #195 (setrlimit)
+    0xd4001001U, // svc #0x80
+    0x54000363U, // b.cc nofile_succeeded (+108)
+    0xd2800030U, // mov x16, #1 (exit) -> exit(errno of RLIMIT_NOFILE)
+    0xd4001001U, // svc #0x80
+    0xd2800c80U, // getrlimit_failed: mov x0, #100
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800ca0U, // wrong_limits: mov x0, #101
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800cc0U, // restate_failed: mov x0, #102
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800ce0U, // lower_succeeded: mov x0, #103
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800d00U, // lower_wrong_errno: mov x0, #104
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800d20U, // raise_succeeded: mov x0, #105
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800d40U, // raise_wrong_errno: mov x0, #106
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800d60U, // limits_changed: mov x0, #107
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800d80U, // nofile_succeeded: mov x0, #108
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+};
+
 int usage() {
     std::cerr << "usage: macho_run_fixture "
                  "<hello|argc|echo|close-stdout|fstat-stdin|ioctl-stdin|writev-stdout|"
                  "readv-stdin|lseek-stdin|pread-stdin|fcntl-stdio|fcntl-setfl-stdio|"
-                 "getrlimit-stack> "
+                 "getrlimit-stack|setrlimit-stack> "
                  "<output-path>\n";
     return 2;
 }
@@ -558,6 +653,8 @@ int main(int argc, char** argv) {
         bytes = image(kFcntlSetflStdioCode);
     } else if (kind == "getrlimit-stack") {
         bytes = image(kGetrlimitStackCode);
+    } else if (kind == "setrlimit-stack") {
+        bytes = image(kSetrlimitStackCode);
     } else {
         return usage();
     }

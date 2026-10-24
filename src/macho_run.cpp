@@ -709,6 +709,32 @@ public:
         }
         return {0, 0, kGuestErrnoEnosys};
     }
+
+    // setrlimit(2) changes only a limit the session really imposes. The
+    // dispatcher has already refused raising either RLIMIT_STACK limit above
+    // the fixed main-thread stack mapping with EPERM, so a request reaching
+    // here either restates that limit or lowers it. Restating it changes
+    // nothing and succeeds. Lowering it would need the stack beyond the new
+    // soft limit made inaccessible, as XNU's dosetrlimit protects it, and the
+    // session's mapping cannot shrink, so the request reports EINVAL as XNU
+    // does when the stack protection cannot change, and the previous limits
+    // stay in effect. No other resource is enforced, so each reports ENOSYS,
+    // matching getrlimit(2).
+    macosarm::HostSetResourceLimitResult set_resource_limit(
+        std::uint32_t resource,
+        std::uint64_t soft_limit,
+        std::uint64_t hard_limit) override {
+        if (resource != macosarm::kDarwinRlimitStack) {
+            return {kGuestErrnoEnosys};
+        }
+        const std::uint64_t limit = stack_size_ < macosarm::kDarwinRlimInfinity
+                                        ? stack_size_
+                                        : macosarm::kDarwinRlimInfinity;
+        if (soft_limit != limit || hard_limit != limit) {
+            return {macosarm::kDarwinErrnoEinval};
+        }
+        return {0};
+    }
 };
 
 int usage() {

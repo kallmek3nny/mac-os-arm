@@ -502,6 +502,23 @@ if(BUILD_TESTING)
                 -DEXPECTED_EXIT=78
                 "-DEXPECTED_STDOUT="
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
+
+        # setrlimit(2) end to end: restating macho-run's fixed 8 MiB RLIMIT_STACK
+        # limits succeeds, lowering the soft limit fails with EINVAL because the
+        # main-thread stack mapping cannot shrink, and raising both limits fails
+        # with EPERM because the synthetic user is not root. Neither failure
+        # changes the limits. RLIMIT_NOFILE fails with ENOSYS (78), so the guest
+        # exits 78 and writes nothing; every other outcome exits from 100 to 108.
+        add_test(
+            NAME macho-run-setrlimit-stack
+            COMMAND "${CMAKE_COMMAND}"
+                "-DFIXTURE_TOOL=$<TARGET_FILE:macho_run_fixture>"
+                "-DRUNNER=$<TARGET_FILE:macho-run>"
+                -DKIND=setrlimit-stack
+                "-DIMAGE=${CMAKE_CURRENT_BINARY_DIR}/macho-run-setrlimit-stack.bin"
+                -DEXPECTED_EXIT=78
+                "-DEXPECTED_STDOUT="
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
     endif()
 endif()
 
