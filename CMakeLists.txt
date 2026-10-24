@@ -486,6 +486,22 @@ if(BUILD_TESTING)
                 -DEXPECTED_EXIT=109
                 "-DEXPECTED_STDOUT="
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
+
+        # getrlimit(2) end to end: RLIMIT_STACK reports macho-run's fixed 8 MiB
+        # main-thread stack mapping as both the soft and the hard limit, while
+        # RLIMIT_NOFILE fails with ENOSYS (78) because macho-run enforces no
+        # descriptor limit. The guest exits with that errno and writes nothing;
+        # every other outcome exits with its own status from 100 to 103.
+        add_test(
+            NAME macho-run-getrlimit-stack
+            COMMAND "${CMAKE_COMMAND}"
+                "-DFIXTURE_TOOL=$<TARGET_FILE:macho_run_fixture>"
+                "-DRUNNER=$<TARGET_FILE:macho-run>"
+                -DKIND=getrlimit-stack
+                "-DIMAGE=${CMAKE_CURRENT_BINARY_DIR}/macho-run-getrlimit-stack.bin"
+                -DEXPECTED_EXIT=78
+                "-DEXPECTED_STDOUT="
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
     endif()
 endif()
 

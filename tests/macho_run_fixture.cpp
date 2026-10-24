@@ -472,10 +472,54 @@ constexpr std::array<std::uint32_t, 45> kFcntlSetflStdioCode{
     0xd4001001U, // svc #0x80
 };
 
+// getrlimit(RLIMIT_STACK, sp); getrlimit(RLIMIT_NOFILE, sp); exit(errno).
+// macho-run reports its fixed 8 MiB main-thread stack mapping as both the
+// soft and the hard RLIMIT_STACK limit, and enforces no descriptor limit, so
+// RLIMIT_NOFILE fails with ENOSYS (78) and a correct host exits 78. Every
+// other outcome has its own status from 100 to 103: a failed or nonzero
+// RLIMIT_STACK query, a soft limit that differs from the hard limit, a stack
+// limit other than 8 MiB, and an RLIMIT_NOFILE query that succeeds. The
+// struct rlimit lands in 16 bytes reserved below the startup stack pointer.
+constexpr std::array<std::uint32_t, 32> kGetrlimitStackCode{
+    0xd10043ffU, // sub sp, sp, #16 (struct rlimit)
+    0xd2800060U, // mov x0, #3 (RLIMIT_STACK)
+    0x910003e1U, // mov x1, sp
+    0xd2801850U, // mov x16, #194 (getrlimit)
+    0xd4001001U, // svc #0x80
+    0x540001e2U, // b.cs stack_failed (+60)
+    0xb50001c0U, // cbnz x0, stack_failed (+56)
+    0xa9402be9U, // ldp x9, x10, [sp] -> rlim_cur, rlim_max
+    0xeb0a013fU, // cmp x9, x10
+    0x540001c1U, // b.ne limits_differ (+56)
+    0xd2a0100bU, // mov x11, #0x800000 (8 MiB)
+    0xeb0b013fU, // cmp x9, x11
+    0x540001c1U, // b.ne wrong_stack_limit (+56)
+    0xd2800100U, // mov x0, #8 (RLIMIT_NOFILE)
+    0x910003e1U, // mov x1, sp
+    0xd2801850U, // mov x16, #194 (getrlimit)
+    0xd4001001U, // svc #0x80
+    0x54000183U, // b.cc nofile_succeeded (+48)
+    0xd2800030U, // mov x16, #1 (exit) -> exit(errno of RLIMIT_NOFILE)
+    0xd4001001U, // svc #0x80
+    0xd2800c80U, // stack_failed: mov x0, #100
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800ca0U, // limits_differ: mov x0, #101
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800cc0U, // wrong_stack_limit: mov x0, #102
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800ce0U, // nofile_succeeded: mov x0, #103
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+};
+
 int usage() {
     std::cerr << "usage: macho_run_fixture "
                  "<hello|argc|echo|close-stdout|fstat-stdin|ioctl-stdin|writev-stdout|"
-                 "readv-stdin|lseek-stdin|pread-stdin|fcntl-stdio|fcntl-setfl-stdio> "
+                 "readv-stdin|lseek-stdin|pread-stdin|fcntl-stdio|fcntl-setfl-stdio|"
+                 "getrlimit-stack> "
                  "<output-path>\n";
     return 2;
 }
@@ -512,6 +556,8 @@ int main(int argc, char** argv) {
         bytes = image(kFcntlStdioCode);
     } else if (kind == "fcntl-setfl-stdio") {
         bytes = image(kFcntlSetflStdioCode);
+    } else if (kind == "getrlimit-stack") {
+        bytes = image(kGetrlimitStackCode);
     } else {
         return usage();
     }

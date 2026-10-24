@@ -46,6 +46,7 @@ constexpr std::uint32_t kGuestErrnoEbadf = 9;
 constexpr std::uint32_t kGuestErrnoEnotty = 25;
 constexpr std::uint32_t kGuestErrnoEspipe = 29;
 constexpr std::uint32_t kGuestErrnoEnotsup = 45;
+constexpr std::uint32_t kGuestErrnoEnosys = 78;
 
 // st_blksize reported for every guest standard descriptor. Darwin libc sizes
 // stdio buffers from it, so it must be positive; it describes no host file.
@@ -334,6 +335,10 @@ class ConsoleHost final : public macosarm::DarwinHostServices {
     // Bit n is set while guest descriptor n has its close-on-exec flag set. A
     // process inherits its standard descriptors without FD_CLOEXEC.
     unsigned close_on_exec_descriptors_ = 0U;
+    // Size in bytes of the main-thread stack the session maps for the guest.
+    // That mapping never grows, so getrlimit(2) RLIMIT_STACK reports it as
+    // both the soft and the hard limit.
+    std::uint64_t stack_size_;
 
     [[nodiscard]] bool is_open(std::int32_t fd) const noexcept {
         return fd >= 0 && fd <= 2 &&
@@ -341,6 +346,10 @@ class ConsoleHost final : public macosarm::DarwinHostServices {
     }
 
 public:
+    // stack_size must be the SessionConfig::stack_size the session maps, so
+    // the limit the guest reads describes its real stack.
+    explicit ConsoleHost(std::uint64_t stack_size) noexcept : stack_size_(stack_size) {}
+
     // close(2) releases only the guest's view of a standard descriptor; the
     // host's own streams stay open for macho-run diagnostics. A released or
     // unknown descriptor reports EBADF, so a second close never succeeds.
@@ -685,6 +694,21 @@ public:
         return {static_cast<std::int64_t>(whole.count()),
                 static_cast<std::uint32_t>(fraction.count()), 0};
     }
+
+    // getrlimit(2) reports only a limit the session really imposes on the
+    // guest. RLIMIT_STACK is the fixed main-thread stack mapping, reported as
+    // both the soft and the hard limit and capped at RLIM_INFINITY so the
+    // dispatcher's contract holds. No other resource is enforced, so each
+    // reports ENOSYS rather than a fabricated limit.
+    macosarm::HostResourceLimitResult resource_limit(std::uint32_t resource) override {
+        if (resource == macosarm::kDarwinRlimitStack) {
+            const std::uint64_t limit = stack_size_ < macosarm::kDarwinRlimInfinity
+                                            ? stack_size_
+                                            : macosarm::kDarwinRlimInfinity;
+            return {limit, limit, 0};
+        }
+        return {0, 0, kGuestErrnoEnosys};
+    }
 };
 
 int usage() {
@@ -729,10 +753,12 @@ int main(int argc, char** argv) {
     // The guest argv starts with the image path, like a native exec.
     const std::vector<std::string_view> arguments(argv + index, argv + argc);
     macosarm::DynarmicBackend backend;
-    ConsoleHost host;
     macosarm::SessionConfig config{};
     config.instruction_budget = budget;
     config.startup.arguments = std::span<const std::string_view>(arguments);
+    // The host reports RLIMIT_STACK from the very stack mapping the session
+    // creates, so it is built only after the session config is final.
+    ConsoleHost host(config.stack_size);
 
     const auto result = macosarm::run_macho_session(bytes, backend, host, config);
     if (!result) {
