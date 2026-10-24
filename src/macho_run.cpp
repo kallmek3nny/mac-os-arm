@@ -16,8 +16,10 @@
 
 // Host services: getentropy(2) reads only the host operating system's CSPRNG,
 // fstat64(2) asks the host only for a standard stream's file type, ioctl(2)
-// asks only whether a standard stream is a terminal and its size, and
-// lseek(2) asks only for a redirected standard stream's offset and file size.
+// asks only whether a standard stream is a terminal and its size, lseek(2)
+// asks only for a redirected standard stream's offset and file size, and
+// pread(2) and pwrite(2) reach only the regular file behind a redirected
+// standard stream.
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -28,6 +30,7 @@
 #include <windows.h>
 #include <bcrypt.h>
 #else
+#include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/random.h>
 #include <sys/stat.h>
@@ -38,6 +41,7 @@ namespace {
 
 // XNU bsd/sys/errno.h values reported to the guest, never host errno values.
 constexpr std::uint32_t kGuestErrnoEio = 5;
+constexpr std::uint32_t kGuestErrnoEnxio = 6;
 constexpr std::uint32_t kGuestErrnoEbadf = 9;
 constexpr std::uint32_t kGuestErrnoEnotty = 25;
 constexpr std::uint32_t kGuestErrnoEspipe = 29;
@@ -222,6 +226,104 @@ bool seek_host_stream(std::int32_t fd, std::int64_t offset) noexcept {
 #endif
 }
 
+#if defined(_WIN32)
+// A positioned ReadFile or WriteFile on a synchronous handle starts at the
+// OVERLAPPED offset but leaves the file pointer after the transfer, so the
+// helpers below save the pointer first and restore it afterwards.
+OVERLAPPED overlapped_at(std::int64_t offset) noexcept {
+    OVERLAPPED at{};
+    const auto position = static_cast<std::uint64_t>(offset);
+    at.Offset = static_cast<DWORD>(position & 0xffffffffULL);
+    at.OffsetHigh = static_cast<DWORD>(position >> 32U);
+    return at;
+}
+
+DWORD clamp_transfer(std::size_t size) noexcept {
+    return size < MAXDWORD ? static_cast<DWORD>(size) : MAXDWORD;
+}
+#endif
+
+// pread(2) and pwrite(2) for standard stream fd. Each moves at most
+// bytes.size() bytes at offset without moving the host descriptor's file
+// offset, so the host C stream, and any stdin bytes stdio has buffered,
+// resume exactly where the guest's read(2), write(2) and lseek(2) left
+// them. Each reports the bytes transferred, or -1 when the host refused the
+// transfer or could not restore its file pointer, never a guessed count.
+// Only offsets the dispatcher has already validated reach here, so a
+// negative one is refused outright.
+std::int64_t read_host_stream_at(
+    std::int32_t fd, std::span<std::byte> bytes, std::int64_t offset) noexcept {
+    if (fd != 0 || offset < 0) {
+        return -1;
+    }
+#if defined(_WIN32)
+    const HANDLE handle = ::GetStdHandle(STD_INPUT_HANDLE);
+    LARGE_INTEGER saved{};
+    if (handle == nullptr || handle == INVALID_HANDLE_VALUE ||
+        ::SetFilePointerEx(handle, LARGE_INTEGER{}, &saved, FILE_CURRENT) == 0) {
+        return -1;
+    }
+    OVERLAPPED at = overlapped_at(offset);
+    DWORD received = 0;
+    const bool succeeded =
+        ::ReadFile(handle, bytes.data(), clamp_transfer(bytes.size()), &received, &at) != 0;
+    // A read at or past end-of-file reports ERROR_HANDLE_EOF, which pread(2)
+    // sees as end-of-file rather than an error.
+    const bool at_end = !succeeded && ::GetLastError() == ERROR_HANDLE_EOF;
+    const bool restored = ::SetFilePointerEx(handle, saved, nullptr, FILE_BEGIN) != 0;
+    if ((!succeeded && !at_end) || !restored) {
+        return -1;
+    }
+    return at_end ? 0 : static_cast<std::int64_t>(received);
+#else
+    const ssize_t received =
+        ::pread(fd, bytes.data(), bytes.size(), static_cast<off_t>(offset));
+    return received < 0 ? -1 : static_cast<std::int64_t>(received);
+#endif
+}
+
+std::int64_t write_host_stream_at(
+    std::int32_t fd, std::span<const std::byte> bytes, std::int64_t offset) noexcept {
+    if ((fd != 1 && fd != 2) || offset < 0) {
+        return -1;
+    }
+    // Flush first so anything the host C stream still holds reaches the
+    // file ahead of this write, in the order the guest issued them.
+    if (std::fflush(host_stream(fd)) != 0) {
+        return -1;
+    }
+#if defined(_WIN32)
+    const HANDLE handle = ::GetStdHandle(fd == 1 ? STD_OUTPUT_HANDLE : STD_ERROR_HANDLE);
+    LARGE_INTEGER saved{};
+    if (handle == nullptr || handle == INVALID_HANDLE_VALUE ||
+        ::SetFilePointerEx(handle, LARGE_INTEGER{}, &saved, FILE_CURRENT) == 0) {
+        return -1;
+    }
+    OVERLAPPED at = overlapped_at(offset);
+    DWORD written = 0;
+    const bool succeeded =
+        ::WriteFile(handle, bytes.data(), clamp_transfer(bytes.size()), &written, &at) != 0;
+    const bool restored = ::SetFilePointerEx(handle, saved, nullptr, FILE_BEGIN) != 0;
+    if (!succeeded || !restored) {
+        return -1;
+    }
+    return static_cast<std::int64_t>(written);
+#else
+#if !defined(__APPLE__)
+    // XNU's vn_write ignores O_APPEND for pwrite(2), but Linux appends to an
+    // O_APPEND descriptor whatever the offset. Refuse rather than write
+    // somewhere the guest did not ask.
+    const int flags = ::fcntl(fd, F_GETFL);
+    if (flags < 0 || (flags & O_APPEND) != 0) {
+        return -1;
+    }
+#endif
+    const ssize_t written =
+        ::pwrite(fd, bytes.data(), bytes.size(), static_cast<off_t>(offset));
+    return written < 0 ? -1 : static_cast<std::int64_t>(written);
+#endif
+}
+
 // The guest's stdin, stdout and stderr reach the host's, as raw bytes. No
 // other descriptor exists in the translated process yet, so those report
 // EBADF, as does a standard descriptor after the guest has closed it.
@@ -331,6 +433,71 @@ public:
             return {kGuestErrnoEio};
         }
         return {0};
+    }
+
+    // pread(2) and pwrite(2) describe only a standard descriptor the guest
+    // still has open, and only in the direction the guest can use it: stdin
+    // is open just for reading and stdout and stderr just for writing, so the
+    // other direction reports EBADF, as preparefileread and preparefilewrite
+    // do. As valid_for_random_access refuses a FIFO or socket with ESPIPE and
+    // a terminal with ENXIO, so does a piped, socket-backed or console stream
+    // here; only a stream redirected from or to a file is accessed at an
+    // offset. A stream the host cannot classify reports EIO rather than a
+    // guessed type. As for lseek(2), no stream claims a character device's
+    // negative-offset allowance, so the dispatcher fails a negative offset
+    // with EINVAL before the host is asked to transfer anything.
+    macosarm::HostRandomAccessResult random_access_status(
+        std::int32_t fd,
+        bool for_write) override {
+        const bool usable = for_write ? (fd == 1 || fd == 2) : fd == 0;
+        if (!usable || !is_open(fd)) {
+            return {false, kGuestErrnoEbadf};
+        }
+        const std::uint16_t type = host_stream_type(fd);
+        if (type == 0) {
+            return {false, kGuestErrnoEio};
+        }
+        if (type == macosarm::kDarwinModeFifo || type == macosarm::kDarwinModeSocket) {
+            return {false, kGuestErrnoEspipe};
+        }
+        if (host_stream_terminal(fd).is_terminal) {
+            return {false, kGuestErrnoEnxio};
+        }
+        return {false, 0};
+    }
+
+    // Read stdin's file at offset for pread(2) without moving its host file
+    // offset or disturbing bytes stdio has buffered for read(2). A host
+    // failure reports EIO; a successful zero-byte result is end-of-file.
+    macosarm::HostReadResult read_at(
+        std::int32_t fd,
+        std::span<std::byte> bytes,
+        std::int64_t offset) override {
+        if (fd != 0 || !is_open(fd)) {
+            return {0, kGuestErrnoEbadf};
+        }
+        const std::int64_t received = read_host_stream_at(fd, bytes, offset);
+        if (received < 0) {
+            return {0, kGuestErrnoEio};
+        }
+        return {static_cast<std::uint64_t>(received), 0};
+    }
+
+    // Write stdout's or stderr's file at offset for pwrite(2) without moving
+    // its host file offset. As for write(2), a host that stores none of a
+    // nonempty request reports EIO.
+    macosarm::HostWriteResult write_at(
+        std::int32_t fd,
+        std::span<const std::byte> bytes,
+        std::int64_t offset) override {
+        if ((fd != 1 && fd != 2) || !is_open(fd)) {
+            return {0, kGuestErrnoEbadf};
+        }
+        const std::int64_t written = write_host_stream_at(fd, bytes, offset);
+        if (written < 0 || (written == 0 && !bytes.empty())) {
+            return {0, kGuestErrnoEio};
+        }
+        return {static_cast<std::uint64_t>(written), 0};
     }
 
     // Like a canonical-mode terminal read, return after a newline, a full

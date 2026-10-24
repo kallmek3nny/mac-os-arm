@@ -431,6 +431,24 @@ if(BUILD_TESTING)
                 -DEXPECTED_EXIT=5
                 "-DEXPECTED_STDOUT=ble"
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
+
+        # pread(0, buffer, 3, 4) on the 10-byte stdin file "positioned" copies
+        # "tio" from offset 4 without moving the file offset, so the read that
+        # follows still starts at offset 0 and returns the whole file. The guest
+        # writes back "tiopositioned" and exits with the 3-byte pread count. A
+        # failed pread exits 100 and a failed read exits 101, so neither errno
+        # can pass for a count.
+        add_test(
+            NAME macho-run-pread-stdin
+            COMMAND "${CMAKE_COMMAND}"
+                "-DFIXTURE_TOOL=$<TARGET_FILE:macho_run_fixture>"
+                "-DRUNNER=$<TARGET_FILE:macho-run>"
+                -DKIND=pread-stdin
+                "-DIMAGE=${CMAKE_CURRENT_BINARY_DIR}/macho-run-pread-stdin.bin"
+                -DSTDIN_TEXT=positioned
+                -DEXPECTED_EXIT=3
+                "-DEXPECTED_STDOUT=tiopositioned"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
     endif()
 endif()
 

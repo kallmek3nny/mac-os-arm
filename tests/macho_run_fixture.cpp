@@ -313,10 +313,59 @@ constexpr std::array<std::uint32_t, 29> kLseekStdinCode{
     0xd4001001U, // svc #0x80
 };
 
+// n = pread(0, buffer, 3, 4); write(1, buffer, n); m = read(0, buffer, 64);
+// write(1, buffer, m); exit(n). macho_run_check.cmake redirects guest stdin
+// from a file, so for the 10-byte stdin "positioned" the pread copies "tio"
+// from offset 4. Because pread(2) never moves the file offset, the read that
+// follows still starts at offset 0 and returns the whole file, so the guest
+// writes back "tiopositioned" and exits with the pread count. A failed pread
+// (carry set) exits 100 and a failed read exits 101, so neither errno can
+// pass for a count. The count is kept in x19 across the later calls, and the
+// buffer lies in the zero-filled tail of __DATA, past "hello".
+constexpr std::array<std::uint32_t, 37> kPreadStdinCode{
+    0xd2800000U, // mov x0, #0 (stdin)
+    0xd2882001U, // mov x1, #0x4100
+    0xf2c00021U, // movk x1, #1, lsl #32 -> 0x100004100
+    0xd2800062U, // mov x2, #3 (nbyte)
+    0xd2800083U, // mov x3, #4 (offset)
+    0xd2801330U, // mov x16, #153 (pread)
+    0xd4001001U, // svc #0x80
+    0x54000302U, // b.cs pread_failed (+96)
+    0xaa0003f3U, // mov x19, x0 -> pread count
+    0xaa0003e2U, // mov x2, x0
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd2882001U, // mov x1, #0x4100
+    0xf2c00021U, // movk x1, #1, lsl #32
+    0xd2800090U, // mov x16, #4 (write)
+    0xd4001001U, // svc #0x80
+    0xd2800000U, // mov x0, #0 (stdin)
+    0xd2882001U, // mov x1, #0x4100
+    0xf2c00021U, // movk x1, #1, lsl #32
+    0xd2800802U, // mov x2, #64
+    0xd2800070U, // mov x16, #3 (read)
+    0xd4001001U, // svc #0x80
+    0x540001a2U, // b.cs read_failed (+52)
+    0xaa0003e2U, // mov x2, x0 -> bytes read
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd2882001U, // mov x1, #0x4100
+    0xf2c00021U, // movk x1, #1, lsl #32
+    0xd2800090U, // mov x16, #4 (write)
+    0xd4001001U, // svc #0x80
+    0xaa1303e0U, // mov x0, x19 -> pread count
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800c80U, // pread_failed: mov x0, #100
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800ca0U, // read_failed: mov x0, #101
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+};
+
 int usage() {
     std::cerr << "usage: macho_run_fixture "
                  "<hello|argc|echo|close-stdout|fstat-stdin|ioctl-stdin|writev-stdout|"
-                 "readv-stdin|lseek-stdin> "
+                 "readv-stdin|lseek-stdin|pread-stdin> "
                  "<output-path>\n";
     return 2;
 }
@@ -347,6 +396,8 @@ int main(int argc, char** argv) {
         bytes = image(kReadvStdinCode);
     } else if (kind == "lseek-stdin") {
         bytes = image(kLseekStdinCode);
+    } else if (kind == "pread-stdin") {
+        bytes = image(kPreadStdinCode);
     } else {
         return usage();
     }
