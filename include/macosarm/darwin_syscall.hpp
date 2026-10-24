@@ -92,6 +92,14 @@ constexpr std::uint64_t kDarwinSysWritev = 121;
 constexpr std::uint64_t kDarwinSysWritevNocancel = 412;
 constexpr std::uint32_t kDarwinIovMax = 1024; // UIO_MAXIOV
 constexpr std::size_t kDarwinIovecSize = 16;
+// XNU syscalls.master #120: user_ssize_t readv(int fd, struct iovec *iovp,
+// u_int iovcnt). #411 readv_nocancel shares its argument and error
+// contract; only the pthread cancellation point differs. readv_nocancel in
+// bsd/kern/sys_generic.c validates iovcnt and the iovec array exactly as
+// writev does (EINVAL, then EFAULT, then EINVAL) before rd_uio resolves the
+// descriptor (EBADF).
+constexpr std::uint64_t kDarwinSysReadv = 120;
+constexpr std::uint64_t kDarwinSysReadvNocancel = 411;
 constexpr std::uint32_t kDarwinErrnoEio = 5;
 constexpr std::uint32_t kDarwinErrnoEbadf = 9;
 constexpr std::uint32_t kDarwinErrnoEnomem = 12;

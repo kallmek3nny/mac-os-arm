@@ -208,6 +208,130 @@ void set_error(CpuState& state, std::uint32_t error) noexcept {
     return finish();
 }
 
+// XNU bsd/kern/sys_generic.c: readv_nocancel rejects iovcnt outside
+// [1, UIO_MAXIOV] (EINVAL), copies the whole iovec array in (EFAULT) and
+// rejects any iov_len or running total above SSIZE_MAX (EINVAL), all before
+// rd_uio resolves the descriptor (EBADF) through a zero-length host read.
+// As in this dispatcher's read(2), exactly one bounded host read then fills
+// the vectors in order and never blocks again to fill them all. Empty
+// vectors are skipped without touching their bases. Destinations are probed
+// first and the read is limited to the leading vectors that can receive it,
+// so host input is never consumed and then dropped; EFAULT is reported only
+// when the first nonempty vector cannot receive a byte.
+[[nodiscard]] SyscallDispatchResult dispatch_readv(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    DarwinHostServices& host,
+    std::uint64_t syscall_number) {
+
+    static_assert(kDarwinIovecSize == 16U, "LP64 struct iovec is 16 bytes");
+    const auto finish = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    };
+    const auto fail = [&](std::uint32_t error) {
+        set_error(state, error);
+        return finish();
+    };
+    const auto contract_violation = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::host_contract_violation,
+            SyscallAction::resume, syscall_number, 0};
+    };
+
+    const auto fd = static_cast<std::int32_t>(static_cast<std::uint32_t>(state.x[0]));
+    const std::uint64_t vector_address = state.x[1];
+    const auto count = static_cast<std::uint32_t>(state.x[2]);
+    if (count == 0U || count > kDarwinIovMax) {
+        return fail(kDarwinErrnoEinval);
+    }
+
+    std::array<std::byte, kDarwinIovMax * kDarwinIovecSize> vectors{};
+    const std::size_t vector_bytes = static_cast<std::size_t>(count) * kDarwinIovecSize;
+    if (!address_space.read(vector_address, std::span<std::byte>(vectors.data(), vector_bytes))) {
+        return fail(kDarwinErrnoEfault);
+    }
+    // Little-endian { iov_base, iov_len } fields of the vector at index.
+    const auto field = [&](std::size_t index, std::size_t offset) {
+        std::uint64_t value = 0;
+        for (std::size_t i = 0; i < sizeof(std::uint64_t); ++i) {
+            value |= static_cast<std::uint64_t>(std::to_integer<unsigned char>(
+                         vectors[index * kDarwinIovecSize + offset + i]))
+                     << (8U * i);
+        }
+        return value;
+    };
+
+    constexpr auto ssize_max =
+        static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+    std::uint64_t total = 0;
+    for (std::size_t index = 0; index < count; ++index) {
+        const std::uint64_t length = field(index, 8U);
+        if (length > ssize_max - total) {
+            return fail(kDarwinErrnoEinval);
+        }
+        total += length;
+    }
+
+    if (fd < 0) {
+        return fail(kDarwinErrnoEbadf);
+    }
+    const HostReadResult probe = host.read(fd, std::span<std::byte>{});
+    if (probe.bytes_read != 0U) {
+        return contract_violation();
+    }
+    if (!probe) {
+        return fail(probe.error);
+    }
+
+    // Bound the single host read by the chunk size and by the leading
+    // nonempty vectors whose destinations can receive it.
+    std::size_t requested = 0;
+    for (std::size_t index = 0; index < count && requested < kIoChunkSize; ++index) {
+        const std::uint64_t length = field(index, 8U);
+        if (length == 0U) {
+            continue;
+        }
+        const auto piece = static_cast<std::size_t>(
+            std::min<std::uint64_t>(length, kIoChunkSize - requested));
+        if (!address_space.probe_write(field(index, 0U), piece)) {
+            break;
+        }
+        requested += piece;
+    }
+    if (requested == 0U) {
+        if (total != 0U) {
+            return fail(kDarwinErrnoEfault);
+        }
+        set_success(state, 0U);
+        return finish();
+    }
+
+    std::array<std::byte, kIoChunkSize> chunk{};
+    const HostReadResult host_result = host.read(
+        fd, std::span<std::byte>(chunk.data(), requested));
+    if (!host_result) {
+        return fail(host_result.error);
+    }
+    if (host_result.bytes_read > requested) {
+        return contract_violation();
+    }
+    const auto received = static_cast<std::size_t>(host_result.bytes_read);
+    std::size_t delivered = 0;
+    for (std::size_t index = 0; index < count && delivered < received; ++index) {
+        const auto piece = static_cast<std::size_t>(
+            std::min<std::uint64_t>(field(index, 8U), received - delivered));
+        if (piece != 0U &&
+            !address_space.write(field(index, 0U),
+                                 std::span<const std::byte>(chunk.data() + delivered, piece))) {
+            return fail(kDarwinErrnoEfault);
+        }
+        delivered += piece;
+    }
+    set_success(state, host_result.bytes_read);
+    return finish();
+}
+
 // XNU bsd/kern/sys_generic.c: read_nocancel resolves the descriptor (EBADF)
 // before dofileread rejects nbyte > INT_MAX (EINVAL) or copyout faults
 // (EFAULT). A read may legally return fewer bytes than requested, so issue
@@ -992,6 +1116,13 @@ SyscallDispatchResult dispatch_darwin_syscall(
         // error contract; only the pthread cancellation point differs, and
         // no guest pthread can be cancelled yet.
         return dispatch_read(state, address_space, host, syscall_number);
+    case kDarwinSysReadv:
+    case kDarwinSysReadvNocancel:
+        // XNU syscalls.master #120 readv / #411 readv_nocancel scatter one
+        // bounded host read across the guest's iovec array, in order. No
+        // guest pthread can be cancelled yet, so both entry points share one
+        // handler.
+        return dispatch_readv(state, address_space, host, syscall_number);
     case kDarwinSysWrite:
     case kDarwinSysWriteNocancel:
         // XNU syscalls.master #397 write_nocancel likewise aliases write.

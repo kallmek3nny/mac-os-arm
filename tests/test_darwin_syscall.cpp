@@ -1821,6 +1821,203 @@ int main() {
     }
 
     {
+        // XNU syscalls.master #120 readv / #411 readv_nocancel validate the
+        // whole LP64 iovec array before resolving the descriptor, then fill
+        // the vectors in order from exactly one bounded host read.
+        constexpr std::uint64_t page = macosarm::GuestAddressSpace::kPageSize;
+        constexpr std::uint64_t dest_base = 0xE00000000ULL;
+        constexpr std::uint64_t vector_scatter = 0xE00100000ULL;
+        constexpr std::uint64_t unmapped_base = 0xF00000000ULL;
+        constexpr std::byte sentinel{0xcc};
+        const auto rw = macosarm::Protection::read | macosarm::Protection::write;
+        const auto encode = [](const std::vector<std::uint64_t>& fields) {
+            std::vector<std::byte> bytes;
+            for (const std::uint64_t value : fields) {
+                for (std::size_t i = 0; i < sizeof(std::uint64_t); ++i) {
+                    bytes.push_back(static_cast<std::byte>((value >> (8U * i)) & 0xffU));
+                }
+            }
+            return bytes;
+        };
+        // A sentinel-filled writable page plus a read-only iovec array that
+        // fills two bytes, skips an empty vector whose base is unmapped, then
+        // fills four bytes at offset 8.
+        const auto prepare = [&](macosarm::GuestAddressSpace& vm) {
+            const std::vector<std::byte> fill(static_cast<std::size_t>(page), sentinel);
+            expect(static_cast<bool>(vm.map(dest_base, page, rw)) &&
+                       static_cast<bool>(vm.load_bytes(dest_base, fill)),
+                   "readv destination maps writable");
+            load_readable(vm, vector_scatter,
+                          encode({dest_base, 2U, unmapped_base, 0U, dest_base + 8U, 4U}));
+        };
+        const auto run_readv = [](macosarm::GuestAddressSpace& vm, ReadHost& host,
+                                  std::uint64_t number, std::uint64_t fd,
+                                  std::uint64_t vectors, std::uint64_t count,
+                                  macosarm::CpuState& state) {
+            state = {};
+            state.pstate = macosarm::kA64PstateCarry;
+            state.x[16] = number;
+            state.x[0] = fd;
+            state.x[1] = vectors;
+            state.x[2] = count;
+            return macosarm::dispatch_darwin_syscall(state, vm, svc(), host);
+        };
+        // True when the first 12 destination bytes match expected, where '.'
+        // stands for an untouched sentinel byte.
+        const auto landed = [&](macosarm::GuestAddressSpace& vm, const std::string& expected) {
+            std::array<std::byte, 12> bytes{};
+            if (expected.size() != bytes.size() || !vm.read(dest_base, bytes)) {
+                return false;
+            }
+            for (std::size_t i = 0; i < bytes.size(); ++i) {
+                const std::byte want =
+                    expected[i] == '.' ? sentinel : static_cast<std::byte>(expected[i]);
+                if (bytes[i] != want) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        {
+            macosarm::GuestAddressSpace vm;
+            prepare(vm);
+            ReadHost host;
+            host.input = {std::byte{'a'}, std::byte{'b'}, std::byte{'c'},
+                          std::byte{'d'}, std::byte{'e'}, std::byte{'f'}};
+            macosarm::CpuState state{};
+            const auto scattered =
+                run_readv(vm, host, macosarm::kDarwinSysReadv, 0U, vector_scatter, 3U, state);
+            expect(static_cast<bool>(scattered) && !carry_is_set(state) && state.x[0] == 6U &&
+                       scattered.syscall_number == macosarm::kDarwinSysReadv &&
+                       host.fds == std::vector<std::int32_t>{0, 0} &&
+                       host.requests == std::vector<std::size_t>{0U, 6U} &&
+                       landed(vm, "ab......cdef"),
+                   "readv scatters one host read in order and skips empty vectors");
+            const auto at_eof =
+                run_readv(vm, host, macosarm::kDarwinSysReadv, 0U, vector_scatter, 3U, state);
+            expect(static_cast<bool>(at_eof) && !carry_is_set(state) && state.x[0] == 0U &&
+                       landed(vm, "ab......cdef"),
+                   "readv at end of file succeeds with zero bytes");
+        }
+
+        {
+            macosarm::GuestAddressSpace vm;
+            prepare(vm);
+            ReadHost host;
+            host.input = {std::byte{'x'}, std::byte{'y'}, std::byte{'z'}};
+            macosarm::CpuState state{};
+            const auto short_read = run_readv(
+                vm, host, macosarm::kDarwinSysReadvNocancel, 0U, vector_scatter, 3U, state);
+            expect(static_cast<bool>(short_read) && !carry_is_set(state) && state.x[0] == 3U &&
+                       short_read.syscall_number == macosarm::kDarwinSysReadvNocancel &&
+                       host.consumed == 3U &&
+                       host.requests == std::vector<std::size_t>{0U, 6U} &&
+                       landed(vm, "xy......z..."),
+                   "readv_nocancel delivers a short host read without refilling");
+        }
+
+        // Argument errors follow XNU's order: iovcnt (EINVAL), the iovec copyin
+        // (EFAULT), then iov_len totals (EINVAL), all before the descriptor
+        // resolves (EBADF), so none of them reaches the host.
+        const auto failed_with = [](const macosarm::SyscallDispatchResult& result,
+                                    macosarm::CpuState& state, std::uint32_t error) {
+            return static_cast<bool>(result) && carry_is_set(state) && state.x[0] == error;
+        };
+        constexpr std::uint64_t readv_number = macosarm::kDarwinSysReadv;
+        constexpr std::uint64_t closed_fd = 7U;
+
+        {
+            macosarm::GuestAddressSpace vm;
+            prepare(vm);
+            constexpr std::uint64_t vector_overflow = 0xE00200000ULL;
+            constexpr std::uint64_t vector_too_long = 0xE00300000ULL;
+            constexpr std::uint64_t half = 0x4000000000000000ULL;
+            load_readable(vm, vector_overflow, encode({dest_base, half, dest_base, half}));
+            load_readable(vm, vector_too_long, encode({dest_base, 2U * half}));
+            ReadHost host;
+            host.input = {std::byte{'q'}};
+            macosarm::CpuState state{};
+            const auto no_vectors = run_readv(vm, host, readv_number, 0U, vector_scatter, 0U, state);
+            expect(failed_with(no_vectors, state, macosarm::kDarwinErrnoEinval),
+                   "readv rejects a zero iovcnt with EINVAL");
+            const auto truncated =
+                run_readv(vm, host, readv_number, 0U, vector_scatter, 0x100000000ULL, state);
+            expect(failed_with(truncated, state, macosarm::kDarwinErrnoEinval),
+                   "readv counts only the low 32 bits of iovcnt");
+            const auto too_many = run_readv(vm, host, readv_number, closed_fd, unmapped_base,
+                                            macosarm::kDarwinIovMax + 1U, state);
+            expect(failed_with(too_many, state, macosarm::kDarwinErrnoEinval),
+                   "readv rejects iovcnt above UIO_MAXIOV before copying the vectors");
+            const auto unmapped_vectors =
+                run_readv(vm, host, readv_number, closed_fd, unmapped_base, 1U, state);
+            expect(failed_with(unmapped_vectors, state, macosarm::kDarwinErrnoEfault),
+                   "readv faults on an unmapped iovec array before resolving the descriptor");
+            const auto overflow =
+                run_readv(vm, host, readv_number, closed_fd, vector_overflow, 2U, state);
+            expect(failed_with(overflow, state, macosarm::kDarwinErrnoEinval),
+                   "readv rejects an iov_len total above SSIZE_MAX before resolving the descriptor");
+            const auto too_long = run_readv(vm, host, readv_number, 0U, vector_too_long, 1U, state);
+            expect(failed_with(too_long, state, macosarm::kDarwinErrnoEinval),
+                   "readv rejects a single iov_len above SSIZE_MAX");
+            expect(host.requests.empty() && host.consumed == 0U && landed(vm, "............"),
+                   "rejected readv arguments never reach the host or guest memory");
+            const auto closed = run_readv(vm, host, readv_number, closed_fd, vector_scatter, 3U, state);
+            expect(failed_with(closed, state, macosarm::kDarwinErrnoEbadf) &&
+                       host.consumed == 0U && landed(vm, "............"),
+                   "readv on a closed descriptor is EBADF without touching guest memory");
+            const auto negative =
+                run_readv(vm, host, readv_number, 0xffffffffULL, vector_scatter, 3U, state);
+            expect(failed_with(negative, state, macosarm::kDarwinErrnoEbadf) && host.consumed == 0U,
+                   "readv on a negative descriptor is EBADF");
+        }
+
+        {
+            // Destinations are probed before the host read, so only the
+            // leading writable vectors receive input and none is dropped.
+            macosarm::GuestAddressSpace vm;
+            prepare(vm);
+            constexpr std::uint64_t vector_unmapped = 0xE00200000ULL;
+            constexpr std::uint64_t vector_read_only = 0xE00300000ULL;
+            constexpr std::uint64_t vector_partial = 0xE00400000ULL;
+            constexpr std::uint64_t vector_empty = 0xE00500000ULL;
+            load_readable(vm, vector_unmapped, encode({unmapped_base, 4U}));
+            load_readable(vm, vector_read_only, encode({vector_scatter, 4U}));
+            load_readable(vm, vector_partial, encode({dest_base, 2U, unmapped_base, 4U}));
+            load_readable(vm, vector_empty, encode({unmapped_base, 0U}));
+            ReadHost host;
+            host.input = {std::byte{'p'}, std::byte{'q'}, std::byte{'r'}, std::byte{'s'}};
+            macosarm::CpuState state{};
+            const auto unmapped = run_readv(vm, host, readv_number, 0U, vector_unmapped, 1U, state);
+            expect(failed_with(unmapped, state, macosarm::kDarwinErrnoEfault) &&
+                       host.consumed == 0U && host.requests == std::vector<std::size_t>{0U},
+                   "readv into an unmapped first vector is EFAULT without consuming input");
+            const auto read_only =
+                run_readv(vm, host, readv_number, 0U, vector_read_only, 1U, state);
+            expect(failed_with(read_only, state, macosarm::kDarwinErrnoEfault) && host.consumed == 0U,
+                   "readv into a read-only vector is EFAULT without consuming input");
+            const auto partial = run_readv(vm, host, readv_number, 0U, vector_partial, 2U, state);
+            expect(static_cast<bool>(partial) && !carry_is_set(state) && state.x[0] == 2U &&
+                       host.consumed == 2U && host.requests.back() == 2U &&
+                       landed(vm, "pq.........."),
+                   "readv limits the host read to the leading writable vectors");
+            const auto empty = run_readv(vm, host, readv_number, 0U, vector_empty, 1U, state);
+            expect(static_cast<bool>(empty) && !carry_is_set(state) && state.x[0] == 0U &&
+                       host.consumed == 2U,
+                   "readv of only empty vectors succeeds without touching their bases");
+            host.next_error = macosarm::kDarwinErrnoEio;
+            const auto failed = run_readv(vm, host, readv_number, 0U, vector_scatter, 3U, state);
+            expect(failed_with(failed, state, macosarm::kDarwinErrnoEio) && host.consumed == 2U &&
+                       landed(vm, "pq.........."),
+                   "host readv errors propagate to the guest");
+            host.violate_contract = true;
+            const auto violated = run_readv(vm, host, readv_number, 0U, vector_scatter, 3U, state);
+            expect(violated.error == macosarm::SyscallDispatchError::host_contract_violation,
+                   "nonzero readv descriptor probe count is rejected");
+        }
+    }
+
+    {
         // XNU bsd/kern/kern_time.c gettimeofday: a 64-bit process receives a
         // 16-byte struct user64_timeval { int64 tv_sec; int32 tv_usec; } with
         // zeroed tail padding and an 8-byte struct timezone. Success returns 0
