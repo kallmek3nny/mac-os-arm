@@ -168,6 +168,16 @@ constexpr std::size_t kDarwinRlimitSize = 16;            // LP64 struct rlimit
 // Only a request that passes every check reaches the host, which applies any
 // resource-specific effect and commits the limits as proc_limitupdate does.
 constexpr std::uint64_t kDarwinSysSetrlimit = 195;
+// XNU syscalls.master #89: int sys_getdtablesize(void). sys_getdtablesize in
+// bsd/kern/kern_descrip.c always succeeds and returns
+// proc_limitgetcur_nofile(p): the soft RLIMIT_NOFILE limit capped at the int
+// maxfilesperproc, as (int)MIN(lim, maxfilesperproc). The soft limit comes
+// only from the host's view of the translated process and is held to the
+// getrlimit contract. No maxfilesperproc sysctl is modeled, so the only cap
+// applied is the int range that maxfilesperproc itself never exceeds. A host
+// that cannot report the limit fails closed with its error, never a
+// fabricated table size.
+constexpr std::uint64_t kDarwinSysGetdtablesize = 89;
 // XNU syscalls.master #92: int fcntl(int fd, int cmd, long arg), and #406
 // fcntl_nocancel with the same argument and error contract; only the
 // pthread cancellation point differs. fd and cmd are ints, so only w0 and

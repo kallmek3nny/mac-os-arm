@@ -1396,6 +1396,44 @@ void set_error(CpuState& state, std::uint32_t error) noexcept {
     return finish();
 }
 
+// XNU bsd/kern/kern_descrip.c: sys_getdtablesize(p, uap, retval) always
+// succeeds with *retval = proc_limitgetcur_nofile(p), which kern_resource.c
+// defines as (int)MIN(proc_limitgetcur(p, RLIMIT_NOFILE), maxfilesperproc):
+// the soft RLIMIT_NOFILE limit capped at the int maxfilesperproc. The soft
+// limit comes only from the host's resource_limit and is held to the
+// getrlimit contract: a host error is reported as is, and an inverted or
+// out-of-range snapshot is a host contract violation. No maxfilesperproc
+// sysctl is modeled, so the only cap is INT_MAX, the most maxfilesperproc can
+// hold; a soft limit of RLIM_INFINITY therefore reports INT_MAX. The result
+// is never negative, so its zero and sign extensions into x0 agree. Nothing
+// touches guest memory.
+[[nodiscard]] SyscallDispatchResult dispatch_getdtablesize(
+    CpuState& state,
+    DarwinHostServices& host,
+    std::uint64_t syscall_number) {
+
+    const auto finish = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    };
+
+    const HostResourceLimitResult current = host.resource_limit(kDarwinRlimitNofile);
+    if (!current) {
+        set_error(state, current.error);
+        return finish();
+    }
+    if (current.soft_limit > current.hard_limit ||
+        current.hard_limit > kDarwinRlimInfinity) {
+        return SyscallDispatchResult{
+            SyscallDispatchError::host_contract_violation,
+            SyscallAction::resume, syscall_number, 0};
+    }
+
+    constexpr std::uint64_t kIntMax = 0x7fffffffU;
+    set_success(state, current.soft_limit < kIntMax ? current.soft_limit : kIntMax);
+    return finish();
+}
+
 // XNU bsd/kern/kern_time.c: gettimeofday(tp, tzp, mach_absolute_time)
 // samples the clock only when tp or mach_absolute_time is requested, then
 // copies out a 64-bit timeval (tv_sec cast through uint32_t to match the
@@ -1737,6 +1775,12 @@ SyscallDispatchResult dispatch_darwin_syscall(
         // EINVAL and EPERM checks against the host's current limits; only a
         // request that passes them reaches the host.
         return dispatch_setrlimit(state, address_space, host, syscall_number);
+    case kDarwinSysGetdtablesize:
+        // XNU syscalls.master #89: int sys_getdtablesize(void). libSystem's
+        // getdtablesize(3) traps here and programs size descriptor loops
+        // from it. The result is the host's soft RLIMIT_NOFILE limit capped
+        // at INT_MAX, and no argument register is read.
+        return dispatch_getdtablesize(state, host, syscall_number);
     case kDarwinSysClose:
     case kDarwinSysCloseNocancel: {
         // XNU bsd/kern/kern_descrip.c: close_nocancel rejects a descriptor

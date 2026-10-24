@@ -3179,6 +3179,127 @@ int main() {
     }
 
     {
+        // getdtablesize(2): XNU syscalls.master #89. The result is the host's
+        // soft RLIMIT_NOFILE limit capped at INT_MAX, and no argument register
+        // or guest memory is read.
+        struct DtableHost final : macosarm::DarwinHostServices {
+            std::vector<std::uint32_t> queries;
+            std::uint64_t soft_limit{256U};
+            std::uint64_t hard_limit{10240U};
+            std::uint32_t next_error{};
+
+            macosarm::HostWriteResult write(std::int32_t,
+                                            std::span<const std::byte>) override {
+                return {0, macosarm::kDarwinErrnoEbadf};
+            }
+            macosarm::HostResourceLimitResult resource_limit(std::uint32_t resource) override {
+                queries.push_back(resource);
+                if (next_error != 0) {
+                    const std::uint32_t error = next_error;
+                    next_error = 0;
+                    return {0, 0, error};
+                }
+                return {soft_limit, hard_limit, 0};
+            }
+        };
+        const auto run_getdtablesize = [](macosarm::DarwinHostServices& host,
+                                          macosarm::CpuState& state) {
+            // An empty address space proves no guest memory is touched, and
+            // garbage argument registers prove none of them is read.
+            macosarm::GuestAddressSpace vm;
+            state = {};
+            state.x[0] = 0xdeadbeefcafef00dULL;
+            state.x[1] = 0x0123456789abcdefULL;
+            state.x[16] = macosarm::kDarwinSysGetdtablesize;
+            // Preset carry so every success test proves the dispatcher clears it.
+            state.pstate = macosarm::kA64PstateCarry;
+            return macosarm::dispatch_darwin_syscall(state, vm, svc(), host);
+        };
+
+        {
+            DtableHost host;
+            macosarm::CpuState state{};
+            const auto result = run_getdtablesize(host, state);
+            expect(static_cast<bool>(result) &&
+                       result.action == macosarm::SyscallAction::resume &&
+                       result.syscall_number == macosarm::kDarwinSysGetdtablesize &&
+                       state.x[0] == 256U && !carry_is_set(state) &&
+                       host.queries.size() == 1U &&
+                       host.queries[0] == macosarm::kDarwinRlimitNofile,
+                   "getdtablesize reports the soft RLIMIT_NOFILE limit and clears carry");
+        }
+
+        {
+            struct Capped {
+                std::uint64_t soft;
+                std::uint64_t hard;
+                std::uint64_t expected;
+            };
+            const Capped cases[] = {
+                {0U, 0U, 0U},
+                {0x7ffffffeU, 0x7ffffffeU, 0x7ffffffeU},
+                {0x7fffffffU, 0x80000000U, 0x7fffffffU},
+                {0x80000000U, 0x80000000U, 0x7fffffffU},
+                {0x100000000ULL, macosarm::kDarwinRlimInfinity, 0x7fffffffU},
+                {macosarm::kDarwinRlimInfinity, macosarm::kDarwinRlimInfinity, 0x7fffffffU},
+            };
+            bool all_capped = true;
+            for (const Capped& c : cases) {
+                DtableHost host;
+                host.soft_limit = c.soft;
+                host.hard_limit = c.hard;
+                macosarm::CpuState state{};
+                const auto result = run_getdtablesize(host, state);
+                all_capped = all_capped && static_cast<bool>(result) &&
+                             state.x[0] == c.expected && !carry_is_set(state);
+            }
+            expect(all_capped,
+                   "getdtablesize caps the soft limit at INT_MAX, including RLIM_INFINITY");
+        }
+
+        {
+            DtableHost host;
+            host.next_error = macosarm::kDarwinErrnoEio;
+            macosarm::CpuState state{};
+            const auto result = run_getdtablesize(host, state);
+            expect(static_cast<bool>(result) &&
+                       state.x[0] == macosarm::kDarwinErrnoEio && carry_is_set(state) &&
+                       host.queries.size() == 1U,
+                   "getdtablesize reports a host resource_limit error as is");
+        }
+
+        {
+            DtableHost inverted;
+            inverted.soft_limit = 4096U;
+            inverted.hard_limit = 1024U;
+            macosarm::CpuState state{};
+            const auto inverted_result = run_getdtablesize(inverted, state);
+            DtableHost out_of_range;
+            out_of_range.soft_limit = 1024U;
+            out_of_range.hard_limit = macosarm::kDarwinRlimInfinity + 1U;
+            const auto out_of_range_result = run_getdtablesize(out_of_range, state);
+            expect(!static_cast<bool>(inverted_result) &&
+                       !static_cast<bool>(out_of_range_result),
+                   "getdtablesize rejects an inverted or out-of-range limits snapshot");
+        }
+
+        {
+            struct NoLimitHost final : macosarm::DarwinHostServices {
+                macosarm::HostWriteResult write(std::int32_t,
+                                                std::span<const std::byte>) override {
+                    return {0, macosarm::kDarwinErrnoEbadf};
+                }
+            };
+            NoLimitHost host;
+            macosarm::CpuState state{};
+            const auto result = run_getdtablesize(host, state);
+            expect(static_cast<bool>(result) &&
+                       state.x[0] == macosarm::kDarwinErrnoEnosys && carry_is_set(state),
+                   "default hosts report ENOSYS for getdtablesize");
+        }
+    }
+
+    {
         // close(2) / close_nocancel(2): XNU syscalls.master #6 and #399.
         {
             CloseHost host;
