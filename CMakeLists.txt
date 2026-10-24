@@ -415,6 +415,22 @@ if(BUILD_TESTING)
                 -DEXPECTED_EXIT=4
                 "-DEXPECTED_STDOUT=ngpi"
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
+
+        # lseek(0, -3, SEEK_END) on the 8-byte stdin file "seekable" lands at
+        # offset 5, so the following read resumes there, the guest writes back
+        # "ble" and exits with that offset. A failed lseek exits 100 and a
+        # failed read exits 101, so neither errno can pass for an offset.
+        add_test(
+            NAME macho-run-lseek-stdin
+            COMMAND "${CMAKE_COMMAND}"
+                "-DFIXTURE_TOOL=$<TARGET_FILE:macho_run_fixture>"
+                "-DRUNNER=$<TARGET_FILE:macho-run>"
+                -DKIND=lseek-stdin
+                "-DIMAGE=${CMAKE_CURRENT_BINARY_DIR}/macho-run-lseek-stdin.bin"
+                -DSTDIN_TEXT=seekable
+                -DEXPECTED_EXIT=5
+                "-DEXPECTED_STDOUT=ble"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
     endif()
 endif()
 

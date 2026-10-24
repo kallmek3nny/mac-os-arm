@@ -15,8 +15,9 @@
 #include <vector>
 
 // Host services: getentropy(2) reads only the host operating system's CSPRNG,
-// fstat64(2) asks the host only for a standard stream's file type, and
-// ioctl(2) asks only whether a standard stream is a terminal and its size.
+// fstat64(2) asks the host only for a standard stream's file type, ioctl(2)
+// asks only whether a standard stream is a terminal and its size, and
+// lseek(2) asks only for a redirected standard stream's offset and file size.
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -39,6 +40,7 @@ namespace {
 constexpr std::uint32_t kGuestErrnoEio = 5;
 constexpr std::uint32_t kGuestErrnoEbadf = 9;
 constexpr std::uint32_t kGuestErrnoEnotty = 25;
+constexpr std::uint32_t kGuestErrnoEspipe = 29;
 
 // st_blksize reported for every guest standard descriptor. Darwin libc sizes
 // stdio buffers from it, so it must be positive; it describes no host file.
@@ -152,6 +154,74 @@ HostStreamTerminal host_stream_terminal(std::int32_t fd) noexcept {
     return terminal;
 }
 
+// The host C stream behind standard descriptor fd (0, 1 or 2), or nullptr.
+std::FILE* host_stream(std::int32_t fd) noexcept {
+    switch (fd) {
+    case 0:
+        return stdin;
+    case 1:
+        return stdout;
+    case 2:
+        return stderr;
+    default:
+        return nullptr;
+    }
+}
+
+// What the host reveals about standard stream fd (0, 1 or 2) for lseek(2):
+// only the logical offset of its host C stream and the size of the regular
+// file behind it. The C stream's offset already excludes bytes stdio has
+// buffered but not yet handed to the guest, so a seek after a short read
+// starts exactly where the guest stopped reading. Both helpers report -1
+// when the host cannot report the value, never a guessed one.
+std::int64_t host_stream_offset(std::int32_t fd) noexcept {
+    std::FILE* const stream = host_stream(fd);
+    if (stream == nullptr) {
+        return -1;
+    }
+#if defined(_WIN32)
+    return static_cast<std::int64_t>(::_ftelli64(stream));
+#else
+    return static_cast<std::int64_t>(::ftello(stream));
+#endif
+}
+
+std::int64_t host_stream_size(std::int32_t fd) noexcept {
+    if (fd < 0 || fd > 2) {
+        return -1;
+    }
+#if defined(_WIN32)
+    constexpr DWORD kStandardHandles[] = {STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE};
+    const HANDLE handle = ::GetStdHandle(kStandardHandles[static_cast<std::size_t>(fd)]);
+    LARGE_INTEGER size{};
+    if (handle == nullptr || handle == INVALID_HANDLE_VALUE || ::GetFileSizeEx(handle, &size) == 0) {
+        return -1;
+    }
+    return static_cast<std::int64_t>(size.QuadPart);
+#else
+    struct stat host_status {};
+    if (::fstat(fd, &host_status) != 0 || !S_ISREG(host_status.st_mode)) {
+        return -1;
+    }
+    return static_cast<std::int64_t>(host_status.st_size);
+#endif
+}
+
+// Move host stream fd to byte offset from the start of its file, reporting
+// whether the host accepted the new position. Only offsets the dispatcher
+// has already validated reach here, so a negative one is refused outright.
+bool seek_host_stream(std::int32_t fd, std::int64_t offset) noexcept {
+    std::FILE* const stream = host_stream(fd);
+    if (stream == nullptr || offset < 0) {
+        return false;
+    }
+#if defined(_WIN32)
+    return ::_fseeki64(stream, offset, SEEK_SET) == 0;
+#else
+    return ::fseeko(stream, static_cast<off_t>(offset), SEEK_SET) == 0;
+#endif
+}
+
 // The guest's stdin, stdout and stderr reach the host's, as raw bytes. No
 // other descriptor exists in the translated process yet, so those report
 // EBADF, as does a standard descriptor after the guest has closed it.
@@ -213,6 +283,54 @@ public:
             return {0, 0, 0, 0, kGuestErrnoEnotty};
         }
         return {terminal.rows, terminal.columns, terminal.x_pixels, terminal.y_pixels, 0};
+    }
+
+    // lseek(2) describes only a standard descriptor the guest still has open.
+    // As XNU refuses a FIFO, socket or terminal with ESPIPE, so does a piped,
+    // socket-backed or console stream here; only a stream redirected from or
+    // to a file can seek. The host contributes just its C stream's logical
+    // offset and the regular file's size, so no other host metadata reaches
+    // the guest. A stream the host cannot classify or position reports EIO
+    // rather than a guessed offset. A host C stream never holds a negative
+    // position, so no stream claims a character device's negative-offset
+    // allowance and the dispatcher fails a negative result with EINVAL
+    // before anything is committed.
+    macosarm::HostSeekResult seek_status(std::int32_t fd) override {
+        if (!is_open(fd)) {
+            return {0, 0, 0, false, kGuestErrnoEbadf};
+        }
+        const std::uint16_t type = host_stream_type(fd);
+        if (type == 0) {
+            return {0, 0, 0, false, kGuestErrnoEio};
+        }
+        if (type == macosarm::kDarwinModeFifo || type == macosarm::kDarwinModeSocket ||
+            host_stream_terminal(fd).is_terminal) {
+            return {0, 0, 0, false, kGuestErrnoEspipe};
+        }
+        const std::int64_t offset = host_stream_offset(fd);
+        if (offset < 0) {
+            return {0, 0, 0, false, kGuestErrnoEio};
+        }
+        // An unknown size, as for a non-file character device, fails only
+        // SEEK_END, like a failed vnode_size.
+        const std::int64_t size = host_stream_size(fd);
+        if (size < 0) {
+            return {offset, 0, kGuestErrnoEio, false, 0};
+        }
+        return {offset, size, 0, false, 0};
+    }
+
+    // Commit a validated lseek(2) offset by repositioning the host C stream,
+    // which also discards any stdin bytes stdio buffered from the old
+    // position. If the host rejects the position, the guest sees EIO.
+    macosarm::HostSetOffsetResult set_offset(std::int32_t fd, std::int64_t offset) override {
+        if (!is_open(fd)) {
+            return {kGuestErrnoEbadf};
+        }
+        if (!seek_host_stream(fd, offset)) {
+            return {kGuestErrnoEio};
+        }
+        return {0};
     }
 
     // Like a canonical-mode terminal read, return after a newline, a full

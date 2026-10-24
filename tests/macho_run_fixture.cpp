@@ -273,10 +273,50 @@ constexpr std::array<std::uint32_t, 29> kReadvStdinCode{
     0xd4001001U, // svc #0x80
 };
 
+// off = lseek(0, -3, SEEK_END); n = read(0, buffer, 64); write(1, buffer, n);
+// exit(off). macho_run_check.cmake redirects guest stdin from a file, so for
+// the 8-byte stdin "seekable" the seek lands 3 bytes before end-of-file at
+// offset 5, the read resumes there and the guest writes back "ble" and exits
+// with that offset. A failed lseek (carry set) exits 100 and a failed read
+// exits 101, so neither errno can pass for an offset. The offset is kept in
+// x19 across the read and write, and the buffer lies in the zero-filled tail
+// of __DATA, past "hello".
+constexpr std::array<std::uint32_t, 29> kLseekStdinCode{
+    0xd2800000U, // mov x0, #0 (stdin)
+    0x92800041U, // mov x1, #-3 (movn x1, #2)
+    0xd2800042U, // mov x2, #2 (SEEK_END)
+    0xd28018f0U, // mov x16, #199 (lseek)
+    0xd4001001U, // svc #0x80
+    0x54000242U, // b.cs lseek_failed (+72)
+    0xaa0003f3U, // mov x19, x0 -> new offset
+    0xd2800000U, // mov x0, #0 (stdin)
+    0xd2882001U, // mov x1, #0x4100
+    0xf2c00021U, // movk x1, #1, lsl #32 -> 0x100004100
+    0xd2800802U, // mov x2, #64
+    0xd2800070U, // mov x16, #3 (read)
+    0xd4001001U, // svc #0x80
+    0x540001a2U, // b.cs read_failed (+52)
+    0xaa0003e2U, // mov x2, x0 -> bytes read
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd2882001U, // mov x1, #0x4100
+    0xf2c00021U, // movk x1, #1, lsl #32
+    0xd2800090U, // mov x16, #4 (write)
+    0xd4001001U, // svc #0x80
+    0xaa1303e0U, // mov x0, x19 -> offset lseek returned
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800c80U, // lseek_failed: mov x0, #100
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800ca0U, // read_failed: mov x0, #101
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+};
+
 int usage() {
     std::cerr << "usage: macho_run_fixture "
                  "<hello|argc|echo|close-stdout|fstat-stdin|ioctl-stdin|writev-stdout|"
-                 "readv-stdin> "
+                 "readv-stdin|lseek-stdin> "
                  "<output-path>\n";
     return 2;
 }
@@ -305,6 +345,8 @@ int main(int argc, char** argv) {
         bytes = image(kWritevStdoutCode);
     } else if (kind == "readv-stdin") {
         bytes = image(kReadvStdinCode);
+    } else if (kind == "lseek-stdin") {
+        bytes = image(kLseekStdinCode);
     } else {
         return usage();
     }
