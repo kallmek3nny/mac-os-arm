@@ -135,6 +135,28 @@ constexpr std::uint64_t kDarwinSysPread = 153;
 constexpr std::uint64_t kDarwinSysPwrite = 154;
 constexpr std::uint64_t kDarwinSysPreadNocancel = 414;
 constexpr std::uint64_t kDarwinSysPwriteNocancel = 415;
+// XNU syscalls.master #194: int getrlimit(u_int which, struct rlimit *rlp).
+// getrlimit in bsd/kern/kern_resource.c takes which as a u_int, so only w0
+// counts, and strips _RLIMIT_POSIX_FLAG from it first. A resource at or
+// above RLIM_NLIMITS then reports EINVAL; otherwise proc_limitget's soft and
+// hard limits are copied out as the 16-byte LP64 struct rlimit { rlim_t
+// rlim_cur; rlim_t rlim_max; }, or EFAULT. Limits come only from the host's
+// view of the translated process, never a fabricated limit, and the
+// dispatcher encodes the record itself.
+constexpr std::uint64_t kDarwinSysGetrlimit = 194;
+constexpr std::uint32_t kDarwinRlimitPosixFlag = 0x1000; // _RLIMIT_POSIX_FLAG
+constexpr std::uint32_t kDarwinRlimitCpu = 0;            // RLIMIT_CPU
+constexpr std::uint32_t kDarwinRlimitFsize = 1;          // RLIMIT_FSIZE
+constexpr std::uint32_t kDarwinRlimitData = 2;           // RLIMIT_DATA
+constexpr std::uint32_t kDarwinRlimitStack = 3;          // RLIMIT_STACK
+constexpr std::uint32_t kDarwinRlimitCore = 4;           // RLIMIT_CORE
+constexpr std::uint32_t kDarwinRlimitAs = 5;             // RLIMIT_AS, alias RLIMIT_RSS
+constexpr std::uint32_t kDarwinRlimitMemlock = 6;        // RLIMIT_MEMLOCK
+constexpr std::uint32_t kDarwinRlimitNproc = 7;          // RLIMIT_NPROC
+constexpr std::uint32_t kDarwinRlimitNofile = 8;         // RLIMIT_NOFILE
+constexpr std::uint32_t kDarwinRlimNlimits = 9;          // RLIM_NLIMITS
+constexpr std::uint64_t kDarwinRlimInfinity = (std::uint64_t{1} << 63U) - 1U; // RLIM_INFINITY
+constexpr std::size_t kDarwinRlimitSize = 16;            // LP64 struct rlimit
 // XNU syscalls.master #92: int fcntl(int fd, int cmd, long arg), and #406
 // fcntl_nocancel with the same argument and error contract; only the
 // pthread cancellation point differs. fd and cmd are ints, so only w0 and
@@ -245,6 +267,22 @@ struct HostEntropyResult {
 struct HostWallClockResult {
     std::int64_t seconds{};
     std::uint32_t microseconds{};
+    std::uint32_t error{};
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return error == 0;
+    }
+};
+
+// Host view of one resource limit of the translated process for
+// getrlimit(2), as proc_limitget reports it: the soft limit (rlim_cur) and
+// the hard limit (rlim_max), with kDarwinRlimInfinity for an unlimited
+// resource. A successful result never has a soft limit above its hard limit
+// or either limit above RLIM_INFINITY; the dispatcher treats anything else
+// as a host contract violation rather than copying it out.
+struct HostResourceLimitResult {
+    std::uint64_t soft_limit{};
+    std::uint64_t hard_limit{};
     std::uint32_t error{};
 
     [[nodiscard]] explicit operator bool() const noexcept {
@@ -455,6 +493,17 @@ public:
     // seconds and microseconds since the Unix epoch. Hosts that do not
     // override this have no clock and report ENOSYS, never a fabricated time.
     [[nodiscard]] virtual HostWallClockResult wall_clock() {
+        return {0, 0, kDarwinErrnoEnosys};
+    }
+
+    // Report the translated process's soft and hard limits for resource for
+    // getrlimit(2), as proc_limitget does. The dispatcher strips
+    // _RLIMIT_POSIX_FLAG and rejects resources at or above kDarwinRlimNlimits
+    // before calling this, then validates the limits and encodes the LP64
+    // struct rlimit itself. Hosts that do not override this have no limits
+    // to report and return ENOSYS, never a fabricated limit.
+    [[nodiscard]] virtual HostResourceLimitResult resource_limit(std::uint32_t resource) {
+        static_cast<void>(resource);
         return {0, 0, kDarwinErrnoEnosys};
     }
 

@@ -302,6 +302,49 @@ macosarm::SyscallDispatchResult run_gettimeofday(
     return macosarm::dispatch_darwin_syscall(state, vm, svc(), host);
 }
 
+// Scripted resource limits for getrlimit(2). Every host query is recorded so
+// tests can prove out-of-range resources and rejected destinations never
+// reach the host, and that _RLIMIT_POSIX_FLAG is stripped before it does.
+struct LimitHost final : macosarm::DarwinHostServices {
+    std::uint64_t soft_limit{};
+    std::uint64_t hard_limit{};
+    std::uint32_t next_error{};
+    std::vector<std::uint32_t> queries;
+
+    macosarm::HostWriteResult write(
+        std::int32_t fd,
+        std::span<const std::byte> bytes) override {
+        static_cast<void>(fd);
+        static_cast<void>(bytes);
+        return {0, macosarm::kDarwinErrnoEbadf};
+    }
+
+    macosarm::HostResourceLimitResult resource_limit(std::uint32_t resource) override {
+        queries.push_back(resource);
+        if (next_error != 0) {
+            const std::uint32_t error = next_error;
+            next_error = 0;
+            return {0, 0, error};
+        }
+        return {soft_limit, hard_limit, 0};
+    }
+};
+
+macosarm::SyscallDispatchResult run_getrlimit(
+    macosarm::GuestAddressSpace& vm,
+    macosarm::DarwinHostServices& host,
+    macosarm::CpuState& state,
+    std::uint64_t which,
+    std::uint64_t limit_address) {
+    state = {};
+    state.x[0] = which;
+    state.x[1] = limit_address;
+    state.x[16] = macosarm::kDarwinSysGetrlimit;
+    // Preset carry so every success test proves the dispatcher clears it.
+    state.pstate = macosarm::kA64PstateCarry;
+    return macosarm::dispatch_darwin_syscall(state, vm, svc(), host);
+}
+
 // Scripted descriptor table for close(2). Every host close is recorded so
 // tests can prove negative descriptors never reach the host and that a
 // descriptor is released at most once, even when the host reports an error
@@ -2625,6 +2668,179 @@ int main() {
                        seconds == 1700000000U &&
                        read_guest_le(vm, clock_tv + 8U, 4U, microseconds) && microseconds == 42U,
                    "unmapped timezone faults after the timeval copyout, matching XNU order");
+        }
+    }
+
+    {
+        // getrlimit(2): XNU syscalls.master #194. Only w0 selects the resource,
+        // _RLIMIT_POSIX_FLAG is stripped before the host is asked, and the LP64
+        // struct rlimit is the only thing copied out.
+        constexpr std::uint64_t limit_buffer = kClockBase;
+        constexpr std::uint64_t limit_unmapped = 0xdead00000000ULL;
+        const auto limit_rw = macosarm::Protection::read | macosarm::Protection::write;
+
+        {
+            macosarm::GuestAddressSpace vm;
+            map_clock_page(vm, limit_rw);
+            LimitHost host;
+            host.soft_limit = 256U;
+            host.hard_limit = macosarm::kDarwinRlimInfinity;
+            macosarm::CpuState state{};
+            const auto result =
+                run_getrlimit(vm, host, state, macosarm::kDarwinRlimitNofile, limit_buffer);
+            std::uint64_t soft = 0;
+            std::uint64_t hard = 0;
+            expect(static_cast<bool>(result) &&
+                       result.action == macosarm::SyscallAction::resume &&
+                       result.syscall_number == macosarm::kDarwinSysGetrlimit &&
+                       state.x[0] == 0U && !carry_is_set(state) &&
+                       host.queries == std::vector<std::uint32_t>{macosarm::kDarwinRlimitNofile} &&
+                       read_guest_le(vm, limit_buffer, 8U, soft) && soft == 256U &&
+                       read_guest_le(vm, limit_buffer + 8U, 8U, hard) &&
+                       hard == macosarm::kDarwinRlimInfinity &&
+                       clock_sentinel_at(vm, limit_buffer + macosarm::kDarwinRlimitSize,
+                                         kClockPage - macosarm::kDarwinRlimitSize),
+                   "getrlimit copies rlim_cur and rlim_max out as a 16-byte struct rlimit");
+
+            host.queries.clear();
+            host.soft_limit = 8U * 1024U * 1024U;
+            host.hard_limit = 64U * 1024U * 1024U;
+            const std::uint64_t which = 0xffffffff00000000ULL |
+                                        macosarm::kDarwinRlimitPosixFlag |
+                                        macosarm::kDarwinRlimitStack;
+            const auto flagged = run_getrlimit(vm, host, state, which, limit_buffer);
+            expect(static_cast<bool>(flagged) && state.x[0] == 0U && !carry_is_set(state) &&
+                       host.queries == std::vector<std::uint32_t>{macosarm::kDarwinRlimitStack} &&
+                       read_guest_le(vm, limit_buffer, 8U, soft) && soft == 8U * 1024U * 1024U &&
+                       read_guest_le(vm, limit_buffer + 8U, 8U, hard) &&
+                       hard == 64U * 1024U * 1024U,
+                   "getrlimit ignores the upper half of x0 and strips _RLIMIT_POSIX_FLAG");
+        }
+
+        {
+            // Out-of-range resources report EINVAL before the destination is
+            // checked, and no rejected call ever queries the host or writes.
+            macosarm::GuestAddressSpace vm;
+            map_clock_page(vm, limit_rw);
+            LimitHost host;
+            macosarm::CpuState state{};
+            const auto past_end =
+                run_getrlimit(vm, host, state, macosarm::kDarwinRlimNlimits, limit_buffer);
+            const bool past_end_rejected = static_cast<bool>(past_end) &&
+                                           state.x[0] == macosarm::kDarwinErrnoEinval &&
+                                           carry_is_set(state);
+            const auto flagged = run_getrlimit(
+                vm, host, state, macosarm::kDarwinRlimitPosixFlag | macosarm::kDarwinRlimNlimits,
+                limit_unmapped);
+            expect(past_end_rejected && static_cast<bool>(flagged) &&
+                       state.x[0] == macosarm::kDarwinErrnoEinval && carry_is_set(state) &&
+                       host.queries.empty() && clock_sentinel_at(vm, kClockBase, kClockPage),
+                   "resources at or above RLIM_NLIMITS report EINVAL before EFAULT");
+
+            const auto unmapped =
+                run_getrlimit(vm, host, state, macosarm::kDarwinRlimitCore, limit_unmapped);
+            const bool unmapped_faults = static_cast<bool>(unmapped) &&
+                                         state.x[0] == macosarm::kDarwinErrnoEfault &&
+                                         carry_is_set(state);
+            const auto crossing = run_getrlimit(vm, host, state, macosarm::kDarwinRlimitCore,
+                                                kClockBase + kClockPage - 8U);
+            expect(unmapped_faults && static_cast<bool>(crossing) &&
+                       state.x[0] == macosarm::kDarwinErrnoEfault && carry_is_set(state) &&
+                       host.queries.empty() && clock_sentinel_at(vm, kClockBase, kClockPage),
+                   "unmapped or page-crossing struct rlimit faults before any host query");
+
+            macosarm::GuestAddressSpace read_only_vm;
+            map_clock_page(read_only_vm, macosarm::Protection::read);
+            const auto read_only = run_getrlimit(read_only_vm, host, state,
+                                                 macosarm::kDarwinRlimitNofile, limit_buffer);
+            expect(static_cast<bool>(read_only) &&
+                       state.x[0] == macosarm::kDarwinErrnoEfault && carry_is_set(state) &&
+                       host.queries.empty() &&
+                       clock_sentinel_at(read_only_vm, kClockBase, kClockPage),
+                   "a read-only struct rlimit destination faults before any host query");
+        }
+
+        {
+            // A host error is reported as is, after exactly one query, and
+            // leaves the destination untouched.
+            macosarm::GuestAddressSpace vm;
+            map_clock_page(vm, limit_rw);
+            LimitHost host;
+            host.next_error = macosarm::kDarwinErrnoEbadf;
+            macosarm::CpuState state{};
+            const auto result =
+                run_getrlimit(vm, host, state, macosarm::kDarwinRlimitNofile, limit_buffer);
+            expect(static_cast<bool>(result) &&
+                       state.x[0] == macosarm::kDarwinErrnoEbadf && carry_is_set(state) &&
+                       host.queries == std::vector<std::uint32_t>{macosarm::kDarwinRlimitNofile} &&
+                       clock_sentinel_at(vm, kClockBase, kClockPage),
+                   "a host getrlimit error is reported without a copyout");
+        }
+
+        {
+            // A soft limit above the hard limit, or a hard limit above
+            // RLIM_INFINITY, is a host contract violation: nothing reaches the
+            // guest. Equal limits at RLIM_INFINITY are still valid.
+            struct Violation {
+                std::uint64_t soft;
+                std::uint64_t hard;
+            };
+            const std::array<Violation, 2> violations{{
+                {512U, 256U},
+                {macosarm::kDarwinRlimInfinity, ~std::uint64_t{0}},
+            }};
+            for (const Violation& violation : violations) {
+                macosarm::GuestAddressSpace vm;
+                map_clock_page(vm, limit_rw);
+                LimitHost host;
+                host.soft_limit = violation.soft;
+                host.hard_limit = violation.hard;
+                macosarm::CpuState state{};
+                const auto violated =
+                    run_getrlimit(vm, host, state, macosarm::kDarwinRlimitNofile, limit_buffer);
+                expect(violated.error == macosarm::SyscallDispatchError::host_contract_violation &&
+                           host.queries.size() == 1U &&
+                           clock_sentinel_at(vm, kClockBase, kClockPage),
+                       "getrlimit rejects inverted or out-of-range host limits");
+            }
+
+            macosarm::GuestAddressSpace vm;
+            map_clock_page(vm, limit_rw);
+            LimitHost host;
+            host.soft_limit = macosarm::kDarwinRlimInfinity;
+            host.hard_limit = macosarm::kDarwinRlimInfinity;
+            macosarm::CpuState state{};
+            const auto unlimited =
+                run_getrlimit(vm, host, state, macosarm::kDarwinRlimitCpu, limit_buffer);
+            std::uint64_t soft = 0;
+            std::uint64_t hard = 0;
+            expect(static_cast<bool>(unlimited) && state.x[0] == 0U && !carry_is_set(state) &&
+                       read_guest_le(vm, limit_buffer, 8U, soft) &&
+                       soft == macosarm::kDarwinRlimInfinity &&
+                       read_guest_le(vm, limit_buffer + 8U, 8U, hard) &&
+                       hard == macosarm::kDarwinRlimInfinity,
+                   "getrlimit accepts equal soft and hard limits at RLIM_INFINITY");
+        }
+
+        {
+            // Hosts that do not override resource_limit report ENOSYS, never
+            // a fabricated limit.
+            struct NoLimitHost final : macosarm::DarwinHostServices {
+                macosarm::HostWriteResult write(std::int32_t,
+                                                std::span<const std::byte>) override {
+                    return {0, macosarm::kDarwinErrnoEbadf};
+                }
+            };
+            macosarm::GuestAddressSpace vm;
+            map_clock_page(vm, limit_rw);
+            NoLimitHost host;
+            macosarm::CpuState state{};
+            const auto result =
+                run_getrlimit(vm, host, state, macosarm::kDarwinRlimitNofile, limit_buffer);
+            expect(static_cast<bool>(result) &&
+                       state.x[0] == macosarm::kDarwinErrnoEnosys && carry_is_set(state) &&
+                       clock_sentinel_at(vm, kClockBase, kClockPage),
+                   "the default host reports ENOSYS for getrlimit");
         }
     }
 
