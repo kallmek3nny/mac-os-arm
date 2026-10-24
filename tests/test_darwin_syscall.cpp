@@ -583,6 +583,193 @@ macosarm::SyscallDispatchResult run_lseek(
     return macosarm::dispatch_darwin_syscall(state, vm, svc(), host);
 }
 
+// One host pread(2) or pwrite(2) transfer, recorded in call order.
+struct PositionedTransfer {
+    std::int32_t fd{};
+    std::size_t size{};
+    std::int64_t offset{};
+};
+
+// Scripted random-access descriptors for pread(2) and pwrite(2). file_fd is
+// a regular file open for reading and writing over contents, read_only_fd a
+// regular file over the same contents that is not open for writing,
+// device_fd a character device that accepts negative offsets, pipe_fd a pipe
+// (ESPIPE) and tty_fd a terminal (ENXIO); every other descriptor is EBADF.
+// Device reads return an index pattern and device writes are captured
+// without file storage, so offsets near INT64_MAX never allocate. A nonzero
+// error fails the transfer at index error_at once, so tests can prove
+// partial pwrite results. Every host call is recorded so tests can prove
+// rejected requests transfer nothing and offsets reach the host unchanged.
+struct RandomAccessHost final : macosarm::DarwinHostServices {
+    std::int32_t file_fd{3};
+    std::int32_t device_fd{4};
+    std::int32_t read_only_fd{5};
+    std::int32_t pipe_fd{6};
+    std::int32_t tty_fd{7};
+    std::vector<std::byte> contents;
+    std::vector<std::byte> device_output;
+    std::uint32_t error{};
+    std::size_t error_at{};
+    std::uint64_t short_count{};
+    bool violate_contract{};
+    std::vector<std::int32_t> requests;
+    std::vector<PositionedTransfer> transfers;
+
+    macosarm::HostWriteResult write(
+        std::int32_t fd,
+        std::span<const std::byte> bytes) override {
+        static_cast<void>(fd);
+        static_cast<void>(bytes);
+        return {0, macosarm::kDarwinErrnoEbadf};
+    }
+
+    macosarm::HostRandomAccessResult random_access_status(
+        std::int32_t fd,
+        bool for_write) override {
+        requests.push_back(fd);
+        if (fd == file_fd || (fd == read_only_fd && !for_write)) {
+            return {false, 0};
+        }
+        if (fd == device_fd) {
+            return {true, 0};
+        }
+        if (fd == pipe_fd) {
+            return {false, macosarm::kDarwinErrnoEspipe};
+        }
+        if (fd == tty_fd) {
+            return {false, macosarm::kDarwinErrnoEnxio};
+        }
+        return {false, macosarm::kDarwinErrnoEbadf};
+    }
+
+    // Record one transfer and report the scripted failure due at its index.
+    std::uint32_t record(std::int32_t fd, std::size_t size, std::int64_t offset) {
+        transfers.push_back({fd, size, offset});
+        if (error != 0 && transfers.size() == error_at + 1U) {
+            const std::uint32_t failure = error;
+            error = 0;
+            return failure;
+        }
+        return 0;
+    }
+
+    macosarm::HostReadResult read_at(
+        std::int32_t fd,
+        std::span<std::byte> bytes,
+        std::int64_t offset) override {
+        if (const std::uint32_t failure = record(fd, bytes.size(), offset); failure != 0) {
+            return {0, failure};
+        }
+        if (violate_contract) {
+            return {static_cast<std::uint64_t>(bytes.size()) + 1U, 0};
+        }
+        if (fd == device_fd) {
+            for (std::size_t i = 0; i < bytes.size(); ++i) {
+                bytes[i] = static_cast<std::byte>((i * 5U + 1U) & 0xffU);
+            }
+            return {bytes.size(), 0};
+        }
+        if (offset < 0 || static_cast<std::uint64_t>(offset) >= contents.size()) {
+            return {0, 0};
+        }
+        const auto start = static_cast<std::size_t>(offset);
+        const std::size_t count = std::min(bytes.size(), contents.size() - start);
+        std::copy_n(contents.begin() + static_cast<std::ptrdiff_t>(start), count, bytes.begin());
+        return {count, 0};
+    }
+
+    macosarm::HostWriteResult write_at(
+        std::int32_t fd,
+        std::span<const std::byte> bytes,
+        std::int64_t offset) override {
+        if (const std::uint32_t failure = record(fd, bytes.size(), offset); failure != 0) {
+            return {0, failure};
+        }
+        if (violate_contract) {
+            return {static_cast<std::uint64_t>(bytes.size()) + 1U, 0};
+        }
+        std::size_t count = bytes.size();
+        if (short_count != 0) {
+            count = static_cast<std::size_t>(std::min<std::uint64_t>(short_count, count));
+            short_count = 0;
+        }
+        if (fd == device_fd) {
+            device_output.insert(device_output.end(), bytes.begin(),
+                                 bytes.begin() + static_cast<std::ptrdiff_t>(count));
+            return {count, 0};
+        }
+        const auto start = static_cast<std::size_t>(offset);
+        if (contents.size() < start + count) {
+            contents.resize(start + count);
+        }
+        std::copy_n(bytes.begin(), count, contents.begin() + static_cast<std::ptrdiff_t>(start));
+        return {count, 0};
+    }
+};
+
+// pread(2) and pwrite(2) fixtures: one guest page pre-filled with a sentinel
+// so tests can prove exactly which guest bytes a pread wrote and that a
+// pwrite only reads its source.
+constexpr std::uint64_t kPositionedBase = 0xE00000000ULL;
+constexpr std::uint64_t kPositionedPage = macosarm::GuestAddressSpace::kPageSize;
+constexpr std::byte kPositionedSentinel{0xcc};
+
+void map_positioned_page(macosarm::GuestAddressSpace& vm, macosarm::Protection protection) {
+    const std::vector<std::byte> sentinel(kPositionedPage, kPositionedSentinel);
+    expect(static_cast<bool>(vm.map(kPositionedBase, kPositionedPage, protection)),
+           "positioned I/O buffer maps");
+    expect(static_cast<bool>(vm.load_bytes(kPositionedBase, sentinel)),
+           "positioned I/O sentinel loads");
+}
+
+// True when every positioned-page byte from offset onward is still the sentinel.
+bool positioned_sentinel_from(macosarm::GuestAddressSpace& vm, std::size_t offset) {
+    std::vector<std::byte> bytes(kPositionedPage);
+    if (!vm.read(kPositionedBase, bytes)) {
+        return false;
+    }
+    return std::all_of(bytes.begin() + static_cast<std::ptrdiff_t>(offset), bytes.end(),
+                       [](std::byte value) { return value == kPositionedSentinel; });
+}
+
+// True when the guest bytes at kPositionedBase + offset equal expected.
+bool positioned_bytes_at(macosarm::GuestAddressSpace& vm,
+                         std::size_t offset,
+                         std::span<const std::byte> expected) {
+    std::vector<std::byte> bytes(expected.size());
+    if (!vm.read(kPositionedBase + offset, bytes)) {
+        return false;
+    }
+    return std::equal(bytes.begin(), bytes.end(), expected.begin(), expected.end());
+}
+
+std::vector<std::byte> text_bytes(const std::string& text) {
+    std::vector<std::byte> bytes(text.size());
+    std::transform(text.begin(), text.end(), bytes.begin(),
+                   [](char c) { return static_cast<std::byte>(c); });
+    return bytes;
+}
+
+macosarm::SyscallDispatchResult run_positioned(
+    macosarm::GuestAddressSpace& vm,
+    macosarm::DarwinHostServices& host,
+    macosarm::CpuState& state,
+    std::uint64_t syscall_number,
+    std::uint64_t fd_register,
+    std::uint64_t buffer_address,
+    std::uint64_t nbyte,
+    std::uint64_t offset_register) {
+    state = {};
+    state.x[0] = fd_register;
+    state.x[1] = buffer_address;
+    state.x[2] = nbyte;
+    state.x[3] = offset_register;
+    state.x[16] = syscall_number;
+    // Preset carry so every success test proves the dispatcher clears it.
+    state.pstate = macosarm::kA64PstateCarry;
+    return macosarm::dispatch_darwin_syscall(state, vm, svc(), host);
+}
+
 } // namespace
 
 int main() {
@@ -2857,6 +3044,427 @@ int main() {
                    bad_size.error == macosarm::SyscallDispatchError::host_contract_violation,
                "lseek rejects a negative regular-file offset or size from the host");
         expect(host.commits.size() == 2U, "lseek commits only after every check passes");
+    }
+
+    constexpr auto positioned_rw = macosarm::Protection::read | macosarm::Protection::write;
+
+    {
+        // pread(2) on a regular file copies the bytes at the offset into the
+        // guest and returns their count in x0 with carry clear. Only w0 names
+        // the descriptor, a read crossing end-of-file is short and one at
+        // end-of-file returns 0. Both entry points share one handler.
+        macosarm::GuestAddressSpace vm;
+        map_positioned_page(vm, positioned_rw);
+        RandomAccessHost host;
+        host.contents = text_bytes("0123456789abcdef");
+        macosarm::CpuState state{};
+        constexpr std::uint64_t upper_fd_bits = std::uint64_t{1} << 32U;
+        const auto first = run_positioned(vm, host, state, macosarm::kDarwinSysPread,
+                                          upper_fd_bits | 3U, kPositionedBase, 4U, 6U);
+        expect(static_cast<bool>(first) && first.action == macosarm::SyscallAction::resume &&
+                   first.syscall_number == macosarm::kDarwinSysPread,
+               "pread dispatch resumes the guest");
+        expect(!carry_is_set(state) && state.x[0] == 4U &&
+                   positioned_bytes_at(vm, 0, text_bytes("6789")),
+               "pread copies the bytes at the offset and clears carry");
+        const auto tail = run_positioned(vm, host, state, macosarm::kDarwinSysPreadNocancel,
+                                         3U, kPositionedBase + 8U, 8U, 12U);
+        expect(static_cast<bool>(tail) &&
+                   tail.syscall_number == macosarm::kDarwinSysPreadNocancel &&
+                   !carry_is_set(state) && state.x[0] == 4U,
+               "pread_nocancel crossing end-of-file returns a short count");
+        expect(positioned_bytes_at(vm, 8, text_bytes("cdef")) && positioned_sentinel_from(vm, 12),
+               "pread writes no guest bytes past the transferred count");
+        const auto at_end = run_positioned(vm, host, state, macosarm::kDarwinSysPread, 3U,
+                                           kPositionedBase + 12U, 8U, 16U);
+        expect(static_cast<bool>(at_end) && !carry_is_set(state) && state.x[0] == 0U &&
+                   positioned_sentinel_from(vm, 12),
+               "pread at end-of-file returns 0 and writes nothing");
+        expect(host.requests == std::vector<std::int32_t>{3, 3, 3} &&
+                   host.transfers.size() == 3U && host.transfers[0].size == 4U &&
+                   host.transfers[0].offset == 6 && host.transfers[1].offset == 12 &&
+                   host.transfers[2].offset == 16,
+               "pread reads once at the unchanged requested offset");
+    }
+
+    {
+        // nbyte above INT_MAX is EINVAL before the descriptor is resolved,
+        // with no 64-bit truncation. Then an unknown fd is EBADF, a pipe
+        // ESPIPE, a terminal ENXIO and a negative offset on a regular file
+        // EINVAL. None of them transfer or write guest bytes.
+        macosarm::GuestAddressSpace vm;
+        map_positioned_page(vm, positioned_rw);
+        RandomAccessHost host;
+        host.contents = text_bytes("0123456789abcdef");
+        macosarm::CpuState state{};
+        const auto pread_fd = [&](std::uint64_t fd, std::uint64_t nbyte, std::int64_t offset) {
+            static_cast<void>(run_positioned(vm, host, state, macosarm::kDarwinSysPread, fd,
+                                             kPositionedBase, nbyte,
+                                             static_cast<std::uint64_t>(offset)));
+        };
+        pread_fd(3U, 0x80000000ULL, 0);
+        const bool over_int_max = failed_with(state, macosarm::kDarwinErrnoEinval);
+        pread_fd(3U, 0x100000004ULL, 0);
+        expect(over_int_max && failed_with(state, macosarm::kDarwinErrnoEinval) &&
+                   host.requests.empty(),
+               "pread above INT_MAX reports EINVAL before resolving the fd");
+        pread_fd(9U, 4U, 0);
+        expect(failed_with(state, macosarm::kDarwinErrnoEbadf), "pread on an unknown fd reports EBADF");
+        pread_fd(6U, 4U, 0);
+        expect(failed_with(state, macosarm::kDarwinErrnoEspipe), "pread on a pipe reports ESPIPE");
+        pread_fd(7U, 4U, 0);
+        expect(failed_with(state, macosarm::kDarwinErrnoEnxio), "pread on a terminal reports ENXIO");
+        pread_fd(3U, 4U, -4);
+        expect(failed_with(state, macosarm::kDarwinErrnoEinval),
+               "pread at a negative offset on a regular file reports EINVAL");
+        expect(host.requests == std::vector<std::int32_t>{9, 6, 7, 3} && host.transfers.empty() &&
+                   positioned_sentinel_from(vm, 0),
+               "rejected pread requests resolve the fd once each and transfer nothing");
+    }
+
+    {
+        // A character device accepts a negative offset, passed to the host
+        // unchanged. A read is clipped so it never passes INT64_MAX, and one
+        // at INT64_MAX itself returns 0 without a host read. A zero-length
+        // read still resolves the descriptor, even for a null buffer, but
+        // never reaches the host.
+        macosarm::GuestAddressSpace vm;
+        map_positioned_page(vm, positioned_rw);
+        RandomAccessHost host;
+        macosarm::CpuState state{};
+        constexpr std::int64_t max_offset = 0x7fffffffffffffffLL;
+        std::vector<std::byte> device_pattern(8);
+        for (std::size_t i = 0; i < device_pattern.size(); ++i) {
+            device_pattern[i] = static_cast<std::byte>((i * 5U + 1U) & 0xffU);
+        }
+        const auto negative = run_positioned(vm, host, state, macosarm::kDarwinSysPread, 4U,
+                                             kPositionedBase, 8U,
+                                             static_cast<std::uint64_t>(std::int64_t{-16}));
+        expect(static_cast<bool>(negative) && !carry_is_set(state) && state.x[0] == 8U &&
+                   positioned_bytes_at(vm, 0, device_pattern),
+               "pread on a character device accepts a negative offset");
+        const auto clipped = run_positioned(vm, host, state, macosarm::kDarwinSysPread, 4U,
+                                            kPositionedBase + 16U, 8U,
+                                            static_cast<std::uint64_t>(max_offset - 4));
+        expect(static_cast<bool>(clipped) && !carry_is_set(state) && state.x[0] == 4U &&
+                   positioned_bytes_at(vm, 16, std::span<const std::byte>(device_pattern).first(4)) &&
+                   positioned_sentinel_from(vm, 20),
+               "pread near INT64_MAX is clipped so it ends at INT64_MAX");
+        const auto at_max = run_positioned(vm, host, state, macosarm::kDarwinSysPread, 4U,
+                                           kPositionedBase, 8U,
+                                           static_cast<std::uint64_t>(max_offset));
+        expect(static_cast<bool>(at_max) && !carry_is_set(state) && state.x[0] == 0U,
+               "pread at INT64_MAX returns 0");
+        const auto empty =
+            run_positioned(vm, host, state, macosarm::kDarwinSysPread, 3U, 0U, 0U, 0U);
+        expect(static_cast<bool>(empty) && !carry_is_set(state) && state.x[0] == 0U,
+               "zero-length pread succeeds for a null buffer");
+        static_cast<void>(
+            run_positioned(vm, host, state, macosarm::kDarwinSysPread, 9U, 0U, 0U, 0U));
+        expect(failed_with(state, macosarm::kDarwinErrnoEbadf),
+               "zero-length pread still reports EBADF for an unknown fd");
+        expect(host.requests == std::vector<std::int32_t>{4, 4, 4, 3, 9} &&
+                   host.transfers.size() == 2U && host.transfers[0].size == 8U &&
+                   host.transfers[0].offset == -16 && host.transfers[1].size == 4U &&
+                   host.transfers[1].offset == max_offset - 4,
+               "only nonempty pread transfers reach the host, at unchanged offsets");
+    }
+
+    {
+        // The destination is probed before the host read, so an unmapped,
+        // page-crossing or read-only buffer is EFAULT without consuming
+        // input. A host error is reported as-is and writes nothing, and a
+        // host claiming more bytes than requested violates its contract.
+        macosarm::GuestAddressSpace vm;
+        map_positioned_page(vm, positioned_rw);
+        macosarm::GuestAddressSpace readonly_vm;
+        map_positioned_page(readonly_vm, macosarm::Protection::read);
+        RandomAccessHost host;
+        host.contents = text_bytes("0123456789abcdef");
+        macosarm::CpuState state{};
+        static_cast<void>(run_positioned(vm, host, state, macosarm::kDarwinSysPread, 3U,
+                                         0xdead00000000ULL, 4U, 0U));
+        const bool unmapped = failed_with(state, macosarm::kDarwinErrnoEfault);
+        static_cast<void>(run_positioned(vm, host, state, macosarm::kDarwinSysPread, 3U,
+                                         kPositionedBase + kPositionedPage - 2U, 4U, 0U));
+        const bool crossing = failed_with(state, macosarm::kDarwinErrnoEfault);
+        static_cast<void>(run_positioned(readonly_vm, host, state, macosarm::kDarwinSysPread, 3U,
+                                         kPositionedBase, 4U, 0U));
+        expect(unmapped && crossing && failed_with(state, macosarm::kDarwinErrnoEfault),
+               "pread to an unmapped, page-crossing or read-only buffer reports EFAULT");
+        expect(host.requests.size() == 3U && host.transfers.empty() &&
+                   positioned_sentinel_from(vm, 0) && positioned_sentinel_from(readonly_vm, 0),
+               "faulting pread resolves the fd but never reads from the host");
+        host.error = macosarm::kDarwinErrnoEio;
+        static_cast<void>(run_positioned(vm, host, state, macosarm::kDarwinSysPread, 3U,
+                                         kPositionedBase, 4U, 0U));
+        expect(failed_with(state, macosarm::kDarwinErrnoEio) && host.transfers.size() == 1U &&
+                   positioned_sentinel_from(vm, 0),
+               "a pread host error is reported and writes no guest bytes");
+        host.violate_contract = true;
+        const auto violated = run_positioned(vm, host, state, macosarm::kDarwinSysPread, 3U,
+                                             kPositionedBase, 4U, 0U);
+        expect(violated.error == macosarm::SyscallDispatchError::host_contract_violation &&
+                   positioned_sentinel_from(vm, 0),
+               "pread rejects a host count above the request");
+    }
+
+    {
+        // A large pread performs one host read of at most 64 KiB, so input
+        // past the first chunk is left for the guest's next call.
+        macosarm::GuestAddressSpace vm;
+        constexpr std::uint64_t large_size = 5U * macosarm::GuestAddressSpace::kPageSize;
+        expect(static_cast<bool>(vm.map(kPositionedBase, large_size, positioned_rw)),
+               "large pread buffer maps writable");
+        RandomAccessHost host;
+        macosarm::CpuState state{};
+        const auto large = run_positioned(vm, host, state, macosarm::kDarwinSysPread, 4U,
+                                          kPositionedBase, 64U * 1024U + 3U, 0U);
+        expect(static_cast<bool>(large) && !carry_is_set(state) && state.x[0] == 64U * 1024U &&
+                   host.transfers.size() == 1U && host.transfers[0].size == 64U * 1024U,
+               "large pread performs one host read capped at 64 KiB");
+    }
+
+    {
+        // pwrite(2) on a regular file stores the guest bytes at the offset
+        // and returns their count in x0 with carry clear, leaving the guest
+        // source untouched. Only w0 names the descriptor, the file grows when
+        // a write passes its end, and both entry points share one handler.
+        // A read-only source page is enough because pwrite only reads it.
+        macosarm::GuestAddressSpace vm;
+        map_positioned_page(vm, macosarm::Protection::read);
+        const std::vector<std::byte> message = text_bytes("WXYZ");
+        expect(static_cast<bool>(vm.load_bytes(kPositionedBase, message)),
+               "pwrite source loads");
+        RandomAccessHost host;
+        host.contents = text_bytes("0123456789abcdef");
+        macosarm::CpuState state{};
+        constexpr std::uint64_t upper_fd_bits = std::uint64_t{1} << 32U;
+        const auto inside = run_positioned(vm, host, state, macosarm::kDarwinSysPwrite,
+                                           upper_fd_bits | 3U, kPositionedBase, 4U, 4U);
+        expect(static_cast<bool>(inside) && inside.action == macosarm::SyscallAction::resume &&
+                   inside.syscall_number == macosarm::kDarwinSysPwrite &&
+                   !carry_is_set(state) && state.x[0] == 4U,
+               "pwrite returns the stored count and clears carry");
+        expect(host.contents == text_bytes("0123WXYZ89abcdef"),
+               "pwrite stores the guest bytes at the requested offset");
+        const auto past_end = run_positioned(vm, host, state, macosarm::kDarwinSysPwriteNocancel,
+                                             3U, kPositionedBase, 2U, 18U);
+        std::vector<std::byte> grown = text_bytes("0123WXYZ89abcdef");
+        grown.push_back(std::byte{0});
+        grown.push_back(std::byte{0});
+        grown.push_back(std::byte{'W'});
+        grown.push_back(std::byte{'X'});
+        expect(static_cast<bool>(past_end) &&
+                   past_end.syscall_number == macosarm::kDarwinSysPwriteNocancel &&
+                   !carry_is_set(state) && state.x[0] == 2U && host.contents == grown,
+               "pwrite_nocancel past end-of-file grows the file");
+        expect(positioned_bytes_at(vm, 0, message) && positioned_sentinel_from(vm, message.size()),
+               "pwrite leaves the guest source unchanged");
+        expect(host.requests == std::vector<std::int32_t>{3, 3} && host.transfers.size() == 2U &&
+                   host.transfers[0].size == 4U && host.transfers[0].offset == 4 &&
+                   host.transfers[1].size == 2U && host.transfers[1].offset == 18,
+               "pwrite writes once at the unchanged requested offset");
+    }
+
+    {
+        // pwrite rejects an offset of exactly -1 with EINVAL before anything
+        // else, even on a character device, and nbyte above INT_MAX with
+        // EINVAL before the descriptor is resolved. Then an unknown fd or one
+        // not open for writing is EBADF, a pipe ESPIPE, a terminal ENXIO and
+        // another negative offset on a regular file EINVAL. None transfer.
+        macosarm::GuestAddressSpace vm;
+        map_positioned_page(vm, positioned_rw);
+        RandomAccessHost host;
+        host.contents = text_bytes("0123456789abcdef");
+        macosarm::CpuState state{};
+        const auto pwrite_fd = [&](std::uint64_t fd, std::uint64_t nbyte, std::int64_t offset) {
+            static_cast<void>(run_positioned(vm, host, state, macosarm::kDarwinSysPwrite, fd,
+                                             kPositionedBase, nbyte,
+                                             static_cast<std::uint64_t>(offset)));
+        };
+        pwrite_fd(4U, 4U, -1);
+        const bool minus_one_device = failed_with(state, macosarm::kDarwinErrnoEinval);
+        pwrite_fd(9U, 0x80000000ULL, -1);
+        expect(minus_one_device && failed_with(state, macosarm::kDarwinErrnoEinval) &&
+                   host.requests.empty(),
+               "pwrite at offset -1 reports EINVAL before any other check");
+        pwrite_fd(3U, 0x80000000ULL, 0);
+        const bool over_int_max = failed_with(state, macosarm::kDarwinErrnoEinval);
+        pwrite_fd(9U, 0x100000004ULL, 0);
+        expect(over_int_max && failed_with(state, macosarm::kDarwinErrnoEinval) &&
+                   host.requests.empty(),
+               "pwrite above INT_MAX reports EINVAL before resolving the fd");
+        pwrite_fd(9U, 4U, 0);
+        expect(failed_with(state, macosarm::kDarwinErrnoEbadf), "pwrite on an unknown fd reports EBADF");
+        pwrite_fd(5U, 4U, 0);
+        expect(failed_with(state, macosarm::kDarwinErrnoEbadf),
+               "pwrite on a descriptor not open for writing reports EBADF");
+        pwrite_fd(6U, 4U, 0);
+        expect(failed_with(state, macosarm::kDarwinErrnoEspipe), "pwrite on a pipe reports ESPIPE");
+        pwrite_fd(7U, 4U, 0);
+        expect(failed_with(state, macosarm::kDarwinErrnoEnxio), "pwrite on a terminal reports ENXIO");
+        pwrite_fd(3U, 4U, -2);
+        expect(failed_with(state, macosarm::kDarwinErrnoEinval),
+               "pwrite at a negative offset on a regular file reports EINVAL");
+        expect(host.requests == std::vector<std::int32_t>{9, 5, 6, 7, 3} && host.transfers.empty() &&
+                   host.contents == text_bytes("0123456789abcdef"),
+               "rejected pwrite requests resolve the fd once each and transfer nothing");
+        const auto readable = run_positioned(vm, host, state, macosarm::kDarwinSysPread, 5U,
+                                             kPositionedBase, 4U, 0U);
+        expect(static_cast<bool>(readable) && !carry_is_set(state) && state.x[0] == 4U &&
+                   positioned_bytes_at(vm, 0, text_bytes("0123")),
+               "pread on the descriptor not open for writing still succeeds");
+    }
+
+    {
+        // A character device accepts a negative offset other than -1, passed
+        // to the host unchanged. pwrite at INT64_MAX itself is EFBIG, and one
+        // near INT64_MAX is clipped so it ends there. A zero-length pwrite
+        // still resolves the descriptor, even for a null buffer, but never
+        // reaches the host.
+        macosarm::GuestAddressSpace vm;
+        map_positioned_page(vm, macosarm::Protection::read);
+        const std::vector<std::byte> message = text_bytes("ABCDEFGH");
+        expect(static_cast<bool>(vm.load_bytes(kPositionedBase, message)),
+               "device pwrite source loads");
+        RandomAccessHost host;
+        macosarm::CpuState state{};
+        constexpr std::int64_t max_offset = 0x7fffffffffffffffLL;
+        const auto negative = run_positioned(vm, host, state, macosarm::kDarwinSysPwrite, 4U,
+                                             kPositionedBase, 8U,
+                                             static_cast<std::uint64_t>(std::int64_t{-16}));
+        expect(static_cast<bool>(negative) && !carry_is_set(state) && state.x[0] == 8U &&
+                   host.device_output == message,
+               "pwrite on a character device accepts a negative offset");
+        static_cast<void>(run_positioned(vm, host, state, macosarm::kDarwinSysPwrite, 4U,
+                                         kPositionedBase, 8U,
+                                         static_cast<std::uint64_t>(max_offset)));
+        expect(failed_with(state, macosarm::kDarwinErrnoEfbig),
+               "pwrite at INT64_MAX reports EFBIG");
+        const auto clipped = run_positioned(vm, host, state, macosarm::kDarwinSysPwrite, 4U,
+                                            kPositionedBase, 8U,
+                                            static_cast<std::uint64_t>(max_offset - 4));
+        expect(static_cast<bool>(clipped) && !carry_is_set(state) && state.x[0] == 4U,
+               "pwrite near INT64_MAX is clipped so it ends at INT64_MAX");
+        const auto empty =
+            run_positioned(vm, host, state, macosarm::kDarwinSysPwrite, 3U, 0U, 0U, 0U);
+        expect(static_cast<bool>(empty) && !carry_is_set(state) && state.x[0] == 0U,
+               "zero-length pwrite succeeds for a null buffer");
+        static_cast<void>(
+            run_positioned(vm, host, state, macosarm::kDarwinSysPwrite, 9U, 0U, 0U, 0U));
+        expect(failed_with(state, macosarm::kDarwinErrnoEbadf),
+               "zero-length pwrite still reports EBADF for an unknown fd");
+        std::vector<std::byte> expected_output = message;
+        expected_output.insert(expected_output.end(), message.begin(), message.begin() + 4);
+        expect(host.requests == std::vector<std::int32_t>{4, 4, 4, 3, 9} &&
+                   host.transfers.size() == 2U && host.transfers[0].size == 8U &&
+                   host.transfers[0].offset == -16 && host.transfers[1].size == 4U &&
+                   host.transfers[1].offset == max_offset - 4 &&
+                   host.device_output == expected_output,
+               "only nonempty pwrite transfers reach the host, at unchanged offsets");
+    }
+
+    {
+        // A pwrite larger than one 64 KiB chunk reaches the host as bounded
+        // chunks in order, each at the offset where the previous one ended,
+        // and returns the full count. A short host write ends the call with
+        // its count. A host error after the first chunk reports the bytes
+        // already written, while one on the first chunk is reported as-is.
+        // A host claiming more bytes than requested violates its contract.
+        constexpr std::size_t chunk = 64U * 1024U;
+        macosarm::GuestAddressSpace vm;
+        expect(static_cast<bool>(vm.map(kPositionedBase,
+                                        5U * macosarm::GuestAddressSpace::kPageSize,
+                                        macosarm::Protection::read)),
+               "large pwrite source maps");
+        std::vector<std::byte> source(chunk + 3U);
+        for (std::size_t i = 0; i < source.size(); ++i) {
+            source[i] = static_cast<std::byte>((i * 7U + 3U) & 0xffU);
+        }
+        expect(static_cast<bool>(vm.load_bytes(kPositionedBase, source)),
+               "large pwrite source loads");
+        const auto source_prefix = [&](std::size_t count) {
+            return std::vector<std::byte>(
+                source.begin(), source.begin() + static_cast<std::ptrdiff_t>(count));
+        };
+        macosarm::CpuState state{};
+
+        RandomAccessHost host;
+        const auto large = run_positioned(vm, host, state, macosarm::kDarwinSysPwrite, 3U,
+                                          kPositionedBase, source.size(), 8U);
+        std::vector<std::byte> stored(8U, std::byte{0});
+        stored.insert(stored.end(), source.begin(), source.end());
+        expect(static_cast<bool>(large) && !carry_is_set(state) &&
+                   state.x[0] == source.size() && host.contents == stored,
+               "large pwrite stores every byte and returns the full count");
+        expect(host.requests == std::vector<std::int32_t>{3} && host.transfers.size() == 2U &&
+                   host.transfers[0].size == chunk && host.transfers[0].offset == 8 &&
+                   host.transfers[1].size == 3U &&
+                   host.transfers[1].offset == static_cast<std::int64_t>(8U + chunk),
+               "large pwrite is split into 64 KiB chunks at advancing offsets");
+
+        RandomAccessHost short_host;
+        short_host.short_count = 100U;
+        const auto shortened = run_positioned(vm, short_host, state, macosarm::kDarwinSysPwrite,
+                                              3U, kPositionedBase, source.size(), 0U);
+        expect(static_cast<bool>(shortened) && !carry_is_set(state) && state.x[0] == 100U &&
+                   short_host.transfers.size() == 1U && short_host.contents == source_prefix(100U),
+               "a short host pwrite ends the call with its count");
+
+        RandomAccessHost late_failure;
+        late_failure.error = macosarm::kDarwinErrnoEio;
+        late_failure.error_at = 1U;
+        const auto partial = run_positioned(vm, late_failure, state, macosarm::kDarwinSysPwrite,
+                                            3U, kPositionedBase, source.size(), 0U);
+        expect(static_cast<bool>(partial) && !carry_is_set(state) && state.x[0] == chunk &&
+                   late_failure.transfers.size() == 2U &&
+                   late_failure.contents == source_prefix(chunk),
+               "a pwrite host error after the first chunk reports the bytes already written");
+
+        RandomAccessHost early_failure;
+        early_failure.error = macosarm::kDarwinErrnoEio;
+        static_cast<void>(run_positioned(vm, early_failure, state, macosarm::kDarwinSysPwrite,
+                                         3U, kPositionedBase, source.size(), 0U));
+        expect(failed_with(state, macosarm::kDarwinErrnoEio) &&
+                   early_failure.transfers.size() == 1U && early_failure.contents.empty(),
+               "a pwrite host error on the first chunk is reported as-is");
+
+        RandomAccessHost violating;
+        violating.violate_contract = true;
+        const auto violated = run_positioned(vm, violating, state, macosarm::kDarwinSysPwrite,
+                                             3U, kPositionedBase, 4U, 0U);
+        expect(violated.error == macosarm::SyscallDispatchError::host_contract_violation &&
+                   violating.contents.empty(),
+               "pwrite rejects a host count above the request");
+    }
+
+    {
+        // pwrite copies each chunk of the guest source in just before the
+        // host write, so an unmapped source is EFAULT after the descriptor
+        // is resolved but before any transfer, and a source that ends after
+        // the first 64 KiB chunk reports the bytes already written.
+        constexpr std::size_t chunk = 64U * 1024U;
+        macosarm::GuestAddressSpace vm;
+        expect(static_cast<bool>(vm.map(kPositionedBase, chunk, macosarm::Protection::read)),
+               "truncated pwrite source maps");
+        macosarm::CpuState state{};
+
+        RandomAccessHost unmapped;
+        static_cast<void>(run_positioned(vm, unmapped, state, macosarm::kDarwinSysPwrite, 3U,
+                                         0xdead00000000ULL, 4U, 0U));
+        expect(failed_with(state, macosarm::kDarwinErrnoEfault) &&
+                   unmapped.requests == std::vector<std::int32_t>{3} &&
+                   unmapped.transfers.empty() && unmapped.contents.empty(),
+               "pwrite from an unmapped source reports EFAULT and transfers nothing");
+
+        RandomAccessHost truncated;
+        const auto partial = run_positioned(vm, truncated, state, macosarm::kDarwinSysPwrite, 3U,
+                                            kPositionedBase, chunk + 3U, 0U);
+        expect(static_cast<bool>(partial) && !carry_is_set(state) && state.x[0] == chunk &&
+                   truncated.transfers.size() == 1U && truncated.transfers[0].size == chunk &&
+                   truncated.contents.size() == chunk,
+               "a pwrite source fault after the first chunk reports the bytes already written");
     }
 
     if (failures != 0) {

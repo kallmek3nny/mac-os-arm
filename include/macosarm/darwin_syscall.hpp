@@ -116,11 +116,32 @@ constexpr std::uint32_t kDarwinSeekCur = 1;  // SEEK_CUR (L_INCR)
 constexpr std::uint32_t kDarwinSeekEnd = 2;  // SEEK_END (L_XTND)
 constexpr std::uint32_t kDarwinSeekHole = 3; // SEEK_HOLE
 constexpr std::uint32_t kDarwinSeekData = 4; // SEEK_DATA
+// XNU syscalls.master #153: user_ssize_t pread(int fd, user_addr_t buf,
+// user_size_t nbyte, off_t offset), and #154 pwrite with the same
+// arguments. #414 pread_nocancel and #415 pwrite_nocancel share their
+// argument and error contracts; only the pthread cancellation point
+// differs. fd is an int, so only w0 counts; nbyte and the off_t offset
+// arrive whole in x2 and x3. In bsd/kern/sys_generic.c pwrite first
+// rejects an offset of exactly -1 (EINVAL). Both then reject an nbyte above
+// INT_MAX (EINVAL) and resolve the descriptor (EBADF, also when it is not
+// open for reading or for writing). A non-vnode descriptor or a FIFO
+// cannot be accessed at an offset (ESPIPE), nor can a terminal (ENXIO).
+// vn_read and vn_write in bsd/vfs/vfs_vnops.c then reject a negative
+// offset except on a character device (EINVAL), and shorten a transfer
+// that would pass INT64_MAX. At INT64_MAX itself a read transfers nothing
+// and a write fails with EFBIG. Neither moves the descriptor's file
+// offset, and pwrite ignores O_APPEND.
+constexpr std::uint64_t kDarwinSysPread = 153;
+constexpr std::uint64_t kDarwinSysPwrite = 154;
+constexpr std::uint64_t kDarwinSysPreadNocancel = 414;
+constexpr std::uint64_t kDarwinSysPwriteNocancel = 415;
 constexpr std::uint32_t kDarwinErrnoEio = 5;
+constexpr std::uint32_t kDarwinErrnoEnxio = 6;
 constexpr std::uint32_t kDarwinErrnoEbadf = 9;
 constexpr std::uint32_t kDarwinErrnoEnomem = 12;
 constexpr std::uint32_t kDarwinErrnoEacces = 13;
 constexpr std::uint32_t kDarwinErrnoEinval = 22;
+constexpr std::uint32_t kDarwinErrnoEfbig = 27;
 constexpr std::uint32_t kDarwinErrnoEspipe = 29;
 constexpr std::uint32_t kDarwinErrnoEoverflow = 84;
 constexpr std::uint32_t kDarwinErrnoEnotty = 25;
@@ -291,6 +312,21 @@ struct HostSetOffsetResult {
     }
 };
 
+// Guest-visible state of descriptor fd for pread(2) or pwrite(2), as
+// preparefileread, preparefilewrite and valid_for_random_access in
+// bsd/kern/sys_generic.c see it. An unknown descriptor, or one not open for
+// the requested direction, reports EBADF. A pipe, socket or FIFO reports
+// ESPIPE and a terminal ENXIO. character_device marks a VCHR vnode, the
+// only kind on which vn_read and vn_write accept a negative offset.
+struct HostRandomAccessResult {
+    bool character_device{};
+    std::uint32_t error{};
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return error == 0;
+    }
+};
+
 class DarwinHostServices {
 public:
     virtual ~DarwinHostServices() = default;
@@ -372,6 +408,50 @@ public:
         static_cast<void>(fd);
         static_cast<void>(offset);
         return {kDarwinErrnoEbadf};
+    }
+
+    // Describe descriptor fd for pread(2) (for_write false) or pwrite(2)
+    // (for_write true), as preparefileread or preparefilewrite and then
+    // valid_for_random_access see it. The dispatcher applies XNU's offset
+    // and size checks itself. Hosts that do not override this expose no
+    // descriptors and report EBADF, never a fabricated file.
+    [[nodiscard]] virtual HostRandomAccessResult random_access_status(
+        std::int32_t fd,
+        bool for_write) {
+        static_cast<void>(fd);
+        static_cast<void>(for_write);
+        return {false, kDarwinErrnoEbadf};
+    }
+
+    // Fill at most bytes.size() bytes of descriptor fd starting at offset
+    // for pread(2), leaving its file offset unchanged. A successful
+    // zero-byte result is end-of-file. The dispatcher calls this only after
+    // random_access_status and the offset checks pass, with a nonempty span
+    // whose range ends at or below INT64_MAX. Hosts that do not override
+    // this report EBADF, never fabricated input.
+    [[nodiscard]] virtual HostReadResult read_at(
+        std::int32_t fd,
+        std::span<std::byte> bytes,
+        std::int64_t offset) {
+        static_cast<void>(fd);
+        static_cast<void>(bytes);
+        static_cast<void>(offset);
+        return {0, kDarwinErrnoEbadf};
+    }
+
+    // Store at most bytes.size() bytes to descriptor fd starting at offset
+    // for pwrite(2), ignoring O_APPEND and leaving its file offset
+    // unchanged. The dispatcher calls this under the same contract as
+    // read_at. Hosts that do not override this report EBADF, never a
+    // fabricated success.
+    [[nodiscard]] virtual HostWriteResult write_at(
+        std::int32_t fd,
+        std::span<const std::byte> bytes,
+        std::int64_t offset) {
+        static_cast<void>(fd);
+        static_cast<void>(bytes);
+        static_cast<void>(offset);
+        return {0, kDarwinErrnoEbadf};
     }
 };
 

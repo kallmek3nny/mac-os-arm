@@ -409,6 +409,198 @@ void set_error(CpuState& state, std::uint32_t error) noexcept {
     return finish();
 }
 
+// XNU bsd/kern/sys_generic.c: pread_nocancel enters read_internal, which
+// rejects nbyte > INT_MAX (EINVAL) before preparefileread resolves the
+// descriptor (EBADF, also when it is not open for reading) and
+// valid_for_random_access rejects a pipe, socket or FIFO (ESPIPE) or a
+// terminal (ENXIO). vn_read_common in bsd/vfs/vfs_vnops.c then rejects a
+// negative offset except on a character device (EINVAL) and shortens a read
+// that would pass INT64_MAX, so at INT64_MAX itself nothing is transferred.
+// These checks run even for a zero-length read. As in this dispatcher's
+// read(2), one bounded host read fills a destination that was probed first,
+// so device input is never consumed and then dropped. The descriptor's file
+// offset never moves.
+[[nodiscard]] SyscallDispatchResult dispatch_pread(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    DarwinHostServices& host,
+    std::uint64_t syscall_number) {
+
+    const auto finish = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    };
+    const auto contract_violation = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::host_contract_violation,
+            SyscallAction::resume, syscall_number, 0};
+    };
+
+    const auto fd = static_cast<std::int32_t>(static_cast<std::uint32_t>(state.x[0]));
+    const std::uint64_t guest_address = state.x[1];
+    const std::uint64_t nbyte = state.x[2];
+    const auto offset = static_cast<std::int64_t>(state.x[3]);
+
+    if (nbyte > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+        set_error(state, kDarwinErrnoEinval);
+        return finish();
+    }
+    const HostRandomAccessResult descriptor = host.random_access_status(fd, false);
+    if (!descriptor) {
+        set_error(state, descriptor.error);
+        return finish();
+    }
+    if (offset < 0 && !descriptor.character_device) {
+        set_error(state, kDarwinErrnoEinval);
+        return finish();
+    }
+
+    // Clip the transfer so it never passes INT64_MAX. A negative offset is
+    // only reachable on a character device, where no clipping applies.
+    std::uint64_t length = nbyte;
+    if (offset >= 0) {
+        const auto room = static_cast<std::uint64_t>(
+            std::numeric_limits<std::int64_t>::max() - offset);
+        length = std::min(length, room);
+    }
+    if (length == 0U) {
+        set_success(state, 0U);
+        return finish();
+    }
+
+    const auto requested = static_cast<std::size_t>(
+        std::min<std::uint64_t>(length, kIoChunkSize));
+    if (!address_space.probe_write(guest_address, requested)) {
+        set_error(state, kDarwinErrnoEfault);
+        return finish();
+    }
+
+    std::array<std::byte, kIoChunkSize> chunk{};
+    const HostReadResult host_result = host.read_at(
+        fd, std::span<std::byte>(chunk.data(), requested), offset);
+    if (!host_result) {
+        set_error(state, host_result.error);
+        return finish();
+    }
+    if (host_result.bytes_read > requested) {
+        return contract_violation();
+    }
+    const auto received = static_cast<std::size_t>(host_result.bytes_read);
+    if (received != 0U &&
+        !address_space.write(guest_address,
+                             std::span<const std::byte>(chunk.data(), received))) {
+        set_error(state, kDarwinErrnoEfault);
+        return finish();
+    }
+    set_success(state, host_result.bytes_read);
+    return finish();
+}
+
+// XNU bsd/kern/sys_generic.c: pwrite_nocancel rejects an offset of exactly
+// -1 (EINVAL) before write_internal rejects nbyte > INT_MAX (EINVAL),
+// preparefilewrite resolves the descriptor (EBADF, also when it is not open
+// for writing) and valid_for_random_access rejects a pipe, socket or FIFO
+// (ESPIPE) or a terminal (ENXIO). vn_write in bsd/vfs/vfs_vnops.c then
+// ignores O_APPEND, rejects a negative offset except on a character device
+// (EINVAL), fails outright at INT64_MAX (EFBIG) and shortens a write that
+// would pass INT64_MAX. These checks run even for a zero-length write. As in
+// this dispatcher's write(2), bounded chunks reach the host in order, a
+// short host write ends the call, and a later fault or host error reports
+// the bytes already written; an error is reported only when none were. The
+// descriptor's file offset never moves.
+[[nodiscard]] SyscallDispatchResult dispatch_pwrite(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    DarwinHostServices& host,
+    std::uint64_t syscall_number) {
+
+    const auto finish = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    };
+    const auto contract_violation = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::host_contract_violation,
+            SyscallAction::resume, syscall_number, 0};
+    };
+
+    const auto fd = static_cast<std::int32_t>(static_cast<std::uint32_t>(state.x[0]));
+    std::uint64_t guest_address = state.x[1];
+    const std::uint64_t nbyte = state.x[2];
+    const auto offset = static_cast<std::int64_t>(state.x[3]);
+    constexpr std::int64_t kMaxOffset = std::numeric_limits<std::int64_t>::max();
+
+    if (offset == -1) {
+        set_error(state, kDarwinErrnoEinval);
+        return finish();
+    }
+    if (nbyte > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+        set_error(state, kDarwinErrnoEinval);
+        return finish();
+    }
+    const HostRandomAccessResult descriptor = host.random_access_status(fd, true);
+    if (!descriptor) {
+        set_error(state, descriptor.error);
+        return finish();
+    }
+    if (offset < 0 && !descriptor.character_device) {
+        set_error(state, kDarwinErrnoEinval);
+        return finish();
+    }
+    if (offset == kMaxOffset) {
+        set_error(state, kDarwinErrnoEfbig);
+        return finish();
+    }
+
+    // Clip the transfer so it never passes INT64_MAX. A negative offset is
+    // only reachable on a character device, where nbyte <= INT_MAX keeps
+    // every chunk's offset representable.
+    std::uint64_t remaining = nbyte;
+    if (offset >= 0) {
+        remaining = std::min(remaining, static_cast<std::uint64_t>(kMaxOffset - offset));
+    }
+
+    std::int64_t position = offset;
+    std::uint64_t total_written = 0;
+    std::array<std::byte, kIoChunkSize> chunk{};
+    const auto finish_partial = [&](std::uint32_t error) {
+        if (total_written == 0U) {
+            set_error(state, error);
+        } else {
+            set_success(state, total_written);
+        }
+        return finish();
+    };
+
+    while (remaining != 0U) {
+        const auto requested = static_cast<std::size_t>(
+            std::min<std::uint64_t>(remaining, chunk.size()));
+        if (!address_space.read(guest_address,
+                                std::span<std::byte>(chunk.data(), requested))) {
+            return finish_partial(kDarwinErrnoEfault);
+        }
+        const HostWriteResult host_result = host.write_at(
+            fd, std::span<const std::byte>(chunk.data(), requested), position);
+        if (!host_result) {
+            return finish_partial(host_result.error);
+        }
+        if (host_result.bytes_written > requested) {
+            return contract_violation();
+        }
+        total_written += host_result.bytes_written;
+        if (host_result.bytes_written != requested ||
+            guest_address > std::numeric_limits<std::uint64_t>::max() - requested) {
+            break;
+        }
+        guest_address += requested;
+        position += static_cast<std::int64_t>(requested);
+        remaining -= requested;
+    }
+
+    set_success(state, total_written);
+    return finish();
+}
+
 // The narrow anonymous mmap contract used by guest malloc and libsystem.
 // XNU bsd/kern/kern_mman.c uses mach_vm_map_kernel for MAP_ANON and
 // treats non-fixed addr as a start hint. We currently have neither vnode
@@ -1241,6 +1433,22 @@ SyscallDispatchResult dispatch_darwin_syscall(
         // TIOCGETA; terminal state comes only from the host's view of the
         // guest descriptor and the dispatcher encodes every record itself.
         return dispatch_ioctl(state, address_space, host, syscall_number);
+    case kDarwinSysPread:
+    case kDarwinSysPreadNocancel:
+        // XNU syscalls.master #153 pread / #414 pread_nocancel: user_ssize_t
+        // pread(int fd, user_addr_t buf, user_size_t nbyte, off_t offset).
+        // The read happens at an explicit offset and never moves the
+        // descriptor's file offset. No guest pthread can be cancelled yet, so
+        // both entry points share one handler.
+        return dispatch_pread(state, address_space, host, syscall_number);
+    case kDarwinSysPwrite:
+    case kDarwinSysPwriteNocancel:
+        // XNU syscalls.master #154 pwrite / #415 pwrite_nocancel: user_ssize_t
+        // pwrite(int fd, user_addr_t buf, user_size_t nbyte, off_t offset).
+        // The write happens at an explicit offset, ignores O_APPEND and never
+        // moves the descriptor's file offset. Both entry points share one
+        // handler.
+        return dispatch_pwrite(state, address_space, host, syscall_number);
     case kDarwinSysLseek:
         // XNU syscalls.master #199: off_t lseek(int fd, off_t offset, int whence).
         // libSystem's lseek(3) traps here, and stdio's fseeko(3), ftello(3) and
