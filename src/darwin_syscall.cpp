@@ -1827,6 +1827,34 @@ SyscallDispatchResult dispatch_darwin_syscall(
         set_success(state, static_cast<std::uint64_t>(duplicated.descriptor));
         return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
     }
+    case kDarwinSysDup2: {
+        // XNU syscalls.master #90: int dup2(u_int from, u_int to). dup2 looks
+        // from up with fp_lookup (EBADF), then rejects a to that is negative
+        // or at or above the soft RLIMIT_NOFILE limit (EBADF). A to equal to
+        // from returns to and changes nothing; otherwise any descriptor open
+        // at to is closed and to is pointed at from's open file description
+        // with close-on-exec clear. A u_int that is negative as an int is
+        // EBADF whichever check XNU reaches first, so it never reaches the
+        // host. A host success that names any descriptor but to is a host
+        // contract violation and never reaches the guest.
+        const auto from = static_cast<std::int32_t>(static_cast<std::uint32_t>(state.x[0]));
+        const auto to = static_cast<std::int32_t>(static_cast<std::uint32_t>(state.x[1]));
+        if (from < 0 || to < 0) {
+            set_error(state, kDarwinErrnoEbadf);
+            return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+        }
+        const HostDuplicateResult duplicated = host.duplicate_to(from, to);
+        if (!duplicated) {
+            set_error(state, duplicated.error);
+            return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+        }
+        if (duplicated.descriptor != to) {
+            return {SyscallDispatchError::host_contract_violation,
+                    SyscallAction::resume, syscall_number, 0};
+        }
+        set_success(state, static_cast<std::uint64_t>(to));
+        return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    }
     case kDarwinSysGetpid:
         // XNU bsd/kern/syscalls.master: BSD #20, int getpid(void).
         // Process identity belongs to the shared context, never to the host.

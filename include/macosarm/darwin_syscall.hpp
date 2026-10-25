@@ -191,6 +191,20 @@ constexpr std::uint64_t kDarwinSysGetdtablesize = 89;
 // so never the lowest free slot, is a host contract violation rather than a
 // descriptor the guest could be handed.
 constexpr std::uint64_t kDarwinSysDup = 41;
+// XNU syscalls.master #90: int dup2(u_int from, u_int to). dup2 in
+// bsd/kern/kern_descrip.c takes both u_ints as ints, so only w0 and w1
+// count. fp_lookup first resolves from (EBADF, also for a negative from),
+// then a to that is negative or at or above the soft RLIMIT_NOFILE limit is
+// EBADF. A to equal to from then returns to and changes nothing, not even
+// its close-on-exec flag. Otherwise a descriptor already open at to is
+// closed, its close error discarded as fp_close_and_unlock's is, and
+// finishdup points to at from's open file description with to's own
+// close-on-exec flag clear. A negative from or to is EBADF whichever check
+// XNU reaches first, so neither reaches the host, which owns the descriptor
+// table and performs every later step; the dispatcher returns to in x0. A
+// host success that names any descriptor but to is a host contract
+// violation rather than a descriptor the guest could be handed.
+constexpr std::uint64_t kDarwinSysDup2 = 90;
 // XNU syscalls.master #92: int fcntl(int fd, int cmd, long arg), and #406
 // fcntl_nocancel with the same argument and error contract; only the
 // pthread cancellation point differs. fd and cmd are ints, so only w0 and
@@ -624,6 +638,25 @@ public:
     // descriptors and report EBADF, never a fabricated descriptor.
     [[nodiscard]] virtual HostDuplicateResult duplicate(std::int32_t fd) {
         static_cast<void>(fd);
+        return {0, kDarwinErrnoEbadf};
+    }
+
+    // Duplicate guest descriptor from onto descriptor to for dup2(2), as dup2
+    // in bsd/kern/kern_descrip.c does. The dispatcher calls this only when
+    // neither from nor to is negative. Report EBADF for a from the guest
+    // does not have open and for a to at or above the soft RLIMIT_NOFILE
+    // limit. A to equal to from changes nothing, not even its close-on-exec
+    // flag. Otherwise close any descriptor open at to, discarding its close
+    // error as fp_close_and_unlock's is, then point to at from's open file
+    // description with to's own close-on-exec flag clear. On error no
+    // descriptor changes. A successful result names to. Hosts that do not
+    // override this expose no descriptors and report EBADF, never a
+    // fabricated descriptor.
+    [[nodiscard]] virtual HostDuplicateResult duplicate_to(
+        std::int32_t from,
+        std::int32_t to) {
+        static_cast<void>(from);
+        static_cast<void>(to);
         return {0, kDarwinErrnoEbadf};
     }
 
