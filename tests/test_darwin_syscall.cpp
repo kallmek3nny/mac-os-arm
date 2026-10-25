@@ -562,6 +562,41 @@ struct TerminalHost final : macosarm::DarwinHostServices {
         }
         return {0, 0, 0, 0, macosarm::kDarwinErrnoEbadf};
     }
+
+    // ioctl(2) FIOCLEX and FIONCLEX. terminal_fd and file_fd each keep their
+    // own close-on-exec flag, starting clear; every other descriptor is
+    // EBADF. A nonzero update_error fails the next update once and leaves the
+    // flag unchanged. Every update request is recorded in call order.
+    struct Update {
+        std::int32_t fd{};
+        bool close_on_exec{};
+
+        friend bool operator==(const Update&, const Update&) = default;
+    };
+
+    bool terminal_close_on_exec{};
+    bool file_close_on_exec{};
+    std::uint32_t update_error{};
+    std::vector<Update> updates;
+
+    macosarm::HostSetCloseOnExecResult set_close_on_exec(
+        std::int32_t fd,
+        bool close_on_exec) override {
+        updates.push_back({fd, close_on_exec});
+        bool* const flag = fd == terminal_fd ? &terminal_close_on_exec
+                           : fd == file_fd   ? &file_close_on_exec
+                                             : nullptr;
+        if (flag == nullptr) {
+            return {macosarm::kDarwinErrnoEbadf};
+        }
+        if (update_error != 0) {
+            const std::uint32_t failure = update_error;
+            update_error = 0;
+            return {failure};
+        }
+        *flag = close_on_exec;
+        return {0};
+    }
 };
 
 // ioctl(2) fixtures: one guest page pre-filled with a sentinel so tests can
@@ -4061,15 +4096,62 @@ int main() {
         }
 
         {
-            // File-table requests are not modeled yet: on any open descriptor,
-            // terminal or not, they report ENOSYS and write nothing. They
+            // FIOCLEX and FIONCLEX set and clear the descriptor's own
+            // close-on-exec flag on any open descriptor, terminal or not, as
+            // fcntl(2) F_SETFD does, and only w0 names the descriptor. They
+            // resolve it first, so an unknown fd is EBADF and never reaches
+            // the update. As _IO requests they read no argument, so an
+            // unmapped data address is fine, and they write nothing.
+            macosarm::GuestAddressSpace vm;
+            map_ioctl_page(vm, rw);
+            TerminalHost host;
+            macosarm::CpuState state{};
+            const std::uint64_t unmapped = kIoctlBase + kIoctlPage;
+            const auto succeeded = [&state]() {
+                return (state.pstate & macosarm::kA64PstateCarry) == 0U && state.x[0] == 0U;
+            };
+
+            const auto acknowledged =
+                run_ioctl(vm, host, state, 0U, macosarm::kDarwinIoctlFioclex, unmapped);
+            expect(static_cast<bool>(acknowledged) && succeeded() &&
+                       host.terminal_close_on_exec && !host.file_close_on_exec,
+                   "FIOCLEX sets close-on-exec on a terminal and clears carry");
+            static_cast<void>(run_ioctl(vm, host, state, 0xFFFFFFFF00000003ULL,
+                                        macosarm::kDarwinIoctlFioclex, unmapped));
+            expect(succeeded() && host.file_close_on_exec,
+                   "FIOCLEX on an open non-terminal sets close-on-exec and reads only w0");
+            static_cast<void>(
+                run_ioctl(vm, host, state, 0U, macosarm::kDarwinIoctlFionclex, unmapped));
+            expect(succeeded() && !host.terminal_close_on_exec && host.file_close_on_exec,
+                   "FIONCLEX clears only that descriptor's close-on-exec flag");
+            static_cast<void>(
+                run_ioctl(vm, host, state, 7U, macosarm::kDarwinIoctlFioclex, unmapped));
+            expect(failed_with(state, macosarm::kDarwinErrnoEbadf),
+                   "FIOCLEX on an unknown fd reports EBADF");
+            host.update_error = macosarm::kDarwinErrnoEio;
+            static_cast<void>(
+                run_ioctl(vm, host, state, 3U, macosarm::kDarwinIoctlFionclex, unmapped));
+            expect(failed_with(state, macosarm::kDarwinErrnoEio) && host.file_close_on_exec,
+                   "a host FIONCLEX failure is reported and leaves close-on-exec unchanged");
+            using Update = TerminalHost::Update;
+            expect(host.updates ==
+                       std::vector<Update>{{0, true}, {3, true}, {0, false}, {3, false}},
+                   "FIOCLEX and FIONCLEX update only resolved descriptors, in call order");
+            expect(host.requests == std::vector<std::int32_t>{0, 3, 0, 7, 3},
+                   "FIOCLEX and FIONCLEX resolve the descriptor once each");
+            expect(ioctl_sentinel_from(vm, 0), "FIOCLEX and FIONCLEX write nothing");
+        }
+
+        {
+            // FIOGETOWN, FIOSETOWN, FIOASYNC and FIONBIO are not modeled for
+            // ioctl yet: on any open descriptor, terminal or not, they report
+            // ENOSYS, change no close-on-exec flag and write nothing. They
             // still resolve the descriptor first, so an unknown fd is EBADF.
             macosarm::GuestAddressSpace vm;
             map_ioctl_page(vm, rw);
             TerminalHost host;
             macosarm::CpuState state{};
-            constexpr std::array<std::uint64_t, 6> file_table_requests{
-                macosarm::kDarwinIoctlFioclex,   macosarm::kDarwinIoctlFionclex,
+            constexpr std::array<std::uint64_t, 4> file_table_requests{
                 macosarm::kDarwinIoctlFiogetown, macosarm::kDarwinIoctlFiosetown,
                 macosarm::kDarwinIoctlFioasync,  macosarm::kDarwinIoctlFionbio,
             };

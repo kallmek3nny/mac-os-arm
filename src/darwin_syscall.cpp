@@ -1614,9 +1614,11 @@ void set_error(CpuState& state, std::uint32_t error) noexcept {
 // XNU bsd/kern/sys_generic.c: ioctl(fd, com, data) sizes the argument from
 // bits 16-28 of com and copies an IOC_IN argument in (EFAULT) before it
 // resolves the descriptor (EBADF). FIOCLEX, FIONCLEX, FIONBIO, FIOASYNC,
-// FIOSETOWN and FIOGETOWN act on the file table entry itself; descriptor
-// flags and ownership are not modeled yet, so they report ENOSYS and are
-// never acknowledged. Every other request reaches the device, which reports
+// FIOSETOWN and FIOGETOWN act on the file table entry itself. FIOCLEX and
+// FIONCLEX set and clear the descriptor's own close-on-exec flag through the
+// host, as fcntl(2) F_SETFD does; ownership and the FIONBIO and FIOASYNC I/O
+// modes are not modeled for ioctl yet, so those report ENOSYS and are never
+// acknowledged. Every other request reaches the device, which reports
 // ENOTTY for a request it does not recognize, and an IOC_OUT result is
 // copied out only on success (EFAULT). Only TIOCGETA and TIOCGWINSZ on a
 // host terminal are recognized; the host reports just that fd is a terminal
@@ -1671,7 +1673,20 @@ void set_error(CpuState& state, std::uint32_t error) noexcept {
 
     switch (command) {
     case kDarwinIoctlFioclex:
-    case kDarwinIoctlFionclex:
+    case kDarwinIoctlFionclex: {
+        // Like fcntl(2) F_SETFD, these change only the descriptor's own
+        // close-on-exec flag. Neither the open file description nor the
+        // device sees them, so an open non-terminal accepts them too, and as
+        // _IO requests they read no argument and copy nothing out.
+        const HostSetCloseOnExecResult updated =
+            host.set_close_on_exec(fd, command == kDarwinIoctlFioclex);
+        if (!updated) {
+            set_error(state, updated.error);
+            return finish();
+        }
+        set_success(state, 0U);
+        return finish();
+    }
     case kDarwinIoctlFiogetown:
     case kDarwinIoctlFiosetown:
     case kDarwinIoctlFioasync:

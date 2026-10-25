@@ -73,8 +73,10 @@ constexpr std::size_t kDarwinTermiosSize = 72;
 constexpr std::size_t kDarwinTermiosControlCharCount = 20; // NCCS
 constexpr std::size_t kDarwinWinsizeSize = 8;
 // XNU bsd/sys/filio.h requests that sys_generic.c's ioctl handles itself on
-// the file table entry instead of forwarding to the device. Descriptor flags
-// and ownership are not modeled yet, so they are never acknowledged.
+// the file table entry instead of forwarding to the device. FIOCLEX and
+// FIONCLEX set and clear the descriptor's own close-on-exec flag, as fcntl(2)
+// F_SETFD does. Ownership and the FIONBIO and FIOASYNC I/O modes are not
+// modeled for ioctl yet, so those requests are never acknowledged.
 constexpr std::uint64_t kDarwinIoctlFioclex = 0x20006601;   // _IO('f', 1)
 constexpr std::uint64_t kDarwinIoctlFionclex = 0x20006602;  // _IO('f', 2)
 constexpr std::uint64_t kDarwinIoctlFiogetown = 0x4004667b; // _IOR('f', 123, int)
