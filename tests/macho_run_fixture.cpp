@@ -472,34 +472,45 @@ constexpr std::array<std::uint32_t, 45> kFcntlSetflStdioCode{
     0xd4001001U, // svc #0x80
 };
 
-// getrlimit(RLIMIT_STACK, sp); getrlimit(RLIMIT_NOFILE, sp); exit(errno).
-// macho-run reports its fixed 8 MiB main-thread stack mapping as both the
-// soft and the hard RLIMIT_STACK limit, and enforces no descriptor limit, so
-// RLIMIT_NOFILE fails with ENOSYS (78) and a correct host exits 78. Every
-// other outcome has its own status from 100 to 103: a failed or nonzero
-// RLIMIT_STACK query, a soft limit that differs from the hard limit, a stack
-// limit other than 8 MiB, and an RLIMIT_NOFILE query that succeeds. The
-// struct rlimit lands in 16 bytes reserved below the startup stack pointer.
-constexpr std::array<std::uint32_t, 32> kGetrlimitStackCode{
+// getrlimit(RLIMIT_STACK, sp); getrlimit(RLIMIT_NOFILE, sp);
+// exit(rlim_cur >> 56). macho-run reports its fixed 8 MiB main-thread stack
+// mapping as both the soft and the hard RLIMIT_STACK limit. Its sparse
+// descriptor table bounds descriptors only by the int range, so it reports
+// RLIM_INFINITY (0x7fffffffffffffff) as both RLIMIT_NOFILE limits and a
+// correct host exits with that limit's top byte, 127. Every other outcome
+// has its own status from 100 to 104: a failed or nonzero RLIMIT_STACK
+// query, a stack soft limit that differs from its hard limit, a stack limit
+// other than 8 MiB, a failed or nonzero RLIMIT_NOFILE query, and either
+// RLIMIT_NOFILE limit other than RLIM_INFINITY. The struct rlimit lands in
+// 16 bytes reserved below the startup stack pointer.
+constexpr std::array<std::uint32_t, 43> kGetrlimitStackCode{
     0xd10043ffU, // sub sp, sp, #16 (struct rlimit)
     0xd2800060U, // mov x0, #3 (RLIMIT_STACK)
     0x910003e1U, // mov x1, sp
     0xd2801850U, // mov x16, #194 (getrlimit)
     0xd4001001U, // svc #0x80
-    0x540001e2U, // b.cs stack_failed (+60)
-    0xb50001c0U, // cbnz x0, stack_failed (+56)
+    0x540002e2U, // b.cs stack_failed (+92)
+    0xb50002c0U, // cbnz x0, stack_failed (+88)
     0xa9402be9U, // ldp x9, x10, [sp] -> rlim_cur, rlim_max
     0xeb0a013fU, // cmp x9, x10
-    0x540001c1U, // b.ne limits_differ (+56)
+    0x540002c1U, // b.ne limits_differ (+88)
     0xd2a0100bU, // mov x11, #0x800000 (8 MiB)
     0xeb0b013fU, // cmp x9, x11
-    0x540001c1U, // b.ne wrong_stack_limit (+56)
+    0x540002c1U, // b.ne wrong_stack_limit (+88)
     0xd2800100U, // mov x0, #8 (RLIMIT_NOFILE)
     0x910003e1U, // mov x1, sp
     0xd2801850U, // mov x16, #194 (getrlimit)
     0xd4001001U, // svc #0x80
-    0x54000183U, // b.cc nofile_succeeded (+48)
-    0xd2800030U, // mov x16, #1 (exit) -> exit(errno of RLIMIT_NOFILE)
+    0x54000282U, // b.cs nofile_failed (+80)
+    0xb5000260U, // cbnz x0, nofile_failed (+76)
+    0xa9402be9U, // ldp x9, x10, [sp] -> rlim_cur, rlim_max
+    0x92f0000bU, // mov x11, #0x7fffffffffffffff (movn x11, #0x8000, lsl #48)
+    0xeb0b013fU, // cmp x9, x11
+    0x54000241U, // b.ne wrong_nofile_limit (+72)
+    0xeb0b015fU, // cmp x10, x11
+    0x54000201U, // b.ne wrong_nofile_limit (+64)
+    0xd378fd20U, // lsr x0, x9, #56 -> 127
+    0xd2800030U, // mov x16, #1 (exit)
     0xd4001001U, // svc #0x80
     0xd2800c80U, // stack_failed: mov x0, #100
     0xd2800030U, // mov x16, #1 (exit)
@@ -510,7 +521,10 @@ constexpr std::array<std::uint32_t, 32> kGetrlimitStackCode{
     0xd2800cc0U, // wrong_stack_limit: mov x0, #102
     0xd2800030U, // mov x16, #1 (exit)
     0xd4001001U, // svc #0x80
-    0xd2800ce0U, // nofile_succeeded: mov x0, #103
+    0xd2800ce0U, // nofile_failed: mov x0, #103
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800d00U, // wrong_nofile_limit: mov x0, #104
     0xd2800030U, // mov x16, #1 (exit)
     0xd4001001U, // svc #0x80
 };
@@ -610,18 +624,28 @@ constexpr std::array<std::uint32_t, 81> kSetrlimitStackCode{
     0xd4001001U, // svc #0x80
 };
 
-// getdtablesize(); exit(errno). getdtablesize(2) reports the soft
-// RLIMIT_NOFILE limit, and macho-run enforces no descriptor limit, so the
-// call fails with ENOSYS (78) exactly as getrlimit(RLIMIT_NOFILE) does and a
-// correct host exits 78. A getdtablesize that succeeds exits 100, so no table
-// size can pass for the errno.
-constexpr std::array<std::uint32_t, 8> kGetdtablesizeCode{
+// size = getdtablesize(); exit(size >> 24). getdtablesize(2) reports the
+// soft RLIMIT_NOFILE limit capped at INT_MAX, and macho-run reports
+// RLIM_INFINITY for that limit because its sparse descriptor table bounds
+// descriptors only by the int range, so the call returns INT_MAX
+// (0x7fffffff) zero-extended into x0 and a correct host exits with its top
+// byte, 127. A failed getdtablesize exits 100 and any other table size,
+// including one with stray upper bits in x0, exits 101, so no errno or
+// other size can pass for INT_MAX.
+constexpr std::array<std::uint32_t, 15> kGetdtablesizeCode{
     0xd2800b30U, // mov x16, #89 (getdtablesize)
     0xd4001001U, // svc #0x80
-    0x54000063U, // b.cc succeeded (+12)
-    0xd2800030U, // mov x16, #1 (exit) -> exit(errno of getdtablesize)
+    0x540000e2U, // b.cs failed (+28)
+    0x12b00009U, // mov w9, #0x7fffffff (movn w9, #0x8000, lsl #16)
+    0xeb09001fU, // cmp x0, x9
+    0x540000e1U, // b.ne wrong_size (+28)
+    0xd358fc00U, // lsr x0, x0, #24 -> 127
+    0xd2800030U, // mov x16, #1 (exit)
     0xd4001001U, // svc #0x80
-    0xd2800c80U, // succeeded: mov x0, #100
+    0xd2800c80U, // failed: mov x0, #100
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800ca0U, // wrong_size: mov x0, #101
     0xd2800030U, // mov x16, #1 (exit)
     0xd4001001U, // svc #0x80
 };
@@ -753,11 +777,111 @@ constexpr std::array<std::uint32_t, 66> kDup2StdoutCode{
     0xd4001001U, // svc #0x80
 };
 
+// fd = fcntl(1, F_DUPFD, 5); fcntl(1, F_DUPFD, -1); close(1);
+// write(fd, "hel", 3); copy = fcntl(fd, F_DUPFD_CLOEXEC, 0); close(fd);
+// write(copy, "lo", 2); exit(fd << 4 | copy). F_DUPFD takes the lowest free
+// descriptor at or above newmin, so with only 0 to 2 open the first copy of
+// stdout is 5, and a negative newmin fails with EINVAL (22). Once the guest
+// has closed 1, F_DUPFD_CLOEXEC from 0 reuses slot 1 with its own
+// close-on-exec flag set, so F_GETFD reports FD_CLOEXEC for it and 0 for the
+// copy at 5. Both copies name the same stream, so the host stdout shows
+// "hello" and a correct host exits 81 (5 << 4 | 1). A failed first F_DUPFD,
+// a negative newmin that succeeds or fails with any errno but EINVAL, a
+// failed close, a failed first write, a failed F_DUPFD_CLOEXEC, descriptor
+// flags that are wrong or cannot be read, or a failed second write exits 100
+// to 106 instead, so no errno can pass for a descriptor. The two copies are
+// kept in x19 and x20 across the later calls.
+constexpr std::array<std::uint32_t, 82> kFcntlDupfdStdoutCode{
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd2800001U, // mov x1, #0 (F_DUPFD)
+    0xd28000a2U, // mov x2, #5 (newmin)
+    0xd2800b90U, // mov x16, #92 (fcntl)
+    0xd4001001U, // svc #0x80
+    0x54000702U, // b.cs first_dupfd_failed (+224)
+    0xaa0003f3U, // mov x19, x0 -> copy of stdout at or above 5
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd2800001U, // mov x1, #0 (F_DUPFD)
+    0x92800002U, // mov x2, #-1 (movn x2, #0) -> negative newmin
+    0xd2800b90U, // mov x16, #92 (fcntl)
+    0xd4001001U, // svc #0x80
+    0x54000683U, // b.cc negative_succeeded (+208)
+    0xf100581fU, // cmp x0, #22 (EINVAL)
+    0x54000641U, // b.ne negative_succeeded (+200)
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd28000d0U, // mov x16, #6 (close)
+    0xd4001001U, // svc #0x80
+    0x54000622U, // b.cs close_failed (+196)
+    0xaa1303e0U, // mov x0, x19 -> copy
+    0xd2880001U, // mov x1, #0x4000
+    0xf2c00021U, // movk x1, #1, lsl #32 -> "hello" at 0x100004000
+    0xd2800062U, // mov x2, #3 -> "hel"
+    0xd2800090U, // mov x16, #4 (write)
+    0xd4001001U, // svc #0x80
+    0x540005a2U, // b.cs first_write_failed (+180)
+    0xaa1303e0U, // mov x0, x19 -> copy
+    0xd2800861U, // mov x1, #67 (F_DUPFD_CLOEXEC)
+    0xd2800002U, // mov x2, #0 (newmin)
+    0xd2800b90U, // mov x16, #92 (fcntl)
+    0xd4001001U, // svc #0x80
+    0x54000542U, // b.cs cloexec_dupfd_failed (+168)
+    0xaa0003f4U, // mov x20, x0 -> close-on-exec copy
+    0xaa1403e0U, // mov x0, x20 -> close-on-exec copy
+    0xd2800021U, // mov x1, #1 (F_GETFD)
+    0xd2800b90U, // mov x16, #92 (fcntl)
+    0xd4001001U, // svc #0x80
+    0x540004e2U, // b.cs wrong_descriptor_flags (+156)
+    0xf100041fU, // cmp x0, #1 (FD_CLOEXEC)
+    0x540004a1U, // b.ne wrong_descriptor_flags (+148)
+    0xaa1303e0U, // mov x0, x19 -> copy
+    0xd2800021U, // mov x1, #1 (F_GETFD)
+    0xd2800b90U, // mov x16, #92 (fcntl)
+    0xd4001001U, // svc #0x80
+    0x54000402U, // b.cs wrong_descriptor_flags (+128)
+    0xb50003e0U, // cbnz x0, wrong_descriptor_flags (+124)
+    0xaa1303e0U, // mov x0, x19 -> copy
+    0xd28000d0U, // mov x16, #6 (close)
+    0xd4001001U, // svc #0x80
+    0x54000242U, // b.cs close_failed (+72)
+    0xaa1403e0U, // mov x0, x20 -> close-on-exec copy
+    0xd2880001U, // mov x1, #0x4000
+    0xf2c00021U, // movk x1, #1, lsl #32
+    0x91000c21U, // add x1, x1, #3 -> "lo"
+    0xd2800042U, // mov x2, #2
+    0xd2800090U, // mov x16, #4 (write)
+    0xd4001001U, // svc #0x80
+    0x540002c2U, // b.cs second_write_failed (+88)
+    0xaa131280U, // orr x0, x20, x19, lsl #4 -> copy << 4 | close-on-exec copy
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800c80U, // first_dupfd_failed: mov x0, #100
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800ca0U, // negative_succeeded: mov x0, #101
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800cc0U, // close_failed: mov x0, #102
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800ce0U, // first_write_failed: mov x0, #103
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800d00U, // cloexec_dupfd_failed: mov x0, #104
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800d20U, // wrong_descriptor_flags: mov x0, #105
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800d40U, // second_write_failed: mov x0, #106
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+};
+
 int usage() {
     std::cerr << "usage: macho_run_fixture "
                  "<hello|argc|echo|close-stdout|fstat-stdin|ioctl-stdin|writev-stdout|"
                  "readv-stdin|lseek-stdin|pread-stdin|fcntl-stdio|fcntl-setfl-stdio|"
-                 "getrlimit-stack|setrlimit-stack|getdtablesize|dup-stdout|dup2-stdout> "
+                 "getrlimit-stack|setrlimit-stack|getdtablesize|dup-stdout|dup2-stdout|"
+                 "fcntl-dupfd-stdout> "
                  "<output-path>\n";
     return 2;
 }
@@ -804,6 +928,8 @@ int main(int argc, char** argv) {
         bytes = image(kDupStdoutCode);
     } else if (kind == "dup2-stdout") {
         bytes = image(kDup2StdoutCode);
+    } else if (kind == "fcntl-dupfd-stdout") {
+        bytes = image(kFcntlDupfdStdoutCode);
     } else {
         return usage();
     }

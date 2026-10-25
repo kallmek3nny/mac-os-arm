@@ -488,10 +488,11 @@ if(BUILD_TESTING)
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
 
         # getrlimit(2) end to end: RLIMIT_STACK reports macho-run's fixed 8 MiB
-        # main-thread stack mapping as both the soft and the hard limit, while
-        # RLIMIT_NOFILE fails with ENOSYS (78) because macho-run enforces no
-        # descriptor limit. The guest exits with that errno and writes nothing;
-        # every other outcome exits with its own status from 100 to 103.
+        # main-thread stack mapping as both the soft and the hard limit, and
+        # RLIMIT_NOFILE reports RLIM_INFINITY as both because the sparse
+        # descriptor table bounds descriptors only by the int range. The guest
+        # exits with the top byte of RLIM_INFINITY, 127, and writes nothing;
+        # every other outcome exits with its own status from 100 to 104.
         add_test(
             NAME macho-run-getrlimit-stack
             COMMAND "${CMAKE_COMMAND}"
@@ -499,7 +500,7 @@ if(BUILD_TESTING)
                 "-DRUNNER=$<TARGET_FILE:macho-run>"
                 -DKIND=getrlimit-stack
                 "-DIMAGE=${CMAKE_CURRENT_BINARY_DIR}/macho-run-getrlimit-stack.bin"
-                -DEXPECTED_EXIT=78
+                -DEXPECTED_EXIT=127
                 "-DEXPECTED_STDOUT="
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
 
@@ -521,10 +522,11 @@ if(BUILD_TESTING)
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
 
         # getdtablesize(2) end to end: the call reports the soft RLIMIT_NOFILE
-        # limit, and macho-run enforces no descriptor limit, so it fails with
-        # ENOSYS (78) exactly as getrlimit(RLIMIT_NOFILE) does. The guest exits
-        # with that errno and writes nothing; a getdtablesize that succeeds
-        # exits 100, so no table size can pass for the errno.
+        # limit capped at INT_MAX, and macho-run reports RLIM_INFINITY for it
+        # because the sparse descriptor table bounds descriptors only by the
+        # int range, so the call returns INT_MAX. The guest exits with its top
+        # byte, 127, and writes nothing; a failed getdtablesize exits 100 and
+        # any other table size exits 101, so no errno can pass for INT_MAX.
         add_test(
             NAME macho-run-getdtablesize
             COMMAND "${CMAKE_COMMAND}"
@@ -532,7 +534,7 @@ if(BUILD_TESTING)
                 "-DRUNNER=$<TARGET_FILE:macho-run>"
                 -DKIND=getdtablesize
                 "-DIMAGE=${CMAKE_CURRENT_BINARY_DIR}/macho-run-getdtablesize.bin"
-                -DEXPECTED_EXIT=78
+                -DEXPECTED_EXIT=127
                 "-DEXPECTED_STDOUT="
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
 
@@ -567,6 +569,25 @@ if(BUILD_TESTING)
                 -DKIND=dup2-stdout
                 "-DIMAGE=${CMAKE_CURRENT_BINARY_DIR}/macho-run-dup2-stdout.bin"
                 -DEXPECTED_EXIT=145
+                -DEXPECTED_STDOUT=hello
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
+
+        # fcntl(2) F_DUPFD end to end: fcntl(1, F_DUPFD, 5) names 5, the lowest
+        # free descriptor at or above newmin while only 0 to 2 are open, and a
+        # negative newmin fails with EINVAL. That copy writes "hel" after the
+        # guest closes 1, and fcntl(5, F_DUPFD_CLOEXEC, 0) then reuses slot 1
+        # with its own close-on-exec flag set while 5 keeps its flag clear.
+        # The reused 1 writes "lo" after the guest closes 5, and the guest
+        # exits with the copy << 4 | the reused descriptor, so a correct host
+        # exits 81; a failed call along the way exits 100 to 106 instead.
+        add_test(
+            NAME macho-run-fcntl-dupfd-stdout
+            COMMAND "${CMAKE_COMMAND}"
+                "-DFIXTURE_TOOL=$<TARGET_FILE:macho_run_fixture>"
+                "-DRUNNER=$<TARGET_FILE:macho-run>"
+                -DKIND=fcntl-dupfd-stdout
+                "-DIMAGE=${CMAKE_CURRENT_BINARY_DIR}/macho-run-fcntl-dupfd-stdout.bin"
+                -DEXPECTED_EXIT=81
                 -DEXPECTED_STDOUT=hello
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
     endif()

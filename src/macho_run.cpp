@@ -435,6 +435,43 @@ public:
         return {to, 0};
     }
 
+    // fcntl(2) F_DUPFD and F_DUPFD_CLOEXEC, as fdalloc and finishdup do
+    // together: the lowest free guest descriptor at or above minimum now
+    // names the same standard stream as fd, so the two share its file offset
+    // and status flags, while the new descriptor's own close-on-exec flag is
+    // set exactly when close_on_exec is true. The table is ordered and holds
+    // no negative descriptor, so the lowest free one is the first gap in its
+    // keys counting up from minimum, and it is never fd, which is open. A fd
+    // the guest does not have open reports EBADF and a negative minimum,
+    // which the dispatcher never passes, reports EINVAL as XNU does.
+    // macho-run enforces no RLIMIT_NOFILE limit, so this reports EMFILE only
+    // once no int at or above minimum could name a further descriptor. On
+    // error nothing is allocated.
+    macosarm::HostDuplicateResult duplicate_at_least(
+        std::int32_t fd,
+        std::int32_t minimum,
+        bool close_on_exec) override {
+        const std::int32_t stream = stream_of(fd);
+        if (stream < 0) {
+            return {0, kGuestErrnoEbadf};
+        }
+        if (minimum < 0) {
+            return {0, macosarm::kDarwinErrnoEinval};
+        }
+        std::int64_t lowest = minimum;
+        for (auto entry = descriptors_.lower_bound(minimum);
+             entry != descriptors_.end() && entry->first == lowest;
+             ++entry) {
+            ++lowest;
+        }
+        if (lowest > std::numeric_limits<std::int32_t>::max()) {
+            return {0, kGuestErrnoEmfile};
+        }
+        const auto descriptor = static_cast<std::int32_t>(lowest);
+        descriptors_.emplace(descriptor, GuestDescriptor{stream, close_on_exec});
+        return {descriptor, 0};
+    }
+
     // fstat64(2) describes only an open guest descriptor, through the
     // standard stream it names. The host contributes just the file type;
     // ownership is the translated process's synthetic user, the permissions
@@ -775,14 +812,23 @@ public:
     // getrlimit(2) reports only a limit the session really imposes on the
     // guest. RLIMIT_STACK is the fixed main-thread stack mapping, reported as
     // both the soft and the hard limit and capped at RLIM_INFINITY so the
-    // dispatcher's contract holds. No other resource is enforced, so each
-    // reports ENOSYS rather than a fabricated limit.
+    // dispatcher's contract holds. RLIMIT_NOFILE is RLIM_INFINITY for both:
+    // the sparse descriptor table bounds descriptors only by the int range,
+    // and with no maxfilesperproc sysctl modeled an unlimited soft limit is
+    // exactly what getdtablesize(2) and fdalloc cap at INT_MAX, the bound
+    // dup(2), dup2(2) and fcntl(2) F_DUPFD enforce here. Reporting it lets
+    // F_DUPFD consult the limit as XNU does instead of failing for every
+    // guest. No other resource is enforced, so each reports ENOSYS rather
+    // than a fabricated limit.
     macosarm::HostResourceLimitResult resource_limit(std::uint32_t resource) override {
         if (resource == macosarm::kDarwinRlimitStack) {
             const std::uint64_t limit = stack_size_ < macosarm::kDarwinRlimInfinity
                                             ? stack_size_
                                             : macosarm::kDarwinRlimInfinity;
             return {limit, limit, 0};
+        }
+        if (resource == macosarm::kDarwinRlimitNofile) {
+            return {macosarm::kDarwinRlimInfinity, macosarm::kDarwinRlimInfinity, 0};
         }
         return {0, 0, kGuestErrnoEnosys};
     }
@@ -795,8 +841,11 @@ public:
     // soft limit made inaccessible, as XNU's dosetrlimit protects it, and the
     // session's mapping cannot shrink, so the request reports EINVAL as XNU
     // does when the stack protection cannot change, and the previous limits
-    // stay in effect. No other resource is enforced, so each reports ENOSYS,
-    // matching getrlimit(2).
+    // stay in effect. RLIMIT_NOFILE reads as RLIM_INFINITY because the sparse
+    // descriptor table enforces no limit, and the table cannot start
+    // enforcing one, so a request for it reports ENOSYS rather than a limit
+    // dup(2), dup2(2) and fcntl(2) F_DUPFD would ignore. No other resource is
+    // enforced, so each reports ENOSYS, matching getrlimit(2).
     macosarm::HostSetResourceLimitResult set_resource_limit(
         std::uint32_t resource,
         std::uint64_t soft_limit,
