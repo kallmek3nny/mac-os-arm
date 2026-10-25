@@ -535,6 +535,22 @@ if(BUILD_TESTING)
                 -DEXPECTED_EXIT=78
                 "-DEXPECTED_STDOUT="
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
+
+        # dup(2) end to end: dup(1) takes the lowest free descriptor, 3, which
+        # still writes "hello" to the host stdout after the guest closes 1, and
+        # duplicating it again reuses the freed slot 1. The guest exits with
+        # the first copy << 4 | the second, so a correct host exits 49; a
+        # failed dup, close, write or second dup exits 100 to 103 instead.
+        add_test(
+            NAME macho-run-dup-stdout
+            COMMAND "${CMAKE_COMMAND}"
+                "-DFIXTURE_TOOL=$<TARGET_FILE:macho_run_fixture>"
+                "-DRUNNER=$<TARGET_FILE:macho-run>"
+                -DKIND=dup-stdout
+                "-DIMAGE=${CMAKE_CURRENT_BINARY_DIR}/macho-run-dup-stdout.bin"
+                -DEXPECTED_EXIT=49
+                -DEXPECTED_STDOUT=hello
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
     endif()
 endif()
 

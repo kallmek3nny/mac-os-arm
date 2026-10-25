@@ -626,11 +626,57 @@ constexpr std::array<std::uint32_t, 8> kGetdtablesizeCode{
     0xd4001001U, // svc #0x80
 };
 
+// fd = dup(1); close(1); write(fd, "hello", 5); again = dup(fd);
+// exit(fd << 4 | again). dup(2) takes the lowest free descriptor, so the
+// first copy of stdout is 3 and, once the guest has closed 1, the second copy
+// reuses slot 1. A copy names the same stream, so "hello" still reaches the
+// host stdout after the guest closes descriptor 1, and a correct host exits
+// 49 (3 << 4 | 1). A failed first dup, close, write or second dup exits 100
+// to 103 instead, so no errno can pass for a descriptor. The first copy is
+// kept in x19 across the later calls.
+constexpr std::array<std::uint32_t, 35> kDupStdoutCode{
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd2800530U, // mov x16, #41 (dup)
+    0xd4001001U, // svc #0x80
+    0x54000282U, // b.cs dup_failed (+80)
+    0xaa0003f3U, // mov x19, x0 -> first copy of stdout
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd28000d0U, // mov x16, #6 (close)
+    0xd4001001U, // svc #0x80
+    0x54000242U, // b.cs close_failed (+72)
+    0xaa1303e0U, // mov x0, x19 -> first copy
+    0xd2880001U, // mov x1, #0x4000
+    0xf2c00021U, // movk x1, #1, lsl #32 -> 0x100004000
+    0xd28000a2U, // mov x2, #5
+    0xd2800090U, // mov x16, #4 (write)
+    0xd4001001U, // svc #0x80
+    0x540001c2U, // b.cs write_failed (+56)
+    0xaa1303e0U, // mov x0, x19 -> first copy
+    0xd2800530U, // mov x16, #41 (dup)
+    0xd4001001U, // svc #0x80
+    0x540001a2U, // b.cs second_dup_failed (+52)
+    0xaa131000U, // orr x0, x0, x19, lsl #4 -> first << 4 | second
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800c80U, // dup_failed: mov x0, #100
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800ca0U, // close_failed: mov x0, #101
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800cc0U, // write_failed: mov x0, #102
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800ce0U, // second_dup_failed: mov x0, #103
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+};
+
 int usage() {
     std::cerr << "usage: macho_run_fixture "
                  "<hello|argc|echo|close-stdout|fstat-stdin|ioctl-stdin|writev-stdout|"
                  "readv-stdin|lseek-stdin|pread-stdin|fcntl-stdio|fcntl-setfl-stdio|"
-                 "getrlimit-stack|setrlimit-stack|getdtablesize> "
+                 "getrlimit-stack|setrlimit-stack|getdtablesize|dup-stdout> "
                  "<output-path>\n";
     return 2;
 }
@@ -673,6 +719,8 @@ int main(int argc, char** argv) {
         bytes = image(kSetrlimitStackCode);
     } else if (kind == "getdtablesize") {
         bytes = image(kGetdtablesizeCode);
+    } else if (kind == "dup-stdout") {
+        bytes = image(kDupStdoutCode);
     } else {
         return usage();
     }

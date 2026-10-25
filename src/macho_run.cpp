@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <span>
 #include <string_view>
 #include <system_error>
@@ -43,6 +44,7 @@ namespace {
 constexpr std::uint32_t kGuestErrnoEio = 5;
 constexpr std::uint32_t kGuestErrnoEnxio = 6;
 constexpr std::uint32_t kGuestErrnoEbadf = 9;
+constexpr std::uint32_t kGuestErrnoEmfile = 24;
 constexpr std::uint32_t kGuestErrnoEnotty = 25;
 constexpr std::uint32_t kGuestErrnoEspipe = 29;
 constexpr std::uint32_t kGuestErrnoEnotsup = 45;
@@ -326,56 +328,102 @@ std::int64_t write_host_stream_at(
 #endif
 }
 
-// The guest's stdin, stdout and stderr reach the host's, as raw bytes. No
-// other descriptor exists in the translated process yet, so those report
-// EBADF, as does a standard descriptor after the guest has closed it.
+// The guest's stdin, stdout and stderr reach the host's, as raw bytes. Each
+// open guest descriptor names one of those three host streams: the guest
+// starts with descriptors 0, 1 and 2 naming them in order, and dup(2) gives a
+// stream further descriptors that share its open file description. Any other
+// descriptor reports EBADF, as does one the guest has closed.
 class ConsoleHost final : public macosarm::DarwinHostServices {
-    // Bit n is set while guest descriptor n (stdin, stdout, stderr) is open.
-    unsigned open_descriptors_ = 0b111U;
-    // Bit n is set while guest descriptor n has its close-on-exec flag set. A
-    // process inherits its standard descriptors without FD_CLOEXEC.
-    unsigned close_on_exec_descriptors_ = 0U;
+    // One slot of the guest descriptor table. stream is the host standard
+    // stream (0, 1 or 2) whose open file description the descriptor names,
+    // or -1 while the slot is free. close_on_exec is the descriptor's own
+    // FD_CLOEXEC flag, which a duplicate never shares.
+    struct GuestDescriptor {
+        std::int32_t stream;
+        bool close_on_exec;
+    };
+
+    // Slot n describes guest descriptor n. macho-run enforces no
+    // RLIMIT_NOFILE limit, so the table grows as dup(2) needs and is bounded
+    // only by the descriptors an int can name.
+    std::vector<GuestDescriptor> descriptors_;
     // Size in bytes of the main-thread stack the session maps for the guest.
     // That mapping never grows, so getrlimit(2) RLIMIT_STACK reports it as
     // both the soft and the hard limit.
     std::uint64_t stack_size_;
 
+    // The host standard stream guest descriptor fd names, or -1 when fd is
+    // not an open guest descriptor.
+    [[nodiscard]] std::int32_t stream_of(std::int32_t fd) const noexcept {
+        if (fd < 0 || static_cast<std::size_t>(fd) >= descriptors_.size()) {
+            return -1;
+        }
+        return descriptors_[static_cast<std::size_t>(fd)].stream;
+    }
+
     [[nodiscard]] bool is_open(std::int32_t fd) const noexcept {
-        return fd >= 0 && fd <= 2 &&
-               (open_descriptors_ & (1U << static_cast<unsigned>(fd))) != 0U;
+        return stream_of(fd) >= 0;
     }
 
 public:
     // stack_size must be the SessionConfig::stack_size the session maps, so
-    // the limit the guest reads describes its real stack.
-    explicit ConsoleHost(std::uint64_t stack_size) noexcept : stack_size_(stack_size) {}
+    // the limit the guest reads describes its real stack. A process inherits
+    // its standard descriptors without FD_CLOEXEC.
+    explicit ConsoleHost(std::uint64_t stack_size)
+        : descriptors_{{0, false}, {1, false}, {2, false}}, stack_size_(stack_size) {}
 
-    // close(2) releases only the guest's view of a standard descriptor; the
-    // host's own streams stay open for macho-run diagnostics. A released or
-    // unknown descriptor reports EBADF, so a second close never succeeds.
-    // Releasing a descriptor also drops its close-on-exec flag, as XNU clears
-    // a released slot's descriptor flags, so no stale flag outlives it.
+    // close(2) releases only the guest descriptor; the host stream it names
+    // stays open for macho-run diagnostics and for any other guest descriptor
+    // that still names it. A released or unknown descriptor reports EBADF, so
+    // a second close never succeeds. Releasing a descriptor also drops its
+    // close-on-exec flag, as XNU clears a released slot's descriptor flags,
+    // so no stale flag outlives it, and frees the slot for a later dup(2).
     macosarm::HostCloseResult close(std::int32_t fd) override {
         if (!is_open(fd)) {
             return {kGuestErrnoEbadf};
         }
-        const unsigned bit = 1U << static_cast<unsigned>(fd);
-        open_descriptors_ &= ~bit;
-        close_on_exec_descriptors_ &= ~bit;
+        descriptors_[static_cast<std::size_t>(fd)] = {-1, false};
         return {0};
     }
 
-    // fstat64(2) describes only a standard descriptor the guest still has
-    // open. The host contributes just the file type; ownership is the
-    // translated process's synthetic user, the permissions are owner
-    // read/write, and every other field stays zero, so no host inode, device,
-    // size or timestamp reaches the guest. A stream the host cannot classify
-    // reports EIO rather than a guessed type.
+    // dup(2), as fdalloc and finishdup do together: the lowest free guest
+    // descriptor now names the same standard stream as fd, so the two share
+    // its file offset and status flags, while the new descriptor's own
+    // close-on-exec flag starts clear. macho-run enforces no RLIMIT_NOFILE
+    // limit, so the table grows by one slot only when every slot is in use,
+    // and reports EMFILE once no int could name a further descriptor. On
+    // error no slot is allocated.
+    macosarm::HostDuplicateResult duplicate(std::int32_t fd) override {
+        const std::int32_t stream = stream_of(fd);
+        if (stream < 0) {
+            return {0, kGuestErrnoEbadf};
+        }
+        std::size_t slot = 0;
+        while (slot < descriptors_.size() && descriptors_[slot].stream >= 0) {
+            ++slot;
+        }
+        if (slot > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+            return {0, kGuestErrnoEmfile};
+        }
+        if (slot == descriptors_.size()) {
+            descriptors_.push_back({-1, false});
+        }
+        descriptors_[slot] = {stream, false};
+        return {static_cast<std::int32_t>(slot), 0};
+    }
+
+    // fstat64(2) describes only an open guest descriptor, through the
+    // standard stream it names. The host contributes just the file type;
+    // ownership is the translated process's synthetic user, the permissions
+    // are owner read/write, and every other field stays zero, so no host
+    // inode, device, size or timestamp reaches the guest. A stream the host
+    // cannot classify reports EIO rather than a guessed type.
     macosarm::HostStatResult file_status(std::int32_t fd) override {
-        if (!is_open(fd)) {
+        const std::int32_t stream = stream_of(fd);
+        if (stream < 0) {
             return {{}, kGuestErrnoEbadf};
         }
-        const std::uint16_t type = host_stream_type(fd);
+        const std::uint16_t type = host_stream_type(stream);
         if (type == 0) {
             return {{}, kGuestErrnoEio};
         }
@@ -388,24 +436,27 @@ public:
         return {status, 0};
     }
 
-    // ioctl(2) TIOCGETA and TIOCGWINSZ describe only a standard descriptor
-    // the guest still has open. The host contributes just whether the stream
-    // is an interactive terminal and its window size; the dispatcher encodes
-    // a synthetic termios, so no host terminal settings reach the guest. A
-    // redirected or piped stream reports ENOTTY, as isatty(3) expects.
+    // ioctl(2) TIOCGETA and TIOCGWINSZ describe only an open guest
+    // descriptor, through the standard stream it names. The host contributes
+    // just whether the stream is an interactive terminal and its window size;
+    // the dispatcher encodes a synthetic termios, so no host terminal settings
+    // reach the guest. A redirected or piped stream reports ENOTTY, as
+    // isatty(3) expects.
     macosarm::HostTerminalResult terminal_status(std::int32_t fd) override {
-        if (!is_open(fd)) {
+        const std::int32_t stream = stream_of(fd);
+        if (stream < 0) {
             return {0, 0, 0, 0, kGuestErrnoEbadf};
         }
-        const HostStreamTerminal terminal = host_stream_terminal(fd);
+        const HostStreamTerminal terminal = host_stream_terminal(stream);
         if (!terminal.is_terminal) {
             return {0, 0, 0, 0, kGuestErrnoEnotty};
         }
         return {terminal.rows, terminal.columns, terminal.x_pixels, terminal.y_pixels, 0};
     }
 
-    // lseek(2) describes only a standard descriptor the guest still has open.
-    // As XNU refuses a FIFO, socket or terminal with ESPIPE, so does a piped,
+    // lseek(2) describes only an open guest descriptor, through the standard
+    // stream it names, so a dup(2) copy shares that stream's offset. As XNU
+    // refuses a FIFO, socket or terminal with ESPIPE, so does a piped,
     // socket-backed or console stream here; only a stream redirected from or
     // to a file can seek. The host contributes just its C stream's logical
     // offset and the regular file's size, so no other host metadata reaches
@@ -415,24 +466,25 @@ public:
     // allowance and the dispatcher fails a negative result with EINVAL
     // before anything is committed.
     macosarm::HostSeekResult seek_status(std::int32_t fd) override {
-        if (!is_open(fd)) {
+        const std::int32_t stream = stream_of(fd);
+        if (stream < 0) {
             return {0, 0, 0, false, kGuestErrnoEbadf};
         }
-        const std::uint16_t type = host_stream_type(fd);
+        const std::uint16_t type = host_stream_type(stream);
         if (type == 0) {
             return {0, 0, 0, false, kGuestErrnoEio};
         }
         if (type == macosarm::kDarwinModeFifo || type == macosarm::kDarwinModeSocket ||
-            host_stream_terminal(fd).is_terminal) {
+            host_stream_terminal(stream).is_terminal) {
             return {0, 0, 0, false, kGuestErrnoEspipe};
         }
-        const std::int64_t offset = host_stream_offset(fd);
+        const std::int64_t offset = host_stream_offset(stream);
         if (offset < 0) {
             return {0, 0, 0, false, kGuestErrnoEio};
         }
         // An unknown size, as for a non-file character device, fails only
         // SEEK_END, like a failed vnode_size.
-        const std::int64_t size = host_stream_size(fd);
+        const std::int64_t size = host_stream_size(stream);
         if (size < 0) {
             return {offset, 0, kGuestErrnoEio, false, 0};
         }
@@ -443,41 +495,43 @@ public:
     // which also discards any stdin bytes stdio buffered from the old
     // position. If the host rejects the position, the guest sees EIO.
     macosarm::HostSetOffsetResult set_offset(std::int32_t fd, std::int64_t offset) override {
-        if (!is_open(fd)) {
+        const std::int32_t stream = stream_of(fd);
+        if (stream < 0) {
             return {kGuestErrnoEbadf};
         }
-        if (!seek_host_stream(fd, offset)) {
+        if (!seek_host_stream(stream, offset)) {
             return {kGuestErrnoEio};
         }
         return {0};
     }
 
-    // pread(2) and pwrite(2) describe only a standard descriptor the guest
-    // still has open, and only in the direction the guest can use it: stdin
-    // is open just for reading and stdout and stderr just for writing, so the
-    // other direction reports EBADF, as preparefileread and preparefilewrite
-    // do. As valid_for_random_access refuses a FIFO or socket with ESPIPE and
-    // a terminal with ENXIO, so does a piped, socket-backed or console stream
-    // here; only a stream redirected from or to a file is accessed at an
-    // offset. A stream the host cannot classify reports EIO rather than a
-    // guessed type. As for lseek(2), no stream claims a character device's
-    // negative-offset allowance, so the dispatcher fails a negative offset
-    // with EINVAL before the host is asked to transfer anything.
+    // pread(2) and pwrite(2) describe only an open guest descriptor, through
+    // the standard stream it names, and only in the direction the guest can use
+    // that stream: stdin is open just for reading and stdout and stderr just
+    // for writing, so the other direction reports EBADF, as preparefileread and
+    // preparefilewrite do. As valid_for_random_access refuses a FIFO or socket
+    // with ESPIPE and a terminal with ENXIO, so does a piped, socket-backed or
+    // console stream here; only a stream redirected from or to a file is
+    // accessed at an offset. A stream the host cannot classify reports EIO
+    // rather than a guessed type. As for lseek(2), no stream claims a character
+    // device's negative-offset allowance, so the dispatcher fails a negative
+    // offset with EINVAL before the host is asked to transfer anything.
     macosarm::HostRandomAccessResult random_access_status(
         std::int32_t fd,
         bool for_write) override {
-        const bool usable = for_write ? (fd == 1 || fd == 2) : fd == 0;
-        if (!usable || !is_open(fd)) {
+        const std::int32_t stream = stream_of(fd);
+        const bool usable = for_write ? (stream == 1 || stream == 2) : stream == 0;
+        if (!usable) {
             return {false, kGuestErrnoEbadf};
         }
-        const std::uint16_t type = host_stream_type(fd);
+        const std::uint16_t type = host_stream_type(stream);
         if (type == 0) {
             return {false, kGuestErrnoEio};
         }
         if (type == macosarm::kDarwinModeFifo || type == macosarm::kDarwinModeSocket) {
             return {false, kGuestErrnoEspipe};
         }
-        if (host_stream_terminal(fd).is_terminal) {
+        if (host_stream_terminal(stream).is_terminal) {
             return {false, kGuestErrnoEnxio};
         }
         return {false, 0};
@@ -490,10 +544,11 @@ public:
         std::int32_t fd,
         std::span<std::byte> bytes,
         std::int64_t offset) override {
-        if (fd != 0 || !is_open(fd)) {
+        const std::int32_t stream = stream_of(fd);
+        if (stream != 0) {
             return {0, kGuestErrnoEbadf};
         }
-        const std::int64_t received = read_host_stream_at(fd, bytes, offset);
+        const std::int64_t received = read_host_stream_at(stream, bytes, offset);
         if (received < 0) {
             return {0, kGuestErrnoEio};
         }
@@ -507,33 +562,36 @@ public:
         std::int32_t fd,
         std::span<const std::byte> bytes,
         std::int64_t offset) override {
-        if ((fd != 1 && fd != 2) || !is_open(fd)) {
+        const std::int32_t stream = stream_of(fd);
+        if (stream != 1 && stream != 2) {
             return {0, kGuestErrnoEbadf};
         }
-        const std::int64_t written = write_host_stream_at(fd, bytes, offset);
+        const std::int64_t written = write_host_stream_at(stream, bytes, offset);
         if (written < 0 || (written == 0 && !bytes.empty())) {
             return {0, kGuestErrnoEio};
         }
         return {static_cast<std::uint64_t>(written), 0};
     }
 
-    // fcntl(2) F_GETFD, F_SETFD and F_GETFL describe only a standard
-    // descriptor the guest still has open. The close-on-exec flag is the
-    // guest's own, changed only through F_SETFD. The access mode follows the
-    // direction the guest can use the stream, as for pread(2) and pwrite(2):
+    // fcntl(2) F_GETFD, F_SETFD and F_GETFL describe only an open guest
+    // descriptor. The close-on-exec flag is that descriptor's own, changed only
+    // through F_SETFD and never shared with a dup(2) copy, while the status
+    // flags belong to the standard stream it names. The access mode follows the
+    // direction the guest can use that stream, as for pread(2) and pwrite(2):
     // stdin is open just for reading and stdout and stderr just for writing.
-    // macho-run never puts a stream in nonblocking, asynchronous or
-    // synchronous mode, so of the host's status flags only O_APPEND can reach
-    // the guest, on a POSIX host whose descriptor really appends every write.
-    // A host that cannot report its flags reports EIO rather than guessed ones.
+    // macho-run never puts a stream in nonblocking, asynchronous or synchronous
+    // mode, so of the host's status flags only O_APPEND can reach the guest, on
+    // a POSIX host whose descriptor really appends every write. A host that
+    // cannot report its flags reports EIO rather than guessed ones.
     macosarm::HostDescriptorFlagsResult descriptor_flags(std::int32_t fd) override {
-        if (!is_open(fd)) {
+        const std::int32_t stream = stream_of(fd);
+        if (stream < 0) {
             return {false, 0, kGuestErrnoEbadf};
         }
         std::uint32_t status_flags =
-            fd == 0 ? macosarm::kDarwinOpenReadOnly : macosarm::kDarwinOpenWriteOnly;
+            stream == 0 ? macosarm::kDarwinOpenReadOnly : macosarm::kDarwinOpenWriteOnly;
 #if !defined(_WIN32)
-        const int host_flags = ::fcntl(fd, F_GETFL);
+        const int host_flags = ::fcntl(stream, F_GETFL);
         if (host_flags < 0) {
             return {false, 0, kGuestErrnoEio};
         }
@@ -541,26 +599,21 @@ public:
             status_flags |= macosarm::kDarwinOpenAppend;
         }
 #endif
-        const bool close_on_exec =
-            (close_on_exec_descriptors_ & (1U << static_cast<unsigned>(fd))) != 0U;
+        const bool close_on_exec = descriptors_[static_cast<std::size_t>(fd)].close_on_exec;
         return {close_on_exec, status_flags, 0};
     }
 
-    // Set or clear the guest's own close-on-exec flag for fcntl(2) F_SETFD.
-    // The host descriptor's flags never change, so macho-run's own streams
-    // stay as they were for its diagnostics.
+    // Set or clear guest descriptor fd's own close-on-exec flag for fcntl(2)
+    // F_SETFD; any other descriptor naming the same stream keeps its own. The
+    // host descriptor's flags never change, so macho-run's own streams stay
+    // as they were for its diagnostics.
     macosarm::HostSetCloseOnExecResult set_close_on_exec(
         std::int32_t fd,
         bool close_on_exec) override {
         if (!is_open(fd)) {
             return {kGuestErrnoEbadf};
         }
-        const unsigned bit = 1U << static_cast<unsigned>(fd);
-        if (close_on_exec) {
-            close_on_exec_descriptors_ |= bit;
-        } else {
-            close_on_exec_descriptors_ &= ~bit;
-        }
+        descriptors_[static_cast<std::size_t>(fd)].close_on_exec = close_on_exec;
         return {0};
     }
 
@@ -614,7 +667,7 @@ public:
     macosarm::HostReadResult read(
         std::int32_t fd,
         std::span<std::byte> bytes) override {
-        if (fd != 0 || !is_open(fd)) {
+        if (stream_of(fd) != 0) {
             return {0, kGuestErrnoEbadf};
         }
         std::size_t received = 0;
@@ -640,10 +693,11 @@ public:
     macosarm::HostWriteResult write(
         std::int32_t fd,
         std::span<const std::byte> bytes) override {
-        // Once the guest closes stdout or stderr, its writes no longer reach
-        // the host stream and report EBADF like any other unknown descriptor.
-        std::FILE* const stream =
-            !is_open(fd) ? nullptr : fd == 1 ? stdout : fd == 2 ? stderr : nullptr;
+        // Only a descriptor naming stdout or stderr reaches a host stream.
+        // Once the guest closes one, its writes report EBADF like any other
+        // unknown descriptor, while a dup(2) copy still reaches the stream.
+        const std::int32_t named = stream_of(fd);
+        std::FILE* const stream = named == 1 ? stdout : named == 2 ? stderr : nullptr;
         if (stream == nullptr) {
             return {0, kGuestErrnoEbadf};
         }
