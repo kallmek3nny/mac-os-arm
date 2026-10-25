@@ -1000,6 +1000,67 @@ struct DescriptorFlagsHost final : macosarm::DarwinHostServices {
         return {take(async_error)};
     }
 
+    // fcntl(2) F_DUPFD and F_DUPFD_CLOEXEC. resource_limit reports
+    // soft_limit and hard_limit verbatim for every resource, so tests can
+    // hand the dispatcher an inverted or out-of-range snapshot, unless a
+    // nonzero limit_error fails it. duplicate_at_least allocates the lowest
+    // descriptor at or above minimum that is not scripted and lies below the
+    // soft limit capped at INT_MAX, as fdalloc does, giving it the source's
+    // status flags and the requested close-on-exec flag, or reports EMFILE
+    // and allocates nothing. With force_duplicate set it instead reports
+    // forced_descriptor verbatim and allocates nothing, so tests can hand the
+    // dispatcher a duplicate that breaks the host contract. Every limit query
+    // and duplication request is recorded in call order.
+    struct Duplication {
+        std::int32_t fd{};
+        std::int32_t minimum{};
+        bool close_on_exec{};
+
+        friend bool operator==(const Duplication&, const Duplication&) = default;
+    };
+
+    std::uint64_t soft_limit{256U};
+    std::uint64_t hard_limit{macosarm::kDarwinRlimInfinity};
+    std::uint32_t limit_error{};
+    bool force_duplicate{};
+    std::int32_t forced_descriptor{};
+    std::vector<std::uint32_t> limit_queries;
+    std::vector<Duplication> duplications;
+
+    macosarm::HostResourceLimitResult resource_limit(std::uint32_t resource) override {
+        limit_queries.push_back(resource);
+        if (limit_error != 0) {
+            return {0, 0, limit_error};
+        }
+        return {soft_limit, hard_limit, 0};
+    }
+
+    macosarm::HostDuplicateResult duplicate_at_least(
+        std::int32_t fd,
+        std::int32_t minimum,
+        bool close_on_exec) override {
+        duplications.push_back({fd, minimum, close_on_exec});
+        const Descriptor* source = find(fd);
+        if (source == nullptr) {
+            return {0, macosarm::kDarwinErrnoEbadf};
+        }
+        if (force_duplicate) {
+            return {forced_descriptor, 0};
+        }
+        // Copy the flags before push_back can move the descriptor table.
+        const std::uint32_t status_flags = source->status_flags;
+        constexpr std::uint64_t kIntMax = 0x7fffffffU;
+        const std::uint64_t limit = soft_limit < kIntMax ? soft_limit : kIntMax;
+        for (auto slot = static_cast<std::uint64_t>(minimum); slot < limit; ++slot) {
+            const auto candidate = static_cast<std::int32_t>(slot);
+            if (find(candidate) == nullptr) {
+                descriptors.push_back({candidate, close_on_exec, status_flags});
+                return {candidate, 0};
+            }
+        }
+        return {0, macosarm::kDarwinErrnoEmfile};
+    }
+
     // True when descriptor fd is scripted with exactly this close-on-exec flag.
     [[nodiscard]] bool close_on_exec_is(std::int32_t fd, bool expected) noexcept {
         const Descriptor* entry = find(fd);
@@ -4686,12 +4747,14 @@ int main() {
                    host.described == std::vector<std::int32_t>{9},
                "fcntl on an unknown descriptor reports EBADF before the command");
 
-        const std::array<std::uint64_t, 2> unmodeled{macosarm::kDarwinFcntlDupfd, 0x7fffffffU};
+        // F_GETOWN (5) needs process-group ownership state that is not modeled.
+        const std::array<std::uint64_t, 2> unmodeled{5U, 0x7fffffffU};
         for (const std::uint64_t command : unmodeled) {
             static_cast<void>(
                 run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl, 2U, command, 1U));
             expect(fcntl_failed_with(state, macosarm::kDarwinErrnoEnosys) &&
-                       host.updates.empty() && host.steps.empty(),
+                       host.updates.empty() && host.steps.empty() &&
+                       host.limit_queries.empty() && host.duplications.empty(),
                    "fcntl reports ENOSYS for a command it does not model");
         }
 
@@ -4860,6 +4923,61 @@ int main() {
                                     macosarm::kDarwinFcntlGetfl, 0U));
         expect(!carry_is_set(state) && state.x[0] == asynchronous_writer,
                "after a FIOASYNC failure F_GETFL reports O_ASYNC without O_NONBLOCK");
+    }
+
+    {
+        // fcntl(2) F_DUPFD and F_DUPFD_CLOEXEC allocate the lowest free
+        // descriptor at or above the int low half of arg and below the soft
+        // RLIMIT_NOFILE limit, naming the source's open file description so the
+        // two share its status flags. Only F_DUPFD_CLOEXEC sets the new
+        // descriptor's own close-on-exec flag; the source's never carries over.
+        using Duplication = DescriptorFlagsHost::Duplication;
+        macosarm::GuestAddressSpace vm;
+        macosarm::CpuState state{};
+        DescriptorFlagsHost host;
+        host.descriptors = {
+            {0, false, macosarm::kDarwinOpenReadOnly},
+            {1, false, macosarm::kDarwinOpenWriteOnly | macosarm::kDarwinOpenAppend},
+            {2, true, macosarm::kDarwinOpenWriteOnly},
+        };
+
+        const auto lowest = run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl, 1U,
+                                      macosarm::kDarwinFcntlDupfd, 0U);
+        expect(static_cast<bool>(lowest) && !carry_is_set(state) && state.x[0] == 3U &&
+                   lowest.syscall_number == macosarm::kDarwinSysFcntl &&
+                   (host.limit_queries ==
+                    std::vector<std::uint32_t>{macosarm::kDarwinRlimitNofile}) &&
+                   (host.duplications == std::vector<Duplication>{{1, 0, false}}) &&
+                   host.close_on_exec_is(3, false),
+               "fcntl F_DUPFD returns the lowest free descriptor with close-on-exec clear");
+
+        static_cast<void>(run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl, 3U,
+                                    macosarm::kDarwinFcntlGetfl, 0U));
+        expect(!carry_is_set(state) &&
+                   state.x[0] == (macosarm::kDarwinOpenWriteOnly | macosarm::kDarwinOpenAppend),
+               "a F_DUPFD duplicate reports the source's status flags");
+
+        static_cast<void>(run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl, 2U,
+                                    macosarm::kDarwinFcntlDupfd, 0U));
+        expect(!carry_is_set(state) && state.x[0] == 4U && host.close_on_exec_is(4, false) &&
+                   host.close_on_exec_is(2, true),
+               "fcntl F_DUPFD never copies the source's close-on-exec flag");
+
+        host.duplications.clear();
+        const auto cloexec =
+            run_fcntl(vm, host, state, macosarm::kDarwinSysFcntlNocancel, 0xFFFFFFFF00000000ULL,
+                      0xFFFFFFFF00000000ULL | macosarm::kDarwinFcntlDupfdCloexec,
+                      0xFFFFFFFF0000000AULL);
+        expect(static_cast<bool>(cloexec) && !carry_is_set(state) && state.x[0] == 10U &&
+                   cloexec.syscall_number == macosarm::kDarwinSysFcntlNocancel &&
+                   (host.duplications == std::vector<Duplication>{{0, 10, true}}) &&
+                   host.close_on_exec_is(10, true),
+               "fcntl_nocancel F_DUPFD_CLOEXEC reads only w0, w1 and w2 and sets FD_CLOEXEC");
+
+        static_cast<void>(run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl, 0U,
+                                    macosarm::kDarwinFcntlDupfd, 255U));
+        expect(!carry_is_set(state) && state.x[0] == 255U && host.close_on_exec_is(255, false),
+               "fcntl F_DUPFD accepts a minimum just below the soft RLIMIT_NOFILE limit");
     }
 
     if (failures != 0) {

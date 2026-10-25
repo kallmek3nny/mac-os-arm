@@ -1097,12 +1097,15 @@ void set_error(CpuState& state, std::uint32_t error) noexcept {
 
 // XNU bsd/kern/kern_descrip.c: sys_fcntl_nocancel(fd, cmd, arg) resolves fd
 // through fp_lookup before it looks at cmd, so a negative or unknown
-// descriptor reports EBADF for every command. Only F_GETFD, F_SETFD,
-// F_GETFL and F_SETFL are modeled; any other command reports ENOSYS once the
-// descriptor resolves, never a fabricated success. The host supplies only
-// the descriptor's close-on-exec flag and OFLAGS(f_flag) and applies the
-// changes F_SETFD and F_SETFL ask for; the dispatcher validates the flags,
-// computes every new flag word and encodes every result itself.
+// descriptor reports EBADF for every command. Only F_DUPFD, F_GETFD,
+// F_SETFD, F_GETFL, F_SETFL and F_DUPFD_CLOEXEC are modeled; any other
+// command reports ENOSYS once the descriptor resolves, never a fabricated
+// success. The host supplies only the descriptor's close-on-exec flag,
+// OFLAGS(f_flag) and the soft RLIMIT_NOFILE limit, applies the changes
+// F_SETFD and F_SETFL ask for and allocates the duplicate F_DUPFD and
+// F_DUPFD_CLOEXEC ask for; the dispatcher validates the flags, the limit
+// and the duplicate, computes every new flag word and encodes every result
+// itself.
 [[nodiscard]] SyscallDispatchResult dispatch_fcntl(
     CpuState& state,
     DarwinHostServices& host,
@@ -1195,9 +1198,62 @@ void set_error(CpuState& state, std::uint32_t error) noexcept {
         set_success(state, 0U);
         return finish();
     }
+    case kDarwinFcntlDupfd:
+    case kDarwinFcntlDupfdCloexec: {
+        // newmin = CAST_DOWN_EXPLICIT(int, arg): only the int low half of arg
+        // is read. A newmin that is negative, or at or above
+        // proc_limitgetcur_nofile(p), is EINVAL; a negative one is rejected
+        // before the limit is consulted, as XNU's || short-circuits. The
+        // limit is the soft RLIMIT_NOFILE limit capped at the int
+        // maxfilesperproc, held to the getrlimit contract exactly as
+        // getdtablesize(2) holds it, and with no maxfilesperproc sysctl
+        // modeled the only cap is INT_MAX. Guarded descriptors are not
+        // modeled, so GUARD_DUP never applies.
+        const auto minimum = static_cast<std::int32_t>(static_cast<std::uint32_t>(argument));
+        if (minimum < 0) {
+            set_error(state, kDarwinErrnoEinval);
+            return finish();
+        }
+        const HostResourceLimitResult current = host.resource_limit(kDarwinRlimitNofile);
+        if (!current) {
+            set_error(state, current.error);
+            return finish();
+        }
+        if (current.soft_limit > current.hard_limit ||
+            current.hard_limit > kDarwinRlimInfinity) {
+            return SyscallDispatchResult{
+                SyscallDispatchError::host_contract_violation,
+                SyscallAction::resume, syscall_number, 0};
+        }
+        constexpr std::uint64_t kIntMax = 0x7fffffffU;
+        const std::uint64_t limit = current.soft_limit < kIntMax ? current.soft_limit : kIntMax;
+        if (static_cast<std::uint64_t>(minimum) >= limit) {
+            set_error(state, kDarwinErrnoEinval);
+            return finish();
+        }
+        // fdalloc + finishdup: the lowest free descriptor at or above newmin,
+        // with its own close-on-exec flag set only for F_DUPFD_CLOEXEC.
+        const HostDuplicateResult duplicated =
+            host.duplicate_at_least(fd, minimum, command == kDarwinFcntlDupfdCloexec);
+        if (!duplicated) {
+            set_error(state, duplicated.error);
+            return finish();
+        }
+        // fdalloc never hands out fd itself, a descriptor below newmin or one
+        // at or above the limit, so a host success naming one is a host
+        // contract violation and never reaches the guest.
+        if (duplicated.descriptor < minimum || duplicated.descriptor == fd ||
+            static_cast<std::uint64_t>(duplicated.descriptor) >= limit) {
+            return SyscallDispatchResult{
+                SyscallDispatchError::host_contract_violation,
+                SyscallAction::resume, syscall_number, 0};
+        }
+        set_success(state, static_cast<std::uint64_t>(duplicated.descriptor));
+        return finish();
+    }
     default:
-        // F_DUPFD and every other command need descriptor-table or
-        // file-description state that is not modeled yet.
+        // Every other command needs descriptor-table or file-description
+        // state that is not modeled yet.
         set_error(state, kDarwinErrnoEnosys);
         return finish();
     }

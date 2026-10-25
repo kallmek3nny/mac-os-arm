@@ -221,9 +221,16 @@ constexpr std::uint64_t kDarwinSysDup2 = 90;
 // then hands the new O_NONBLOCK state to the file through FIONBIO and the
 // new O_ASYNC state through FIOASYNC. A FIONBIO failure is reported with
 // f_flag already changed; a FIOASYNC failure clears O_NONBLOCK again,
-// returns the file to blocking I/O and reports the FIOASYNC error. Every
-// other command, including F_DUPFD, reports ENOSYS once the descriptor
-// resolves, never a fabricated success.
+// returns the file to blocking I/O and reports the FIOASYNC error. F_DUPFD
+// and F_DUPFD_CLOEXEC read only the int low half of arg as the lowest
+// descriptor the duplicate may take: one that is negative or at or above
+// the soft RLIMIT_NOFILE limit is EINVAL. fdalloc then takes the lowest
+// free descriptor at or above it, or fails with EMFILE when none is free
+// below the limit, and finishdup points it at fd's open file description
+// with its own close-on-exec flag set only for F_DUPFD_CLOEXEC; the
+// duplicate is returned in x0. Guarded descriptors are not modeled, so
+// GUARD_DUP never applies. Every other command reports ENOSYS once the
+// descriptor resolves, never a fabricated success.
 constexpr std::uint64_t kDarwinSysFcntl = 92;
 constexpr std::uint64_t kDarwinSysFcntlNocancel = 406;
 constexpr std::uint32_t kDarwinFcntlDupfd = 0; // F_DUPFD
@@ -231,6 +238,7 @@ constexpr std::uint32_t kDarwinFcntlGetfd = 1; // F_GETFD
 constexpr std::uint32_t kDarwinFcntlSetfd = 2; // F_SETFD
 constexpr std::uint32_t kDarwinFcntlGetfl = 3; // F_GETFL
 constexpr std::uint32_t kDarwinFcntlSetfl = 4; // F_SETFL
+constexpr std::uint32_t kDarwinFcntlDupfdCloexec = 67; // F_DUPFD_CLOEXEC
 constexpr std::uint32_t kDarwinFdCloexec = 1;  // FD_CLOEXEC
 // XNU bsd/sys/fcntl.h status flags F_GETFL can report: an access mode plus
 // FMASK's O_NONBLOCK, O_APPEND, O_ASYNC, O_FSYNC and O_DSYNC.
@@ -657,6 +665,28 @@ public:
         std::int32_t to) {
         static_cast<void>(from);
         static_cast<void>(to);
+        return {0, kDarwinErrnoEbadf};
+    }
+
+    // Duplicate guest descriptor fd for fcntl(2) F_DUPFD and F_DUPFD_CLOEXEC,
+    // as fdalloc and finishdup do together: allocate the lowest free
+    // descriptor at or above minimum and below the soft RLIMIT_NOFILE limit,
+    // point it at fd's open file description and set the new descriptor's
+    // own close-on-exec flag exactly when close_on_exec is true. The
+    // dispatcher calls this only after descriptor_flags resolves fd, and only
+    // for a minimum that is not negative and lies below the soft
+    // RLIMIT_NOFILE limit resource_limit reports. Report EMFILE when no
+    // descriptor at or above minimum is free below that limit; on error no
+    // descriptor is allocated. A successful result names a descriptor at or
+    // above minimum other than fd. Hosts that do not override this expose no
+    // descriptors and report EBADF, never a fabricated descriptor.
+    [[nodiscard]] virtual HostDuplicateResult duplicate_at_least(
+        std::int32_t fd,
+        std::int32_t minimum,
+        bool close_on_exec) {
+        static_cast<void>(fd);
+        static_cast<void>(minimum);
+        static_cast<void>(close_on_exec);
         return {0, kDarwinErrnoEbadf};
     }
 
