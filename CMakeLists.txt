@@ -590,6 +590,26 @@ if(BUILD_TESTING)
                 -DEXPECTED_EXIT=81
                 -DEXPECTED_STDOUT=hello
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
+
+        # ioctl(2) FIOCLEX and FIONCLEX end to end: FIOCLEX sets stdout's own
+        # close-on-exec flag, so F_GETFD reports FD_CLOEXEC while stdout still
+        # writes "hel", and the dup(2) copy, 3, starts with its flag clear.
+        # FIONCLEX clears stdout's flag again. stdin, redirected from a file
+        # and so no terminal, accepts FIOCLEX too, as XNU acts on the file
+        # table entry before the device sees it, while ioctl(9, FIOCLEX) fails
+        # with EBADF (9) because 9 is not open. The copy writes "lo" and the
+        # guest exits with the copy << 4 | that errno, so a correct host exits
+        # 57; a failed call or wrong flag along the way exits 100 to 107.
+        add_test(
+            NAME macho-run-ioctl-fioclex-stdio
+            COMMAND "${CMAKE_COMMAND}"
+                "-DFIXTURE_TOOL=$<TARGET_FILE:macho_run_fixture>"
+                "-DRUNNER=$<TARGET_FILE:macho-run>"
+                -DKIND=ioctl-fioclex-stdio
+                "-DIMAGE=${CMAKE_CURRENT_BINARY_DIR}/macho-run-ioctl-fioclex-stdio.bin"
+                -DEXPECTED_EXIT=57
+                -DEXPECTED_STDOUT=hello
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
     endif()
 endif()
 

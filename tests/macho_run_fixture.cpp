@@ -876,12 +876,133 @@ constexpr std::array<std::uint32_t, 82> kFcntlDupfdStdoutCode{
     0xd4001001U, // svc #0x80
 };
 
+// ioctl(1, FIOCLEX); fcntl(1, F_GETFD); write(1, "hel", 3); copy = dup(1);
+// fcntl(copy, F_GETFD); ioctl(1, FIONCLEX); fcntl(1, F_GETFD);
+// ioctl(0, FIOCLEX); fcntl(0, F_GETFD); ioctl(9, FIOCLEX);
+// write(copy, "lo", 2); exit(copy << 4 | errno). FIOCLEX and FIONCLEX set
+// and clear only the descriptor's own close-on-exec flag, as fcntl(2) F_SETFD
+// does, so F_GETFD reports FD_CLOEXEC for stdout after FIOCLEX, and stdout
+// still writes "hel" because close-on-exec closes nothing before an exec.
+// The dup(2) copy, 3, starts with its own flag clear, and FIONCLEX clears
+// stdout's flag again. XNU acts on the file table entry before the device
+// sees either request, so stdin, which macho_run_check.cmake redirects from a
+// file and so is no terminal, accepts FIOCLEX too. Descriptor 9 is not open,
+// so ioctl(9, FIOCLEX) fails with EBADF (9). The copy then writes "lo", so
+// the host stdout shows "hello" and a correct host exits 57 (3 << 4 | 9). A
+// failed FIOCLEX on stdout, descriptor flags that are wrong or cannot be
+// read, a failed first write, a failed dup, a failed FIONCLEX, a failed
+// FIOCLEX on stdin, an ioctl on descriptor 9 that succeeds or fails with any
+// errno but EBADF, or a failed second write exits 100 to 107 instead, so no
+// errno can pass for a descriptor. The copy is kept in x19 across the later
+// calls.
+constexpr std::array<std::uint32_t, 99> kIoctlFioclexStdioCode{
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd28cc021U, // mov x1, #0x6601
+    0xf2a40001U, // movk x1, #0x2000, lsl #16 -> FIOCLEX 0x20006601
+    0xd28006d0U, // mov x16, #54 (ioctl)
+    0xd4001001U, // svc #0x80
+    0x540008c2U, // b.cs stdout_fioclex_failed (+280)
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd2800021U, // mov x1, #1 (F_GETFD)
+    0xd2800b90U, // mov x16, #92 (fcntl)
+    0xd4001001U, // svc #0x80
+    0x54000882U, // b.cs wrong_descriptor_flags (+272)
+    0xf100041fU, // cmp x0, #1 (FD_CLOEXEC)
+    0x54000841U, // b.ne wrong_descriptor_flags (+264)
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd2880001U, // mov x1, #0x4000
+    0xf2c00021U, // movk x1, #1, lsl #32 -> "hello" at 0x100004000
+    0xd2800062U, // mov x2, #3 -> "hel"
+    0xd2800090U, // mov x16, #4 (write)
+    0xd4001001U, // svc #0x80
+    0x540007c2U, // b.cs first_write_failed (+248)
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd2800530U, // mov x16, #41 (dup)
+    0xd4001001U, // svc #0x80
+    0x540007a2U, // b.cs dup_failed (+244)
+    0xaa0003f3U, // mov x19, x0 -> copy of stdout, still in x0
+    0xd2800021U, // mov x1, #1 (F_GETFD)
+    0xd2800b90U, // mov x16, #92 (fcntl)
+    0xd4001001U, // svc #0x80
+    0x54000642U, // b.cs wrong_descriptor_flags (+200)
+    0xb5000620U, // cbnz x0, wrong_descriptor_flags (+196)
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd28cc041U, // mov x1, #0x6602
+    0xf2a40001U, // movk x1, #0x2000, lsl #16 -> FIONCLEX 0x20006602
+    0xd28006d0U, // mov x16, #54 (ioctl)
+    0xd4001001U, // svc #0x80
+    0x54000682U, // b.cs fionclex_failed (+208)
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd2800021U, // mov x1, #1 (F_GETFD)
+    0xd2800b90U, // mov x16, #92 (fcntl)
+    0xd4001001U, // svc #0x80
+    0x540004c2U, // b.cs wrong_descriptor_flags (+152)
+    0xb50004a0U, // cbnz x0, wrong_descriptor_flags (+148)
+    0xd2800000U, // mov x0, #0 (stdin)
+    0xd28cc021U, // mov x1, #0x6601
+    0xf2a40001U, // movk x1, #0x2000, lsl #16 -> FIOCLEX
+    0xd28006d0U, // mov x16, #54 (ioctl)
+    0xd4001001U, // svc #0x80
+    0x54000562U, // b.cs stdin_fioclex_failed (+172)
+    0xd2800000U, // mov x0, #0 (stdin)
+    0xd2800021U, // mov x1, #1 (F_GETFD)
+    0xd2800b90U, // mov x16, #92 (fcntl)
+    0xd4001001U, // svc #0x80
+    0x54000342U, // b.cs wrong_descriptor_flags (+104)
+    0xf100041fU, // cmp x0, #1 (FD_CLOEXEC)
+    0x54000301U, // b.ne wrong_descriptor_flags (+96)
+    0xd2800120U, // mov x0, #9 -> no guest descriptor
+    0xd28cc021U, // mov x1, #0x6601
+    0xf2a40001U, // movk x1, #0x2000, lsl #16 -> FIOCLEX
+    0xd28006d0U, // mov x16, #54 (ioctl)
+    0xd4001001U, // svc #0x80
+    0x54000423U, // b.cc closed_ioctl_wrong (+132)
+    0xf100241fU, // cmp x0, #9 (EBADF)
+    0x540003e1U, // b.ne closed_ioctl_wrong (+124)
+    0xaa1303e0U, // mov x0, x19 -> copy
+    0xd2880001U, // mov x1, #0x4000
+    0xf2c00021U, // movk x1, #1, lsl #32
+    0x91000c21U, // add x1, x1, #3 -> "lo"
+    0xd2800042U, // mov x2, #2
+    0xd2800090U, // mov x16, #4 (write)
+    0xd4001001U, // svc #0x80
+    0x54000342U, // b.cs second_write_failed (+104)
+    0xd2800120U, // mov x0, #9 (EBADF)
+    0xaa131000U, // orr x0, x0, x19, lsl #4 -> copy << 4 | EBADF
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800c80U, // stdout_fioclex_failed: mov x0, #100
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800ca0U, // wrong_descriptor_flags: mov x0, #101
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800cc0U, // first_write_failed: mov x0, #102
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800ce0U, // dup_failed: mov x0, #103
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800d00U, // fionclex_failed: mov x0, #104
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800d20U, // stdin_fioclex_failed: mov x0, #105
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800d40U, // closed_ioctl_wrong: mov x0, #106
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800d60U, // second_write_failed: mov x0, #107
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+};
+
 int usage() {
     std::cerr << "usage: macho_run_fixture "
                  "<hello|argc|echo|close-stdout|fstat-stdin|ioctl-stdin|writev-stdout|"
                  "readv-stdin|lseek-stdin|pread-stdin|fcntl-stdio|fcntl-setfl-stdio|"
                  "getrlimit-stack|setrlimit-stack|getdtablesize|dup-stdout|dup2-stdout|"
-                 "fcntl-dupfd-stdout> "
+                 "fcntl-dupfd-stdout|ioctl-fioclex-stdio> "
                  "<output-path>\n";
     return 2;
 }
@@ -930,6 +1051,8 @@ int main(int argc, char** argv) {
         bytes = image(kDup2StdoutCode);
     } else if (kind == "fcntl-dupfd-stdout") {
         bytes = image(kFcntlDupfdStdoutCode);
+    } else if (kind == "ioctl-fioclex-stdio") {
+        bytes = image(kIoctlFioclexStdioCode);
     } else {
         return usage();
     }

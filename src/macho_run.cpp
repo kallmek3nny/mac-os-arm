@@ -664,9 +664,10 @@ public:
     }
 
     // Set or clear guest descriptor fd's own close-on-exec flag for fcntl(2)
-    // F_SETFD; any other descriptor naming the same stream keeps its own. The
-    // host descriptor's flags never change, so macho-run's own streams stay
-    // as they were for its diagnostics.
+    // F_SETFD and ioctl(2) FIOCLEX and FIONCLEX; any other descriptor naming
+    // the same stream keeps its own. The host descriptor's flags never
+    // change, so macho-run's own streams stay as they were for its
+    // diagnostics.
     macosarm::HostSetCloseOnExecResult set_close_on_exec(
         std::int32_t fd,
         bool close_on_exec) override {
