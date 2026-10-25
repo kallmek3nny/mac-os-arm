@@ -551,6 +551,24 @@ if(BUILD_TESTING)
                 -DEXPECTED_EXIT=49
                 -DEXPECTED_STDOUT=hello
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
+
+        # dup2(2) end to end: dup2(1, 9) names 9 even though only 0 to 2 are
+        # open, since macho-run enforces no RLIMIT_NOFILE limit, and that copy
+        # writes "hel" after the guest closes 1. dup2(9, 9) returns 9 and
+        # changes nothing, and dup2(9, 1) reopens 1 onto the same stream,
+        # which writes "lo" after the guest closes 9. The guest exits with
+        # the copy << 4 | the reopened descriptor, so a correct host exits 145;
+        # a failed call along the way exits 100 to 106 instead.
+        add_test(
+            NAME macho-run-dup2-stdout
+            COMMAND "${CMAKE_COMMAND}"
+                "-DFIXTURE_TOOL=$<TARGET_FILE:macho_run_fixture>"
+                "-DRUNNER=$<TARGET_FILE:macho-run>"
+                -DKIND=dup2-stdout
+                "-DIMAGE=${CMAKE_CURRENT_BINARY_DIR}/macho-run-dup2-stdout.bin"
+                -DEXPECTED_EXIT=145
+                -DEXPECTED_STDOUT=hello
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
     endif()
 endif()
 

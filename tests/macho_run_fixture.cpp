@@ -672,11 +672,92 @@ constexpr std::array<std::uint32_t, 35> kDupStdoutCode{
     0xd4001001U, // svc #0x80
 };
 
+// to = dup2(1, 9); close(1); write(to, "hel", 3); same = dup2(to, to);
+// back = dup2(to, 1); close(to); write(back, "lo", 2); exit(to << 4 | back).
+// macho-run enforces no RLIMIT_NOFILE limit, so dup2(2) may name 9 while
+// only 0 to 2 are open, and that copy still writes "hel" to the host stdout
+// once the guest closes 1. A to equal to from returns it and changes nothing,
+// and dup2(to, 1) reopens the closed descriptor 1 onto the same stream, which
+// keeps working after the guest closes 9, so the host stdout shows "hello"
+// and a correct host exits 145 (9 << 4 | 1). A failed first dup2, close of
+// 1, first write, same-descriptor dup2 (or one that returns any descriptor
+// but 9), reopening dup2, close of 9 or second write exits 100 to 106
+// instead, so no errno can pass for a descriptor. The copy at 9 and the
+// reopened 1 are kept in x19 and x20 across the later calls.
+constexpr std::array<std::uint32_t, 66> kDup2StdoutCode{
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd2800121U, // mov x1, #9
+    0xd2800b50U, // mov x16, #90 (dup2)
+    0xd4001001U, // svc #0x80
+    0x54000522U, // b.cs first_dup2_failed (+164)
+    0xaa0003f3U, // mov x19, x0 -> copy of stdout at 9
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd28000d0U, // mov x16, #6 (close)
+    0xd4001001U, // svc #0x80
+    0x540004e2U, // b.cs close_stdout_failed (+156)
+    0xaa1303e0U, // mov x0, x19 -> copy at 9
+    0xd2880001U, // mov x1, #0x4000
+    0xf2c00021U, // movk x1, #1, lsl #32 -> "hello" at 0x100004000
+    0xd2800062U, // mov x2, #3 -> "hel"
+    0xd2800090U, // mov x16, #4 (write)
+    0xd4001001U, // svc #0x80
+    0x54000462U, // b.cs first_write_failed (+140)
+    0xaa1303e0U, // mov x0, x19 -> from = 9
+    0xaa1303e1U, // mov x1, x19 -> to = 9
+    0xd2800b50U, // mov x16, #90 (dup2)
+    0xd4001001U, // svc #0x80
+    0x54000422U, // b.cs same_dup2_failed (+132)
+    0xeb13001fU, // cmp x0, x19
+    0x540003e1U, // b.ne same_dup2_failed (+124)
+    0xaa1303e0U, // mov x0, x19 -> from = 9
+    0xd2800021U, // mov x1, #1 -> to = the closed stdout descriptor
+    0xd2800b50U, // mov x16, #90 (dup2)
+    0xd4001001U, // svc #0x80
+    0x540003a2U, // b.cs reopen_failed (+116)
+    0xaa0003f4U, // mov x20, x0 -> reopened descriptor
+    0xaa1303e0U, // mov x0, x19 -> copy at 9
+    0xd28000d0U, // mov x16, #6 (close)
+    0xd4001001U, // svc #0x80
+    0x54000362U, // b.cs close_copy_failed (+108)
+    0xaa1403e0U, // mov x0, x20 -> reopened descriptor
+    0xd2880001U, // mov x1, #0x4000
+    0xf2c00021U, // movk x1, #1, lsl #32
+    0x91000c21U, // add x1, x1, #3 -> "lo"
+    0xd2800042U, // mov x2, #2
+    0xd2800090U, // mov x16, #4 (write)
+    0xd4001001U, // svc #0x80
+    0x540002c2U, // b.cs second_write_failed (+88)
+    0xaa131280U, // orr x0, x20, x19, lsl #4 -> copy << 4 | reopened
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800c80U, // first_dup2_failed: mov x0, #100
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800ca0U, // close_stdout_failed: mov x0, #101
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800cc0U, // first_write_failed: mov x0, #102
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800ce0U, // same_dup2_failed: mov x0, #103
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800d00U, // reopen_failed: mov x0, #104
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800d20U, // close_copy_failed: mov x0, #105
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800d40U, // second_write_failed: mov x0, #106
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+};
+
 int usage() {
     std::cerr << "usage: macho_run_fixture "
                  "<hello|argc|echo|close-stdout|fstat-stdin|ioctl-stdin|writev-stdout|"
                  "readv-stdin|lseek-stdin|pread-stdin|fcntl-stdio|fcntl-setfl-stdio|"
-                 "getrlimit-stack|setrlimit-stack|getdtablesize|dup-stdout> "
+                 "getrlimit-stack|setrlimit-stack|getdtablesize|dup-stdout|dup2-stdout> "
                  "<output-path>\n";
     return 2;
 }
@@ -721,6 +802,8 @@ int main(int argc, char** argv) {
         bytes = image(kGetdtablesizeCode);
     } else if (kind == "dup-stdout") {
         bytes = image(kDupStdoutCode);
+    } else if (kind == "dup2-stdout") {
+        bytes = image(kDup2StdoutCode);
     } else {
         return usage();
     }

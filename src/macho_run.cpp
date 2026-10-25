@@ -10,6 +10,7 @@
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <span>
 #include <string_view>
 #include <system_error>
@@ -330,23 +331,25 @@ std::int64_t write_host_stream_at(
 
 // The guest's stdin, stdout and stderr reach the host's, as raw bytes. Each
 // open guest descriptor names one of those three host streams: the guest
-// starts with descriptors 0, 1 and 2 naming them in order, and dup(2) gives a
-// stream further descriptors that share its open file description. Any other
-// descriptor reports EBADF, as does one the guest has closed.
+// starts with descriptors 0, 1 and 2 naming them in order, and dup(2) and
+// dup2(2) give a stream further descriptors that share its open file
+// description. Any other descriptor reports EBADF, as does one the guest has
+// closed.
 class ConsoleHost final : public macosarm::DarwinHostServices {
-    // One slot of the guest descriptor table. stream is the host standard
-    // stream (0, 1 or 2) whose open file description the descriptor names,
-    // or -1 while the slot is free. close_on_exec is the descriptor's own
-    // FD_CLOEXEC flag, which a duplicate never shares.
+    // One open guest descriptor. stream is the host standard stream (0, 1 or
+    // 2) whose open file description the descriptor names. close_on_exec is
+    // the descriptor's own FD_CLOEXEC flag, which a duplicate never shares.
     struct GuestDescriptor {
         std::int32_t stream;
         bool close_on_exec;
     };
 
-    // Slot n describes guest descriptor n. macho-run enforces no
-    // RLIMIT_NOFILE limit, so the table grows as dup(2) needs and is bounded
-    // only by the descriptors an int can name.
-    std::vector<GuestDescriptor> descriptors_;
+    // The guest descriptor table, keyed by descriptor and holding only the
+    // open ones, none of them negative. macho-run enforces no RLIMIT_NOFILE
+    // limit, so every descriptor an int can name is in range and dup2(2) may
+    // name one far above the rest. Keeping the table sparse means that costs
+    // a single entry, never a slot for every descriptor below it.
+    std::map<std::int32_t, GuestDescriptor> descriptors_;
     // Size in bytes of the main-thread stack the session maps for the guest.
     // That mapping never grows, so getrlimit(2) RLIMIT_STACK reports it as
     // both the soft and the hard limit.
@@ -355,10 +358,8 @@ class ConsoleHost final : public macosarm::DarwinHostServices {
     // The host standard stream guest descriptor fd names, or -1 when fd is
     // not an open guest descriptor.
     [[nodiscard]] std::int32_t stream_of(std::int32_t fd) const noexcept {
-        if (fd < 0 || static_cast<std::size_t>(fd) >= descriptors_.size()) {
-            return -1;
-        }
-        return descriptors_[static_cast<std::size_t>(fd)].stream;
+        const auto found = descriptors_.find(fd);
+        return found == descriptors_.end() ? -1 : found->second.stream;
     }
 
     [[nodiscard]] bool is_open(std::int32_t fd) const noexcept {
@@ -370,46 +371,68 @@ public:
     // the limit the guest reads describes its real stack. A process inherits
     // its standard descriptors without FD_CLOEXEC.
     explicit ConsoleHost(std::uint64_t stack_size)
-        : descriptors_{{0, false}, {1, false}, {2, false}}, stack_size_(stack_size) {}
+        : descriptors_{{0, {0, false}}, {1, {1, false}}, {2, {2, false}}},
+          stack_size_(stack_size) {}
 
     // close(2) releases only the guest descriptor; the host stream it names
     // stays open for macho-run diagnostics and for any other guest descriptor
     // that still names it. A released or unknown descriptor reports EBADF, so
     // a second close never succeeds. Releasing a descriptor also drops its
     // close-on-exec flag, as XNU clears a released slot's descriptor flags,
-    // so no stale flag outlives it, and frees the slot for a later dup(2).
+    // so no stale flag outlives it, and frees it for a later dup(2).
     macosarm::HostCloseResult close(std::int32_t fd) override {
-        if (!is_open(fd)) {
+        if (descriptors_.erase(fd) == 0) {
             return {kGuestErrnoEbadf};
         }
-        descriptors_[static_cast<std::size_t>(fd)] = {-1, false};
         return {0};
     }
 
     // dup(2), as fdalloc and finishdup do together: the lowest free guest
     // descriptor now names the same standard stream as fd, so the two share
     // its file offset and status flags, while the new descriptor's own
-    // close-on-exec flag starts clear. macho-run enforces no RLIMIT_NOFILE
-    // limit, so the table grows by one slot only when every slot is in use,
-    // and reports EMFILE once no int could name a further descriptor. On
-    // error no slot is allocated.
+    // close-on-exec flag starts clear. The table is ordered and holds no
+    // negative descriptor, so the lowest free one is the first gap in its
+    // keys counting up from 0. macho-run enforces no RLIMIT_NOFILE limit, so
+    // dup(2) reports EMFILE only once no int could name a further
+    // descriptor. On error nothing is allocated.
     macosarm::HostDuplicateResult duplicate(std::int32_t fd) override {
         const std::int32_t stream = stream_of(fd);
         if (stream < 0) {
             return {0, kGuestErrnoEbadf};
         }
-        std::size_t slot = 0;
-        while (slot < descriptors_.size() && descriptors_[slot].stream >= 0) {
-            ++slot;
+        std::int64_t lowest = 0;
+        for (const auto& entry : descriptors_) {
+            if (entry.first != lowest) {
+                break;
+            }
+            ++lowest;
         }
-        if (slot > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+        if (lowest > std::numeric_limits<std::int32_t>::max()) {
             return {0, kGuestErrnoEmfile};
         }
-        if (slot == descriptors_.size()) {
-            descriptors_.push_back({-1, false});
+        const auto descriptor = static_cast<std::int32_t>(lowest);
+        descriptors_.emplace(descriptor, GuestDescriptor{stream, false});
+        return {descriptor, 0};
+    }
+
+    // dup2(2), as XNU's dup2 does: a from the guest does not have open
+    // reports EBADF. macho-run enforces no RLIMIT_NOFILE limit, so no to
+    // that is not negative lies at or above it, and the sparse table records
+    // even the highest one as a single entry. A to equal to from returns to
+    // and changes nothing, not even its close-on-exec flag. Otherwise any
+    // descriptor open at to is released, which for a guest descriptor never
+    // fails, so there is no close error to discard, and to then names from's
+    // standard stream with its own close-on-exec flag clear. On error no
+    // descriptor changes.
+    macosarm::HostDuplicateResult duplicate_to(std::int32_t from, std::int32_t to) override {
+        const std::int32_t stream = stream_of(from);
+        if (stream < 0 || to < 0) {
+            return {0, kGuestErrnoEbadf};
         }
-        descriptors_[slot] = {stream, false};
-        return {static_cast<std::int32_t>(slot), 0};
+        if (to != from) {
+            descriptors_.insert_or_assign(to, GuestDescriptor{stream, false});
+        }
+        return {to, 0};
     }
 
     // fstat64(2) describes only an open guest descriptor, through the
@@ -599,7 +622,7 @@ public:
             status_flags |= macosarm::kDarwinOpenAppend;
         }
 #endif
-        const bool close_on_exec = descriptors_[static_cast<std::size_t>(fd)].close_on_exec;
+        const bool close_on_exec = descriptors_.at(fd).close_on_exec;
         return {close_on_exec, status_flags, 0};
     }
 
@@ -613,7 +636,7 @@ public:
         if (!is_open(fd)) {
             return {kGuestErrnoEbadf};
         }
-        descriptors_[static_cast<std::size_t>(fd)].close_on_exec = close_on_exec;
+        descriptors_.at(fd).close_on_exec = close_on_exec;
         return {0};
     }
 
