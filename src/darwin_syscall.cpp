@@ -1616,14 +1616,21 @@ void set_error(CpuState& state, std::uint32_t error) noexcept {
 // resolves the descriptor (EBADF). FIOCLEX, FIONCLEX, FIONBIO, FIOASYNC,
 // FIOSETOWN and FIOGETOWN act on the file table entry itself. FIOCLEX and
 // FIONCLEX set and clear the descriptor's own close-on-exec flag through the
-// host, as fcntl(2) F_SETFD does; ownership and the FIONBIO and FIOASYNC I/O
-// modes are not modeled for ioctl yet, so those report ENOSYS and are never
-// acknowledged. Every other request reaches the device, which reports
-// ENOTTY for a request it does not recognize, and an IOC_OUT result is
-// copied out only on success (EFAULT). Only TIOCGETA and TIOCGWINSZ on a
-// host terminal are recognized; the host reports just that fd is a terminal
-// and its window size, and the dispatcher encodes both records itself. A
-// negative descriptor never reaches the host.
+// host, as fcntl(2) F_SETFD does. FIONBIO and FIOASYNC read the int they
+// copied in: XNU sets FNONBLOCK (FASYNC) in f_flag when it is nonzero and
+// clears it otherwise, then hands the file the new mode through fo_ioctl.
+// The dispatcher likewise commits the new OFLAGS(f_flag) through
+// set_status_flags and then calls set_nonblocking_io (set_async_io); a mode
+// failure is reported with the status flags already changed, exactly as XNU
+// leaves f_flag, and nothing is undone. Ownership is not modeled for ioctl
+// yet, so FIOSETOWN and FIOGETOWN report ENOSYS and are never acknowledged.
+// XNU's FREAD | FWRITE check cannot fail here, since every OFLAGS(f_flag) a
+// host may report holds O_RDONLY, O_WRONLY or O_RDWR. Every other request
+// reaches the device, which reports ENOTTY for a request it does not
+// recognize, and an IOC_OUT result is copied out only on success (EFAULT).
+// Only TIOCGETA and TIOCGWINSZ on a host terminal are recognized; the host
+// reports just that fd is a terminal and its window size, and the dispatcher
+// encodes both records itself. A negative descriptor never reaches the host.
 [[nodiscard]] SyscallDispatchResult dispatch_ioctl(
     CpuState& state,
     GuestAddressSpace& address_space,
@@ -1640,10 +1647,11 @@ void set_error(CpuState& state, std::uint32_t error) noexcept {
     const std::uint64_t guest_address = state.x[2];
     const auto size = static_cast<std::size_t>((command >> 16U) & kDarwinIocParmMask);
 
+    // XNU copies an IOC_IN argument into its kernel buffer before it resolves
+    // the descriptor, so a fault is EFAULT even for a bad descriptor. Only
+    // FIONBIO and FIOASYNC consume what was copied in.
+    std::array<std::byte, kDarwinIocParmMask + 1U> argument{};
     if ((command & kDarwinIocIn) != 0U && size != 0U) {
-        // Staged only to reproduce XNU's copyin fault ordering; no request
-        // handled here consumes guest input yet.
-        std::array<std::byte, kDarwinIocParmMask + 1U> argument{};
         if (!address_space.read(guest_address, std::span<std::byte>(argument.data(), size))) {
             set_error(state, kDarwinErrnoEfault);
             return finish();
@@ -1687,10 +1695,55 @@ void set_error(CpuState& state, std::uint32_t error) noexcept {
         set_success(state, 0U);
         return finish();
     }
+    case kDarwinIoctlFionbio:
+    case kDarwinIoctlFioasync: {
+        // tmp = *(int *)datap: only the int copied in is read, and any
+        // nonzero value turns the mode on. The flag changes in f_flag first,
+        // whether or not the descriptor is a terminal, and fo_ioctl then
+        // hands the file its new mode; a mode failure is reported with
+        // f_flag already changed and nothing is undone.
+        std::uint32_t requested = 0U;
+        for (std::size_t i = 0; i < sizeof(requested); ++i) {
+            requested |= static_cast<std::uint32_t>(argument[i]) << (8U * i);
+        }
+        const bool enable = requested != 0U;
+        const HostDescriptorFlagsResult described = host.descriptor_flags(fd);
+        if (!described) {
+            set_error(state, described.error);
+            return finish();
+        }
+        // OFLAGS(f_flag) always holds exactly one access mode and only FMASK
+        // bits; anything else is a host contract violation, never guest data.
+        constexpr std::uint32_t reportable_status_flags =
+            kDarwinOpenAccessMode | kDarwinOpenNonblock | kDarwinOpenAppend |
+            kDarwinOpenAsync | kDarwinOpenFsync | kDarwinOpenDsync;
+        if ((described.status_flags & ~reportable_status_flags) != 0U ||
+            (described.status_flags & kDarwinOpenAccessMode) == kDarwinOpenAccessMode) {
+            return SyscallDispatchResult{
+                SyscallDispatchError::host_contract_violation,
+                SyscallAction::resume, syscall_number, 0};
+        }
+        const bool nonblocking_request = command == kDarwinIoctlFionbio;
+        const std::uint32_t flag = nonblocking_request ? kDarwinOpenNonblock : kDarwinOpenAsync;
+        const std::uint32_t status_flags =
+            enable ? (described.status_flags | flag) : (described.status_flags & ~flag);
+        const HostSetStatusFlagsResult committed = host.set_status_flags(fd, status_flags);
+        if (!committed) {
+            set_error(state, committed.error);
+            return finish();
+        }
+        const HostFileModeResult mode = nonblocking_request
+                                            ? host.set_nonblocking_io(fd, enable)
+                                            : host.set_async_io(fd, enable);
+        if (!mode) {
+            set_error(state, mode.error);
+            return finish();
+        }
+        set_success(state, 0U);
+        return finish();
+    }
     case kDarwinIoctlFiogetown:
     case kDarwinIoctlFiosetown:
-    case kDarwinIoctlFioasync:
-    case kDarwinIoctlFionbio:
         set_error(state, kDarwinErrnoEnosys);
         return finish();
     case kDarwinIoctlTiocgeta: {

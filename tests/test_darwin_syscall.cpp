@@ -597,6 +597,86 @@ struct TerminalHost final : macosarm::DarwinHostServices {
         *flag = close_on_exec;
         return {0};
     }
+
+    // ioctl(2) FIONBIO and FIOASYNC. terminal_fd and file_fd each keep their
+    // own OFLAGS(f_flag) status flags, starting as O_RDWR and O_RDONLY, and
+    // every other descriptor is EBADF. A nonzero status_error,
+    // nonblocking_error or async_error fails the next set_status_flags,
+    // set_nonblocking_io or set_async_io call once and leaves that state
+    // unchanged. Every status flag commit and I/O mode request is recorded
+    // in call order; value is the committed flags, or 1 or 0 for the mode.
+    struct ModeStep {
+        enum class Kind { status_flags, nonblocking_io, async_io };
+
+        Kind kind{};
+        std::int32_t fd{};
+        std::uint32_t value{};
+
+        friend bool operator==(const ModeStep&, const ModeStep&) = default;
+    };
+
+    std::uint32_t terminal_status_flags{macosarm::kDarwinOpenReadWrite};
+    std::uint32_t file_status_flags{macosarm::kDarwinOpenReadOnly};
+    std::uint32_t status_error{};
+    std::uint32_t nonblocking_error{};
+    std::uint32_t async_error{};
+    std::vector<ModeStep> mode_steps;
+
+    [[nodiscard]] std::uint32_t* status_flags_of(std::int32_t fd) noexcept {
+        return fd == terminal_fd ? &terminal_status_flags
+               : fd == file_fd   ? &file_status_flags
+                                 : nullptr;
+    }
+
+    // Report and clear a one-shot scripted failure.
+    [[nodiscard]] static std::uint32_t take(std::uint32_t& error) noexcept {
+        const std::uint32_t failure = error;
+        error = 0;
+        return failure;
+    }
+
+    macosarm::HostDescriptorFlagsResult descriptor_flags(std::int32_t fd) override {
+        const std::uint32_t* const flags = status_flags_of(fd);
+        if (flags == nullptr) {
+            return {false, 0, macosarm::kDarwinErrnoEbadf};
+        }
+        return {fd == terminal_fd ? terminal_close_on_exec : file_close_on_exec, *flags, 0};
+    }
+
+    macosarm::HostSetStatusFlagsResult set_status_flags(
+        std::int32_t fd,
+        std::uint32_t status_flags) override {
+        mode_steps.push_back({ModeStep::Kind::status_flags, fd, status_flags});
+        std::uint32_t* const flags = status_flags_of(fd);
+        if (flags == nullptr) {
+            return {macosarm::kDarwinErrnoEbadf};
+        }
+        if (status_error != 0) {
+            return {take(status_error)};
+        }
+        *flags = status_flags;
+        return {0};
+    }
+
+    macosarm::HostFileModeResult set_nonblocking_io(
+        std::int32_t fd,
+        bool nonblocking) override {
+        mode_steps.push_back({ModeStep::Kind::nonblocking_io, fd, nonblocking ? 1U : 0U});
+        if (status_flags_of(fd) == nullptr) {
+            return {macosarm::kDarwinErrnoEbadf};
+        }
+        return {take(nonblocking_error)};
+    }
+
+    macosarm::HostFileModeResult set_async_io(
+        std::int32_t fd,
+        bool asynchronous) override {
+        mode_steps.push_back({ModeStep::Kind::async_io, fd, asynchronous ? 1U : 0U});
+        if (status_flags_of(fd) == nullptr) {
+            return {macosarm::kDarwinErrnoEbadf};
+        }
+        return {take(async_error)};
+    }
 };
 
 // ioctl(2) fixtures: one guest page pre-filled with a sentinel so tests can
@@ -4143,17 +4223,17 @@ int main() {
         }
 
         {
-            // FIOGETOWN, FIOSETOWN, FIOASYNC and FIONBIO are not modeled for
-            // ioctl yet: on any open descriptor, terminal or not, they report
-            // ENOSYS, change no close-on-exec flag and write nothing. They
-            // still resolve the descriptor first, so an unknown fd is EBADF.
+            // FIOGETOWN and FIOSETOWN are not modeled for ioctl yet: on any
+            // open descriptor, terminal or not, they report ENOSYS, change no
+            // close-on-exec flag and write nothing. They still resolve the
+            // descriptor first, so an unknown fd is EBADF.
             macosarm::GuestAddressSpace vm;
             map_ioctl_page(vm, rw);
             TerminalHost host;
             macosarm::CpuState state{};
-            constexpr std::array<std::uint64_t, 4> file_table_requests{
-                macosarm::kDarwinIoctlFiogetown, macosarm::kDarwinIoctlFiosetown,
-                macosarm::kDarwinIoctlFioasync,  macosarm::kDarwinIoctlFionbio,
+            constexpr std::array<std::uint64_t, 2> file_table_requests{
+                macosarm::kDarwinIoctlFiogetown,
+                macosarm::kDarwinIoctlFiosetown,
             };
             bool on_terminal = true;
             bool on_file = true;
@@ -4172,6 +4252,171 @@ int main() {
             expect(host.requests.size() == 3U * file_table_requests.size(),
                    "file-table ioctl requests resolve the descriptor once each");
             expect(ioctl_sentinel_from(vm, 0), "file-table ioctl requests write nothing");
+        }
+
+        // Store the int an ioctl(2) _IOW(..., int) request copies in at
+        // kIoctlBase, followed by tail, so tests can prove only the int is read.
+        const auto put_ioctl_int = [&](macosarm::GuestAddressSpace& vm, std::uint32_t value,
+                                       std::uint32_t tail) {
+            std::array<std::byte, 8> bytes{};
+            for (std::size_t i = 0; i < 4U; ++i) {
+                bytes[i] = static_cast<std::byte>((value >> (8U * i)) & 0xffU);
+                bytes[4U + i] = static_cast<std::byte>((tail >> (8U * i)) & 0xffU);
+            }
+            expect(static_cast<bool>(vm.load_bytes(kIoctlBase, bytes)), "ioctl int argument loads");
+        };
+        constexpr std::uint32_t read_write = macosarm::kDarwinOpenReadWrite;
+        constexpr std::uint32_t nonblock_flag = macosarm::kDarwinOpenNonblock;
+        constexpr std::uint32_t async_flag = macosarm::kDarwinOpenAsync;
+
+        {
+            // ioctl(2) FIONBIO and FIOASYNC read only the int they copy in: any
+            // nonzero value sets O_NONBLOCK (O_ASYNC) in the open file
+            // description's status flags and zero clears it, then the file is
+            // handed its new I/O mode. A terminal and an open non-terminal
+            // behave alike, each request touches only its own flag, and
+            // nothing is copied out or changes close-on-exec.
+            using Step = TerminalHost::ModeStep;
+            using Kind = Step::Kind;
+            macosarm::GuestAddressSpace vm;
+            map_ioctl_page(vm, rw);
+            TerminalHost host;
+            macosarm::CpuState state{};
+            put_ioctl_int(vm, 1U, 0U);
+            const auto nonblocking =
+                run_ioctl(vm, host, state, 0U, macosarm::kDarwinIoctlFionbio, kIoctlBase);
+            expect(static_cast<bool>(nonblocking) &&
+                       nonblocking.action == macosarm::SyscallAction::resume &&
+                       nonblocking.syscall_number == macosarm::kDarwinSysIoctl &&
+                       state.x[0] == 0U && !carry_is_set(state),
+                   "FIONBIO success returns 0, clears carry and resumes the guest");
+            expect(host.terminal_status_flags == (read_write | nonblock_flag) &&
+                       (host.mode_steps == std::vector<Step>{
+                            {Kind::status_flags, 0, read_write | nonblock_flag},
+                            {Kind::nonblocking_io, 0, 1U}}),
+                   "FIONBIO with a nonzero int sets O_NONBLOCK, then asks for nonblocking I/O");
+
+            host.mode_steps.clear();
+            put_ioctl_int(vm, 0U, 0xffffffffU);
+            static_cast<void>(run_ioctl(vm, host, state, 0xffffffff00000000ULL,
+                                        macosarm::kDarwinIoctlFionbio, kIoctlBase));
+            expect(!carry_is_set(state) && state.x[0] == 0U &&
+                       host.terminal_status_flags == read_write &&
+                       (host.mode_steps == std::vector<Step>{
+                            {Kind::status_flags, 0, read_write},
+                            {Kind::nonblocking_io, 0, 0U}}),
+                   "FIONBIO with a zero int clears O_NONBLOCK and reads only the int and w0");
+
+            host.mode_steps.clear();
+            put_ioctl_int(vm, 0x80000000U, 0U);
+            static_cast<void>(
+                run_ioctl(vm, host, state, 3U, macosarm::kDarwinIoctlFioasync, kIoctlBase));
+            const bool async_set = !carry_is_set(state) && state.x[0] == 0U &&
+                                   host.file_status_flags == async_flag;
+            static_cast<void>(
+                run_ioctl(vm, host, state, 3U, macosarm::kDarwinIoctlFionbio, kIoctlBase));
+            const bool nonblocking_kept_async = !carry_is_set(state) && state.x[0] == 0U &&
+                                                host.file_status_flags == (async_flag | nonblock_flag);
+            put_ioctl_int(vm, 0U, 0U);
+            static_cast<void>(
+                run_ioctl(vm, host, state, 3U, macosarm::kDarwinIoctlFioasync, kIoctlBase));
+            expect(async_set && nonblocking_kept_async && !carry_is_set(state) &&
+                       state.x[0] == 0U && host.file_status_flags == nonblock_flag &&
+                       host.terminal_status_flags == read_write &&
+                       (host.mode_steps == std::vector<Step>{
+                            {Kind::status_flags, 3, async_flag},
+                            {Kind::async_io, 3, 1U},
+                            {Kind::status_flags, 3, async_flag | nonblock_flag},
+                            {Kind::nonblocking_io, 3, 1U},
+                            {Kind::status_flags, 3, nonblock_flag},
+                            {Kind::async_io, 3, 0U}}),
+                   "FIOASYNC and FIONBIO on an open non-terminal each change only their own flag");
+            expect((host.requests == std::vector<std::int32_t>{0, 0, 3, 3, 3}) &&
+                       host.updates.empty() && !host.terminal_close_on_exec &&
+                       !host.file_close_on_exec && ioctl_sentinel_from(vm, 8U),
+                   "FIONBIO and FIOASYNC resolve the fd once each, copy nothing out and keep "
+                   "close-on-exec");
+        }
+
+        {
+            // FIONBIO and FIOASYNC fail as XNU does: an unreadable int is EFAULT
+            // before the host sees the request, an unknown descriptor is EBADF,
+            // and a failed status flag commit changes nothing. A failed I/O mode
+            // request is reported with the status flags already changed, and
+            // ioctl undoes nothing, unlike fcntl(2) F_SETFL.
+            using Step = TerminalHost::ModeStep;
+            using Kind = Step::Kind;
+            macosarm::GuestAddressSpace vm;
+            map_ioctl_page(vm, rw);
+            TerminalHost host;
+            macosarm::CpuState state{};
+            const std::uint64_t unmapped = kIoctlBase + kIoctlPage;
+            static_cast<void>(
+                run_ioctl(vm, host, state, 0U, macosarm::kDarwinIoctlFioasync, unmapped));
+            expect(failed_with(state, macosarm::kDarwinErrnoEfault) && host.requests.empty() &&
+                       host.mode_steps.empty(),
+                   "FIOASYNC with an unreadable int reports EFAULT before querying the host");
+
+            put_ioctl_int(vm, 1U, 0U);
+            static_cast<void>(
+                run_ioctl(vm, host, state, 7U, macosarm::kDarwinIoctlFionbio, kIoctlBase));
+            expect(failed_with(state, macosarm::kDarwinErrnoEbadf) &&
+                       host.requests == std::vector<std::int32_t>{7} && host.mode_steps.empty(),
+                   "FIONBIO on an unknown fd reports EBADF and changes no status flags");
+
+            host.status_error = macosarm::kDarwinErrnoEio;
+            static_cast<void>(
+                run_ioctl(vm, host, state, 0U, macosarm::kDarwinIoctlFionbio, kIoctlBase));
+            expect(failed_with(state, macosarm::kDarwinErrnoEio) &&
+                       host.terminal_status_flags == read_write &&
+                       (host.mode_steps ==
+                        std::vector<Step>{{Kind::status_flags, 0, read_write | nonblock_flag}}),
+                   "a failed FIONBIO status flag commit is reported and asks for no I/O mode");
+
+            host.mode_steps.clear();
+            host.nonblocking_error = macosarm::kDarwinErrnoEinval;
+            static_cast<void>(
+                run_ioctl(vm, host, state, 0U, macosarm::kDarwinIoctlFionbio, kIoctlBase));
+            expect(failed_with(state, macosarm::kDarwinErrnoEinval) &&
+                       host.terminal_status_flags == (read_write | nonblock_flag) &&
+                       (host.mode_steps == std::vector<Step>{
+                            {Kind::status_flags, 0, read_write | nonblock_flag},
+                            {Kind::nonblocking_io, 0, 1U}}),
+                   "a failed FIONBIO mode request is reported with O_NONBLOCK already set");
+
+            host.mode_steps.clear();
+            host.async_error = macosarm::kDarwinErrnoEio;
+            static_cast<void>(
+                run_ioctl(vm, host, state, 3U, macosarm::kDarwinIoctlFioasync, kIoctlBase));
+            expect(failed_with(state, macosarm::kDarwinErrnoEio) &&
+                       host.file_status_flags == async_flag &&
+                       (host.mode_steps == std::vector<Step>{
+                            {Kind::status_flags, 3, async_flag},
+                            {Kind::async_io, 3, 1U}}),
+                   "a failed FIOASYNC mode request keeps O_ASYNC and undoes nothing");
+            expect(host.updates.empty() && ioctl_sentinel_from(vm, 8U),
+                   "failed FIONBIO and FIOASYNC requests copy nothing out");
+        }
+
+        {
+            // OFLAGS(f_flag) always holds exactly one access mode and only FMASK
+            // bits, so FIONBIO and FIOASYNC refuse anything else from the host
+            // as a contract violation before any status flags are committed.
+            macosarm::GuestAddressSpace vm;
+            map_ioctl_page(vm, rw);
+            TerminalHost host;
+            macosarm::CpuState state{};
+            put_ioctl_int(vm, 1U, 0U);
+            host.terminal_status_flags = macosarm::kDarwinOpenAccessMode;
+            host.file_status_flags = macosarm::kDarwinOpenReadOnly | 0x0010U;
+            const auto bad_mode =
+                run_ioctl(vm, host, state, 0U, macosarm::kDarwinIoctlFionbio, kIoctlBase);
+            const auto bad_bits =
+                run_ioctl(vm, host, state, 3U, macosarm::kDarwinIoctlFioasync, kIoctlBase);
+            expect(bad_mode.error == macosarm::SyscallDispatchError::host_contract_violation &&
+                       bad_bits.error == macosarm::SyscallDispatchError::host_contract_violation &&
+                       host.mode_steps.empty(),
+                   "FIONBIO and FIOASYNC reject host status flags outside OFLAGS(f_flag)");
         }
 
         {

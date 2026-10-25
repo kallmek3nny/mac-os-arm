@@ -75,8 +75,11 @@ constexpr std::size_t kDarwinWinsizeSize = 8;
 // XNU bsd/sys/filio.h requests that sys_generic.c's ioctl handles itself on
 // the file table entry instead of forwarding to the device. FIOCLEX and
 // FIONCLEX set and clear the descriptor's own close-on-exec flag, as fcntl(2)
-// F_SETFD does. Ownership and the FIONBIO and FIOASYNC I/O modes are not
-// modeled for ioctl yet, so those requests are never acknowledged.
+// F_SETFD does. FIONBIO and FIOASYNC take an int: nonzero sets O_NONBLOCK
+// (O_ASYNC) in the open file description's status flags and zero clears it,
+// before the file is handed the new I/O mode, as fcntl(2) F_SETFL does for
+// each flag. Ownership is not modeled for ioctl yet, so FIOSETOWN and
+// FIOGETOWN are never acknowledged.
 constexpr std::uint64_t kDarwinIoctlFioclex = 0x20006601;   // _IO('f', 1)
 constexpr std::uint64_t kDarwinIoctlFionclex = 0x20006602;  // _IO('f', 2)
 constexpr std::uint64_t kDarwinIoctlFiogetown = 0x4004667b; // _IOR('f', 123, int)
@@ -789,11 +792,11 @@ public:
     }
 
     // Commit status_flags as the OFLAGS(f_flag) status flags of descriptor
-    // fd's open file description for fcntl(2) F_SETFL. The dispatcher calls
-    // this only after descriptor_flags resolves fd, keeping the access mode
-    // it reported and changing only FCNTLFLAGS bits. On error the flags stay
-    // unchanged. Hosts that do not override this report EBADF, never a
-    // fabricated success.
+    // fd's open file description for fcntl(2) F_SETFL and ioctl(2) FIONBIO
+    // and FIOASYNC. The dispatcher calls this only after descriptor_flags
+    // resolves fd, keeping the access mode it reported and changing only
+    // FCNTLFLAGS bits. On error the flags stay unchanged. Hosts that do not
+    // override this report EBADF, never a fabricated success.
     [[nodiscard]] virtual HostSetStatusFlagsResult set_status_flags(
         std::int32_t fd,
         std::uint32_t status_flags) {
@@ -803,11 +806,11 @@ public:
     }
 
     // Switch the file behind descriptor fd to non-blocking (nonblocking
-    // true) or blocking I/O, as fo_ioctl(FIONBIO) does for fcntl(2) F_SETFL.
-    // The dispatcher calls this only after set_status_flags succeeds, and
-    // again with nonblocking false to undo O_NONBLOCK when set_async_io
-    // fails. Hosts that do not override this report EBADF, never a
-    // fabricated success.
+    // true) or blocking I/O, as fo_ioctl(FIONBIO) does for fcntl(2) F_SETFL
+    // and ioctl(2) FIONBIO. The dispatcher calls this only after
+    // set_status_flags succeeds, and for F_SETFL again with nonblocking
+    // false to undo O_NONBLOCK when set_async_io fails. Hosts that do not
+    // override this report EBADF, never a fabricated success.
     [[nodiscard]] virtual HostFileModeResult set_nonblocking_io(
         std::int32_t fd,
         bool nonblocking) {
@@ -818,9 +821,10 @@ public:
 
     // Switch the file behind descriptor fd to asynchronous (SIGIO-driven,
     // asynchronous true) or ordinary I/O, as fo_ioctl(FIOASYNC) does for
-    // fcntl(2) F_SETFL. The dispatcher calls this only after
-    // set_nonblocking_io succeeds. Hosts that do not override this report
-    // EBADF, never a fabricated success.
+    // fcntl(2) F_SETFL and ioctl(2) FIOASYNC. The dispatcher calls this only
+    // after set_status_flags succeeds, and for F_SETFL only once
+    // set_nonblocking_io has succeeded too. Hosts that do not override this
+    // report EBADF, never a fabricated success.
     [[nodiscard]] virtual HostFileModeResult set_async_io(
         std::int32_t fd,
         bool asynchronous) {
