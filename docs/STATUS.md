@@ -1,6 +1,6 @@
 # runtime architecture and compatibility status
 
-This handoff covers the implementation through phase 61. This is an experimental ARM64 userspace translation runtime, **not** a complete macOS 27 virtual machine, dyld, kernel or Rosetta replacement.
+This handoff covers the implementation through phase 82. This is an experimental ARM64 userspace translation runtime, **not** a complete macOS 27 virtual machine, dyld, kernel or Rosetta replacement.
 
 ## execution path
 
@@ -18,7 +18,7 @@ This handoff covers the implementation through phase 61. This is an experimental
 
 - CPU-backed execution exists in optional Dynarmic tests, including ARM64 guest instructions and bounded raw Mach-O fixtures.
 - A `macho-run` tool accepts raw ARM64 Mach-O images. Fixture tests validate stdout, return codes, argument handling and stdin echo/EOF.
-- The BSD bridge includes limited read/write, `read_nocancel`/`write_nocancel`, process identity/credentials (some values deliberately synthetic), guest-memory mmap/mprotect/munmap and thread-related bootstrap paths.
+- The BSD bridge includes limited read/write, `read_nocancel`/`write_nocancel`, time and entropy, close/dup/dup2, fstat64, ioctl terminal and descriptor flags, vectored/positional I/O, fcntl flags and fd duplication, resource limits and file sync, process identity/credentials (some values deliberately synthetic), guest-memory mmap/mprotect/munmap and thread-related bootstrap paths.
 - Guest thread contexts, worker TLS/errno isolation and code-generation invalidation have explicit tests. This is not equivalent to native Darwin pthread support.
 - Both core and JIT configurations have CI suites. The Dynarmic suites execute real translated fixture code rather than merely mocking a CPU.
 

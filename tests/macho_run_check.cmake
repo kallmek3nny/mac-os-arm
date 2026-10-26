@@ -46,12 +46,24 @@ else()
     file(WRITE "${stdin_file}" "")
 endif()
 
+# With STDOUT_TO_FILE set, guest stdout goes to a regular file, as a shell
+# redirection would send it, and is read back for the EXPECTED_STDOUT
+# comparison. Otherwise this script captures it directly.
+set(stdout_capture OUTPUT_VARIABLE run_stdout)
+if(STDOUT_TO_FILE)
+    set(stdout_file "${IMAGE}.stdout")
+    set(stdout_capture OUTPUT_FILE "${stdout_file}")
+endif()
+
 execute_process(
     COMMAND "${RUNNER}" ${runner_args} "${IMAGE}" ${guest_args}
     INPUT_FILE "${stdin_file}"
+    ${stdout_capture}
     RESULT_VARIABLE run_result
-    OUTPUT_VARIABLE run_stdout
     ERROR_VARIABLE run_stderr)
+if(STDOUT_TO_FILE)
+    file(READ "${stdout_file}" run_stdout)
+endif()
 
 if(NOT "${run_result}" STREQUAL "${EXPECTED_EXIT}")
     message(FATAL_ERROR

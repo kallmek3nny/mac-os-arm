@@ -2,9 +2,9 @@
 
 Experimental ARM64/ARM64e macOS userspace rehosting and translation research for x86_64 macOS hosts. This project is separate from [`kallmek3nny/mac-os`](https://github.com/kallmek3nny/mac-os), which handles GPU/driver research.
 
-## current state (through phase 61)
+## current state (through phase 82)
 
-The runtime contains an ARM64 Mach-O loader and memory model, dyld dependency/symbol/fixup machinery, a model of selected Darwin BSD syscalls and Mach traps, thread-startup and guest TLS scaffolding, and optional Dynarmic ARM64 execution. Recent work adds executable-memory JIT invalidation, synthetic BSD process credentials, a small `macho-run` CLI, guest stdin read support, and non-canceling read/write syscall aliases.
+The runtime contains an ARM64 Mach-O loader and memory model, dyld dependency/symbol/fixup machinery, a model of selected Darwin BSD syscalls and Mach traps, thread-startup and guest TLS scaffolding, and optional Dynarmic ARM64 execution. Recent work adds executable-memory JIT invalidation, synthetic BSD process credentials, a small `macho-run` CLI, guest stdin read support, and non-canceling read/write syscall aliases. Phases 62–82 additionally cover selected time, entropy, descriptor lifecycle, stat, ioctl, vectored/positional I/O, resource-limit, duplication and sync syscalls, with bounded guest execution tests.
 
 This is **not** general macOS 27 application compatibility. The project verifies constrained ARM64 test programs and selected runtime contracts; it has **not** demonstrated unmodified stock libSystem, Objective-C/Foundation/AppKit, graphical applications, or full host-kernel and dyld shared-cache integration. Software pointer-authentication modeling is not Apple hardware PAC.
 

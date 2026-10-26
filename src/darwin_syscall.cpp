@@ -88,6 +88,250 @@ void set_error(CpuState& state, std::uint32_t error) noexcept {
     return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
 }
 
+// XNU bsd/kern/sys_generic.c: writev_nocancel rejects iovcnt outside
+// [1, UIO_MAXIOV] (EINVAL) and copies the whole iovec array in (EFAULT),
+// then uio_calculateresid_user rejects any iov_len or running total above
+// SSIZE_MAX (EINVAL), all before fp_lookup resolves the descriptor (EBADF).
+// A zero-length host write resolves it without emitting bytes, so a bad
+// descriptor wins over a bad iov_base even when every vector is empty. The
+// vectors are then written in order and empty ones are skipped without
+// touching their bases. Like this dispatcher's write(2), a short host write
+// ends the call, and a later fault or host error reports the bytes already
+// written; an error is reported only when none were.
+[[nodiscard]] SyscallDispatchResult dispatch_writev(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    DarwinHostServices& host,
+    std::uint64_t syscall_number) {
+
+    static_assert(kDarwinIovecSize == 16U, "LP64 struct iovec is 16 bytes");
+    const auto finish = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    };
+    const auto fail = [&](std::uint32_t error) {
+        set_error(state, error);
+        return finish();
+    };
+    const auto contract_violation = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::host_contract_violation,
+            SyscallAction::resume, syscall_number, 0};
+    };
+
+    const auto fd = static_cast<std::int32_t>(static_cast<std::uint32_t>(state.x[0]));
+    const std::uint64_t vector_address = state.x[1];
+    const auto count = static_cast<std::uint32_t>(state.x[2]);
+    if (count == 0U || count > kDarwinIovMax) {
+        return fail(kDarwinErrnoEinval);
+    }
+
+    std::array<std::byte, kDarwinIovMax * kDarwinIovecSize> vectors{};
+    const std::size_t vector_bytes = static_cast<std::size_t>(count) * kDarwinIovecSize;
+    if (!address_space.read(vector_address, std::span<std::byte>(vectors.data(), vector_bytes))) {
+        return fail(kDarwinErrnoEfault);
+    }
+    // Little-endian { iov_base, iov_len } fields of the vector at index.
+    const auto field = [&](std::size_t index, std::size_t offset) {
+        std::uint64_t value = 0;
+        for (std::size_t i = 0; i < sizeof(std::uint64_t); ++i) {
+            value |= static_cast<std::uint64_t>(std::to_integer<unsigned char>(
+                         vectors[index * kDarwinIovecSize + offset + i]))
+                     << (8U * i);
+        }
+        return value;
+    };
+
+    constexpr auto ssize_max =
+        static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+    std::uint64_t total = 0;
+    for (std::size_t index = 0; index < count; ++index) {
+        const std::uint64_t length = field(index, 8U);
+        if (length > ssize_max - total) {
+            return fail(kDarwinErrnoEinval);
+        }
+        total += length;
+    }
+
+    if (fd < 0) {
+        return fail(kDarwinErrnoEbadf);
+    }
+    const HostWriteResult probe = host.write(fd, std::span<const std::byte>{});
+    if (probe.bytes_written != 0U) {
+        return contract_violation();
+    }
+    if (!probe) {
+        return fail(probe.error);
+    }
+
+    std::uint64_t total_written = 0;
+    const auto stop = [&](std::uint32_t error) {
+        if (total_written == 0U) {
+            set_error(state, error);
+        } else {
+            set_success(state, total_written);
+        }
+        return finish();
+    };
+    std::array<std::byte, kIoChunkSize> chunk{};
+    for (std::size_t index = 0; index < count; ++index) {
+        std::uint64_t guest_address = field(index, 0U);
+        std::uint64_t remaining = field(index, 8U);
+        while (remaining != 0U) {
+            const auto requested = static_cast<std::size_t>(
+                std::min<std::uint64_t>(remaining, chunk.size()));
+            if (!address_space.read(guest_address, std::span<std::byte>(chunk.data(), requested))) {
+                return stop(kDarwinErrnoEfault);
+            }
+            const HostWriteResult written = host.write(
+                fd, std::span<const std::byte>(chunk.data(), requested));
+            if (!written) {
+                return stop(written.error);
+            }
+            if (written.bytes_written > requested) {
+                return contract_violation();
+            }
+            total_written += written.bytes_written;
+            if (written.bytes_written != requested) {
+                set_success(state, total_written);
+                return finish();
+            }
+            remaining -= requested;
+            if (remaining != 0U &&
+                guest_address > std::numeric_limits<std::uint64_t>::max() - requested) {
+                return stop(kDarwinErrnoEfault);
+            }
+            guest_address += requested;
+        }
+    }
+    set_success(state, total_written);
+    return finish();
+}
+
+// XNU bsd/kern/sys_generic.c: readv_nocancel rejects iovcnt outside
+// [1, UIO_MAXIOV] (EINVAL), copies the whole iovec array in (EFAULT) and
+// rejects any iov_len or running total above SSIZE_MAX (EINVAL), all before
+// rd_uio resolves the descriptor (EBADF) through a zero-length host read.
+// As in this dispatcher's read(2), exactly one bounded host read then fills
+// the vectors in order and never blocks again to fill them all. Empty
+// vectors are skipped without touching their bases. Destinations are probed
+// first and the read is limited to the leading vectors that can receive it,
+// so host input is never consumed and then dropped; EFAULT is reported only
+// when the first nonempty vector cannot receive a byte.
+[[nodiscard]] SyscallDispatchResult dispatch_readv(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    DarwinHostServices& host,
+    std::uint64_t syscall_number) {
+
+    static_assert(kDarwinIovecSize == 16U, "LP64 struct iovec is 16 bytes");
+    const auto finish = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    };
+    const auto fail = [&](std::uint32_t error) {
+        set_error(state, error);
+        return finish();
+    };
+    const auto contract_violation = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::host_contract_violation,
+            SyscallAction::resume, syscall_number, 0};
+    };
+
+    const auto fd = static_cast<std::int32_t>(static_cast<std::uint32_t>(state.x[0]));
+    const std::uint64_t vector_address = state.x[1];
+    const auto count = static_cast<std::uint32_t>(state.x[2]);
+    if (count == 0U || count > kDarwinIovMax) {
+        return fail(kDarwinErrnoEinval);
+    }
+
+    std::array<std::byte, kDarwinIovMax * kDarwinIovecSize> vectors{};
+    const std::size_t vector_bytes = static_cast<std::size_t>(count) * kDarwinIovecSize;
+    if (!address_space.read(vector_address, std::span<std::byte>(vectors.data(), vector_bytes))) {
+        return fail(kDarwinErrnoEfault);
+    }
+    // Little-endian { iov_base, iov_len } fields of the vector at index.
+    const auto field = [&](std::size_t index, std::size_t offset) {
+        std::uint64_t value = 0;
+        for (std::size_t i = 0; i < sizeof(std::uint64_t); ++i) {
+            value |= static_cast<std::uint64_t>(std::to_integer<unsigned char>(
+                         vectors[index * kDarwinIovecSize + offset + i]))
+                     << (8U * i);
+        }
+        return value;
+    };
+
+    constexpr auto ssize_max =
+        static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+    std::uint64_t total = 0;
+    for (std::size_t index = 0; index < count; ++index) {
+        const std::uint64_t length = field(index, 8U);
+        if (length > ssize_max - total) {
+            return fail(kDarwinErrnoEinval);
+        }
+        total += length;
+    }
+
+    if (fd < 0) {
+        return fail(kDarwinErrnoEbadf);
+    }
+    const HostReadResult probe = host.read(fd, std::span<std::byte>{});
+    if (probe.bytes_read != 0U) {
+        return contract_violation();
+    }
+    if (!probe) {
+        return fail(probe.error);
+    }
+
+    // Bound the single host read by the chunk size and by the leading
+    // nonempty vectors whose destinations can receive it.
+    std::size_t requested = 0;
+    for (std::size_t index = 0; index < count && requested < kIoChunkSize; ++index) {
+        const std::uint64_t length = field(index, 8U);
+        if (length == 0U) {
+            continue;
+        }
+        const auto piece = static_cast<std::size_t>(
+            std::min<std::uint64_t>(length, kIoChunkSize - requested));
+        if (!address_space.probe_write(field(index, 0U), piece)) {
+            break;
+        }
+        requested += piece;
+    }
+    if (requested == 0U) {
+        if (total != 0U) {
+            return fail(kDarwinErrnoEfault);
+        }
+        set_success(state, 0U);
+        return finish();
+    }
+
+    std::array<std::byte, kIoChunkSize> chunk{};
+    const HostReadResult host_result = host.read(
+        fd, std::span<std::byte>(chunk.data(), requested));
+    if (!host_result) {
+        return fail(host_result.error);
+    }
+    if (host_result.bytes_read > requested) {
+        return contract_violation();
+    }
+    const auto received = static_cast<std::size_t>(host_result.bytes_read);
+    std::size_t delivered = 0;
+    for (std::size_t index = 0; index < count && delivered < received; ++index) {
+        const auto piece = static_cast<std::size_t>(
+            std::min<std::uint64_t>(field(index, 8U), received - delivered));
+        if (piece != 0U &&
+            !address_space.write(field(index, 0U),
+                                 std::span<const std::byte>(chunk.data() + delivered, piece))) {
+            return fail(kDarwinErrnoEfault);
+        }
+        delivered += piece;
+    }
+    set_success(state, host_result.bytes_read);
+    return finish();
+}
+
 // XNU bsd/kern/sys_generic.c: read_nocancel resolves the descriptor (EBADF)
 // before dofileread rejects nbyte > INT_MAX (EINVAL) or copyout faults
 // (EFAULT). A read may legally return fewer bytes than requested, so issue
@@ -162,6 +406,198 @@ void set_error(CpuState& state, std::uint32_t error) noexcept {
         return finish();
     }
     set_success(state, host_result.bytes_read);
+    return finish();
+}
+
+// XNU bsd/kern/sys_generic.c: pread_nocancel enters read_internal, which
+// rejects nbyte > INT_MAX (EINVAL) before preparefileread resolves the
+// descriptor (EBADF, also when it is not open for reading) and
+// valid_for_random_access rejects a pipe, socket or FIFO (ESPIPE) or a
+// terminal (ENXIO). vn_read_common in bsd/vfs/vfs_vnops.c then rejects a
+// negative offset except on a character device (EINVAL) and shortens a read
+// that would pass INT64_MAX, so at INT64_MAX itself nothing is transferred.
+// These checks run even for a zero-length read. As in this dispatcher's
+// read(2), one bounded host read fills a destination that was probed first,
+// so device input is never consumed and then dropped. The descriptor's file
+// offset never moves.
+[[nodiscard]] SyscallDispatchResult dispatch_pread(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    DarwinHostServices& host,
+    std::uint64_t syscall_number) {
+
+    const auto finish = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    };
+    const auto contract_violation = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::host_contract_violation,
+            SyscallAction::resume, syscall_number, 0};
+    };
+
+    const auto fd = static_cast<std::int32_t>(static_cast<std::uint32_t>(state.x[0]));
+    const std::uint64_t guest_address = state.x[1];
+    const std::uint64_t nbyte = state.x[2];
+    const auto offset = static_cast<std::int64_t>(state.x[3]);
+
+    if (nbyte > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+        set_error(state, kDarwinErrnoEinval);
+        return finish();
+    }
+    const HostRandomAccessResult descriptor = host.random_access_status(fd, false);
+    if (!descriptor) {
+        set_error(state, descriptor.error);
+        return finish();
+    }
+    if (offset < 0 && !descriptor.character_device) {
+        set_error(state, kDarwinErrnoEinval);
+        return finish();
+    }
+
+    // Clip the transfer so it never passes INT64_MAX. A negative offset is
+    // only reachable on a character device, where no clipping applies.
+    std::uint64_t length = nbyte;
+    if (offset >= 0) {
+        const auto room = static_cast<std::uint64_t>(
+            std::numeric_limits<std::int64_t>::max() - offset);
+        length = std::min(length, room);
+    }
+    if (length == 0U) {
+        set_success(state, 0U);
+        return finish();
+    }
+
+    const auto requested = static_cast<std::size_t>(
+        std::min<std::uint64_t>(length, kIoChunkSize));
+    if (!address_space.probe_write(guest_address, requested)) {
+        set_error(state, kDarwinErrnoEfault);
+        return finish();
+    }
+
+    std::array<std::byte, kIoChunkSize> chunk{};
+    const HostReadResult host_result = host.read_at(
+        fd, std::span<std::byte>(chunk.data(), requested), offset);
+    if (!host_result) {
+        set_error(state, host_result.error);
+        return finish();
+    }
+    if (host_result.bytes_read > requested) {
+        return contract_violation();
+    }
+    const auto received = static_cast<std::size_t>(host_result.bytes_read);
+    if (received != 0U &&
+        !address_space.write(guest_address,
+                             std::span<const std::byte>(chunk.data(), received))) {
+        set_error(state, kDarwinErrnoEfault);
+        return finish();
+    }
+    set_success(state, host_result.bytes_read);
+    return finish();
+}
+
+// XNU bsd/kern/sys_generic.c: pwrite_nocancel rejects an offset of exactly
+// -1 (EINVAL) before write_internal rejects nbyte > INT_MAX (EINVAL),
+// preparefilewrite resolves the descriptor (EBADF, also when it is not open
+// for writing) and valid_for_random_access rejects a pipe, socket or FIFO
+// (ESPIPE) or a terminal (ENXIO). vn_write in bsd/vfs/vfs_vnops.c then
+// ignores O_APPEND, rejects a negative offset except on a character device
+// (EINVAL), fails outright at INT64_MAX (EFBIG) and shortens a write that
+// would pass INT64_MAX. These checks run even for a zero-length write. As in
+// this dispatcher's write(2), bounded chunks reach the host in order, a
+// short host write ends the call, and a later fault or host error reports
+// the bytes already written; an error is reported only when none were. The
+// descriptor's file offset never moves.
+[[nodiscard]] SyscallDispatchResult dispatch_pwrite(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    DarwinHostServices& host,
+    std::uint64_t syscall_number) {
+
+    const auto finish = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    };
+    const auto contract_violation = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::host_contract_violation,
+            SyscallAction::resume, syscall_number, 0};
+    };
+
+    const auto fd = static_cast<std::int32_t>(static_cast<std::uint32_t>(state.x[0]));
+    std::uint64_t guest_address = state.x[1];
+    const std::uint64_t nbyte = state.x[2];
+    const auto offset = static_cast<std::int64_t>(state.x[3]);
+    constexpr std::int64_t kMaxOffset = std::numeric_limits<std::int64_t>::max();
+
+    if (offset == -1) {
+        set_error(state, kDarwinErrnoEinval);
+        return finish();
+    }
+    if (nbyte > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+        set_error(state, kDarwinErrnoEinval);
+        return finish();
+    }
+    const HostRandomAccessResult descriptor = host.random_access_status(fd, true);
+    if (!descriptor) {
+        set_error(state, descriptor.error);
+        return finish();
+    }
+    if (offset < 0 && !descriptor.character_device) {
+        set_error(state, kDarwinErrnoEinval);
+        return finish();
+    }
+    if (offset == kMaxOffset) {
+        set_error(state, kDarwinErrnoEfbig);
+        return finish();
+    }
+
+    // Clip the transfer so it never passes INT64_MAX. A negative offset is
+    // only reachable on a character device, where nbyte <= INT_MAX keeps
+    // every chunk's offset representable.
+    std::uint64_t remaining = nbyte;
+    if (offset >= 0) {
+        remaining = std::min(remaining, static_cast<std::uint64_t>(kMaxOffset - offset));
+    }
+
+    std::int64_t position = offset;
+    std::uint64_t total_written = 0;
+    std::array<std::byte, kIoChunkSize> chunk{};
+    const auto finish_partial = [&](std::uint32_t error) {
+        if (total_written == 0U) {
+            set_error(state, error);
+        } else {
+            set_success(state, total_written);
+        }
+        return finish();
+    };
+
+    while (remaining != 0U) {
+        const auto requested = static_cast<std::size_t>(
+            std::min<std::uint64_t>(remaining, chunk.size()));
+        if (!address_space.read(guest_address,
+                                std::span<std::byte>(chunk.data(), requested))) {
+            return finish_partial(kDarwinErrnoEfault);
+        }
+        const HostWriteResult host_result = host.write_at(
+            fd, std::span<const std::byte>(chunk.data(), requested), position);
+        if (!host_result) {
+            return finish_partial(host_result.error);
+        }
+        if (host_result.bytes_written > requested) {
+            return contract_violation();
+        }
+        total_written += host_result.bytes_written;
+        if (host_result.bytes_written != requested ||
+            guest_address > std::numeric_limits<std::uint64_t>::max() - requested) {
+            break;
+        }
+        guest_address += requested;
+        position += static_cast<std::int64_t>(requested);
+        remaining -= requested;
+    }
+
+    set_success(state, total_written);
     return finish();
 }
 
@@ -479,6 +915,893 @@ void set_error(CpuState& state, std::uint32_t error) noexcept {
     return reject(kDarwinErrnoEnosys);
 }
 
+// XNU bsd/kern/kern_descrip.c: fstat64(fd, ub) resolves the descriptor
+// (EBADF) before vn_stat fills the kernel stat and copyout writes the
+// 144-byte arm64 struct stat64 (EFAULT); success returns 0 in x0. The host
+// reports only guest-visible metadata and the dispatcher encodes the layout
+// itself, so no host stat structure reaches the guest. A malformed status is
+// a host contract violation and is never copied out. A negative descriptor
+// never reaches the host, and the destination is probed before any write.
+[[nodiscard]] SyscallDispatchResult dispatch_fstat64(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    DarwinHostServices& host,
+    std::uint64_t syscall_number) {
+
+    static_assert(kDarwinStat64Size == 144U, "arm64 struct stat64 is 144 bytes");
+    constexpr std::int64_t nanoseconds_per_second = 1000000000;
+    const auto finish = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    };
+
+    const auto fd = static_cast<std::int32_t>(static_cast<std::uint32_t>(state.x[0]));
+    const std::uint64_t guest_address = state.x[1];
+    if (fd < 0) {
+        set_error(state, kDarwinErrnoEbadf);
+        return finish();
+    }
+    const HostStatResult described = host.file_status(fd);
+    if (!described) {
+        set_error(state, described.error);
+        return finish();
+    }
+
+    const HostFileStatus& status = described.status;
+    const auto file_type = static_cast<std::uint16_t>(status.mode & kDarwinModeTypeMask);
+    const bool known_type =
+        file_type == kDarwinModeFifo || file_type == kDarwinModeCharDevice ||
+        file_type == kDarwinModeDirectory || file_type == kDarwinModeBlockDevice ||
+        file_type == kDarwinModeRegular || file_type == kDarwinModeSymlink ||
+        file_type == kDarwinModeSocket;
+    const auto valid_time = [&](const DarwinTimespec& stamp) {
+        return stamp.nanoseconds >= 0 && stamp.nanoseconds < nanoseconds_per_second;
+    };
+    if (!known_type || !valid_time(status.access_time) ||
+        !valid_time(status.modification_time) || !valid_time(status.change_time) ||
+        !valid_time(status.birth_time)) {
+        return SyscallDispatchResult{
+            SyscallDispatchError::host_contract_violation,
+            SyscallAction::resume, syscall_number, 0};
+    }
+
+    // Little-endian arm64 layout; unset bytes, including the padding at
+    // offset 28, stay zero so no stale staging data reaches the guest.
+    std::array<std::byte, kDarwinStat64Size> record{};
+    const auto put = [&](std::size_t offset, std::uint64_t value, std::size_t width) {
+        for (std::size_t i = 0; i < width; ++i) {
+            record[offset + i] = static_cast<std::byte>((value >> (8U * i)) & 0xffU);
+        }
+    };
+    const auto put_time = [&](std::size_t offset, const DarwinTimespec& stamp) {
+        put(offset, static_cast<std::uint64_t>(stamp.seconds), 8U);
+        put(offset + 8U, static_cast<std::uint64_t>(stamp.nanoseconds), 8U);
+    };
+    put(0U, static_cast<std::uint32_t>(status.device), 4U);
+    put(4U, status.mode, 2U);
+    put(6U, status.link_count, 2U);
+    put(8U, status.inode, 8U);
+    put(16U, status.user_id, 4U);
+    put(20U, status.group_id, 4U);
+    put(24U, static_cast<std::uint32_t>(status.special_device), 4U);
+    put_time(32U, status.access_time);
+    put_time(48U, status.modification_time);
+    put_time(64U, status.change_time);
+    put_time(80U, status.birth_time);
+    put(96U, static_cast<std::uint64_t>(status.size), 8U);
+    put(104U, static_cast<std::uint64_t>(status.blocks), 8U);
+    put(112U, static_cast<std::uint32_t>(status.block_size), 4U);
+    put(116U, status.flags, 4U);
+    // st_gen (120), st_lspare (124) and st_qspare (128-143) stay zero: XNU's
+    // vn_stat withholds st_gen from non-root callers, and the synthetic guest
+    // user is never root.
+
+    if (!address_space.probe_write(guest_address, record.size()) ||
+        !address_space.write(guest_address, std::span<const std::byte>(record))) {
+        set_error(state, kDarwinErrnoEfault);
+        return finish();
+    }
+    set_success(state, 0U);
+    return finish();
+}
+
+// XNU bsd/vfs/vfs_syscalls.c: lseek(fd, offset, whence) resolves the
+// descriptor first (EBADF), refuses a pipe, socket, FIFO or terminal
+// (ESPIPE), and only then checks whence (EINVAL). The new offset uses
+// XNU's wrapping off_t arithmetic: a positive request whose result wraps
+// negative is EOVERFLOW, and any other negative result is EINVAL except
+// on a character device. The host commits nothing until every check
+// passes, so a failed lseek never moves the descriptor's offset.
+[[nodiscard]] SyscallDispatchResult dispatch_lseek(
+    CpuState& state,
+    DarwinHostServices& host,
+    std::uint64_t syscall_number) {
+
+    const auto finish = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    };
+    // off_t addition as XNU performs it: two's-complement wrap, never UB.
+    const auto wrapping_add = [](std::int64_t lhs, std::int64_t rhs) {
+        return static_cast<std::int64_t>(
+            static_cast<std::uint64_t>(lhs) + static_cast<std::uint64_t>(rhs));
+    };
+
+    const auto fd = static_cast<std::int32_t>(static_cast<std::uint32_t>(state.x[0]));
+    const auto requested = static_cast<std::int64_t>(state.x[1]);
+    const auto whence = static_cast<std::uint32_t>(state.x[2]);
+    if (fd < 0) {
+        set_error(state, kDarwinErrnoEbadf);
+        return finish();
+    }
+    const HostSeekResult described = host.seek_status(fd);
+    if (!described) {
+        set_error(state, described.error);
+        return finish();
+    }
+    // A known size is never negative, and only a character device may
+    // already sit at a negative offset.
+    if ((described.size_error == 0 && described.size < 0) ||
+        (described.offset < 0 && !described.character_device)) {
+        return SyscallDispatchResult{
+            SyscallDispatchError::host_contract_violation,
+            SyscallAction::resume, syscall_number, 0};
+    }
+
+    std::int64_t offset = requested;
+    std::uint32_t error = 0;
+    switch (whence) {
+    case kDarwinSeekCur:
+        offset = wrapping_add(offset, described.offset);
+        break;
+    case kDarwinSeekEnd:
+        if (described.size_error != 0) {
+            error = described.size_error;
+            break;
+        }
+        offset = wrapping_add(offset, described.size);
+        break;
+    case kDarwinSeekSet:
+        break;
+    case kDarwinSeekHole:
+    case kDarwinSeekData:
+        // XNU asks the filesystem through VNOP_IOCTL(FSIOC_FIOSEEKHOLE or
+        // FSIOC_FIOSEEKDATA). Hole maps are not modeled, so, like a vnode
+        // whose filesystem lacks those requests, the query fails with
+        // ENOTTY rather than reporting a fabricated hole layout.
+        error = kDarwinErrnoEnotty;
+        break;
+    default:
+        error = kDarwinErrnoEinval;
+        break;
+    }
+    if (error == 0) {
+        if (requested > 0 && offset < 0) {
+            error = kDarwinErrnoEoverflow;
+        } else if (offset < 0 && !described.character_device) {
+            error = kDarwinErrnoEinval;
+        }
+    }
+    if (error != 0) {
+        set_error(state, error);
+        return finish();
+    }
+    const HostSetOffsetResult committed = host.set_offset(fd, offset);
+    if (!committed) {
+        set_error(state, committed.error);
+        return finish();
+    }
+    set_success(state, static_cast<std::uint64_t>(offset));
+    return finish();
+}
+
+// XNU bsd/kern/kern_descrip.c: sys_fcntl_nocancel(fd, cmd, arg) resolves fd
+// through fp_lookup before it looks at cmd, so a negative or unknown
+// descriptor reports EBADF for every command. Only F_DUPFD, F_GETFD,
+// F_SETFD, F_GETFL, F_SETFL, F_DUPFD_CLOEXEC, F_SETNOSIGPIPE and
+// F_GETNOSIGPIPE are modeled; any other command reports ENOSYS once the
+// descriptor resolves, never a fabricated success. The host supplies only
+// the descriptor's close-on-exec flag, OFLAGS(f_flag), the open file
+// description's FG_NOSIGPIPE flag and the soft RLIMIT_NOFILE limit, applies
+// the changes F_SETFD, F_SETFL and F_SETNOSIGPIPE ask for and allocates the
+// duplicate F_DUPFD and F_DUPFD_CLOEXEC ask for; the dispatcher validates
+// the flags, the limit
+// and the duplicate, computes every new flag word and encodes every result
+// itself.
+[[nodiscard]] SyscallDispatchResult dispatch_fcntl(
+    CpuState& state,
+    DarwinHostServices& host,
+    std::uint64_t syscall_number) {
+
+    constexpr std::uint32_t reportable_status_flags =
+        kDarwinOpenAccessMode | kDarwinOpenNonblock | kDarwinOpenAppend |
+        kDarwinOpenAsync | kDarwinOpenFsync | kDarwinOpenDsync;
+    const auto finish = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    };
+
+    const auto fd = static_cast<std::int32_t>(static_cast<std::uint32_t>(state.x[0]));
+    const auto command = static_cast<std::uint32_t>(state.x[1]);
+    const std::uint64_t argument = state.x[2];
+    if (fd < 0) {
+        set_error(state, kDarwinErrnoEbadf);
+        return finish();
+    }
+    const HostDescriptorFlagsResult described = host.descriptor_flags(fd);
+    if (!described) {
+        set_error(state, described.error);
+        return finish();
+    }
+    // OFLAGS(f_flag) always holds exactly one access mode and only FMASK
+    // bits; anything else is a host contract violation, never guest data.
+    if ((described.status_flags & ~reportable_status_flags) != 0 ||
+        (described.status_flags & kDarwinOpenAccessMode) == kDarwinOpenAccessMode) {
+        return SyscallDispatchResult{
+            SyscallDispatchError::host_contract_violation,
+            SyscallAction::resume, syscall_number, 0};
+    }
+
+    switch (command) {
+    case kDarwinFcntlGetfd:
+        set_success(state, described.close_on_exec ? kDarwinFdCloexec : 0U);
+        return finish();
+    case kDarwinFcntlSetfd: {
+        // Only bit 0 of arg (FD_CLOEXEC) is consulted; other bits are ignored.
+        const HostSetCloseOnExecResult updated =
+            host.set_close_on_exec(fd, (argument & kDarwinFdCloexec) != 0);
+        if (!updated) {
+            set_error(state, updated.error);
+            return finish();
+        }
+        set_success(state, 0U);
+        return finish();
+    }
+    case kDarwinFcntlGetfl:
+        set_success(state, described.status_flags);
+        return finish();
+    case kDarwinFcntlSetfl: {
+        // fp->f_flag &= ~FCNTLFLAGS; fp->f_flag |= FFLAGS((int)arg) & FCNTLFLAGS.
+        // Only the int low half of arg is read. FFLAGS adds one, which can
+        // carry O_ACCMODE into O_NONBLOCK, unless O_EXEC is set, in which case
+        // it clears the access mode bits instead. FCNTLFLAGS bits share their
+        // open(2) positions, so the result stays in OFLAGS form and keeps the
+        // access mode descriptor_flags reported.
+        const auto requested = static_cast<std::uint32_t>(argument);
+        const std::uint32_t kernel_flags = (requested & kDarwinOpenExec) != 0
+                                               ? (requested & ~kDarwinOpenAccessMode)
+                                               : (requested + 1U);
+        const std::uint32_t status_flags =
+            (described.status_flags & ~kDarwinFcntlSettableFlags) |
+            (kernel_flags & kDarwinFcntlSettableFlags);
+        const HostSetStatusFlagsResult committed = host.set_status_flags(fd, status_flags);
+        if (!committed) {
+            set_error(state, committed.error);
+            return finish();
+        }
+        // fo_ioctl(FIONBIO): a failure is reported with f_flag already changed.
+        const HostFileModeResult nonblocking =
+            host.set_nonblocking_io(fd, (status_flags & kDarwinOpenNonblock) != 0);
+        if (!nonblocking) {
+            set_error(state, nonblocking.error);
+            return finish();
+        }
+        // fo_ioctl(FIOASYNC): on failure XNU clears FNONBLOCK, returns the file
+        // to blocking I/O and reports the FIOASYNC error. Both undo steps
+        // ignore their own errors, as XNU's (void)fo_ioctl does.
+        const HostFileModeResult asynchronous =
+            host.set_async_io(fd, (status_flags & kDarwinOpenAsync) != 0);
+        if (!asynchronous) {
+            static_cast<void>(host.set_status_flags(fd, status_flags & ~kDarwinOpenNonblock));
+            static_cast<void>(host.set_nonblocking_io(fd, false));
+            set_error(state, asynchronous.error);
+            return finish();
+        }
+        set_success(state, 0U);
+        return finish();
+    }
+    case kDarwinFcntlDupfd:
+    case kDarwinFcntlDupfdCloexec: {
+        // newmin = CAST_DOWN_EXPLICIT(int, arg): only the int low half of arg
+        // is read. A newmin that is negative, or at or above
+        // proc_limitgetcur_nofile(p), is EINVAL; a negative one is rejected
+        // before the limit is consulted, as XNU's || short-circuits. The
+        // limit is the soft RLIMIT_NOFILE limit capped at the int
+        // maxfilesperproc, held to the getrlimit contract exactly as
+        // getdtablesize(2) holds it, and with no maxfilesperproc sysctl
+        // modeled the only cap is INT_MAX. Guarded descriptors are not
+        // modeled, so GUARD_DUP never applies.
+        const auto minimum = static_cast<std::int32_t>(static_cast<std::uint32_t>(argument));
+        if (minimum < 0) {
+            set_error(state, kDarwinErrnoEinval);
+            return finish();
+        }
+        const HostResourceLimitResult current = host.resource_limit(kDarwinRlimitNofile);
+        if (!current) {
+            set_error(state, current.error);
+            return finish();
+        }
+        if (current.soft_limit > current.hard_limit ||
+            current.hard_limit > kDarwinRlimInfinity) {
+            return SyscallDispatchResult{
+                SyscallDispatchError::host_contract_violation,
+                SyscallAction::resume, syscall_number, 0};
+        }
+        constexpr std::uint64_t kIntMax = 0x7fffffffU;
+        const std::uint64_t limit = current.soft_limit < kIntMax ? current.soft_limit : kIntMax;
+        if (static_cast<std::uint64_t>(minimum) >= limit) {
+            set_error(state, kDarwinErrnoEinval);
+            return finish();
+        }
+        // fdalloc + finishdup: the lowest free descriptor at or above newmin,
+        // with its own close-on-exec flag set only for F_DUPFD_CLOEXEC.
+        const HostDuplicateResult duplicated =
+            host.duplicate_at_least(fd, minimum, command == kDarwinFcntlDupfdCloexec);
+        if (!duplicated) {
+            set_error(state, duplicated.error);
+            return finish();
+        }
+        // fdalloc never hands out fd itself, a descriptor below newmin or one
+        // at or above the limit, so a host success naming one is a host
+        // contract violation and never reaches the guest.
+        if (duplicated.descriptor < minimum || duplicated.descriptor == fd ||
+            static_cast<std::uint64_t>(duplicated.descriptor) >= limit) {
+            return SyscallDispatchResult{
+                SyscallDispatchError::host_contract_violation,
+                SyscallAction::resume, syscall_number, 0};
+        }
+        set_success(state, static_cast<std::uint64_t>(duplicated.descriptor));
+        return finish();
+    }
+    case kDarwinFcntlSetnosigpipe: {
+        // tmp = CAST_DOWN_EXPLICIT(int, arg): only the int low half of arg
+        // is read, and any nonzero value sets FG_NOSIGPIPE. Sockets, which
+        // keep SO_NOSIGPIPE instead, are not modeled, so the flag always
+        // belongs to the open file description and every descriptor naming
+        // it sees the change.
+        const HostSetNoSigpipeResult updated =
+            host.set_no_sigpipe(fd, static_cast<std::uint32_t>(argument) != 0U);
+        if (!updated) {
+            set_error(state, updated.error);
+            return finish();
+        }
+        set_success(state, 0U);
+        return finish();
+    }
+    case kDarwinFcntlGetnosigpipe: {
+        // *retval = (fg_lflags & FG_NOSIGPIPE) ? 1 : 0; arg is ignored.
+        const HostNoSigpipeResult current = host.no_sigpipe(fd);
+        if (!current) {
+            set_error(state, current.error);
+            return finish();
+        }
+        set_success(state, current.no_sigpipe ? 1U : 0U);
+        return finish();
+    }
+    default:
+        // Every other command needs descriptor-table or file-description
+        // state that is not modeled yet.
+        set_error(state, kDarwinErrnoEnosys);
+        return finish();
+    }
+}
+
+// XNU bsd/dev/random/randomdev.c: getentropy(buffer, size) rejects sizes
+// above its 256-byte kernel buffer with EINVAL (OpenBSD compatibility),
+// fills that buffer from the kernel CSPRNG, then copies it out (EFAULT).
+// There is no short count: success returns 0 with every byte written.
+// The guest destination is probed first so host entropy is never drawn for
+// a buffer that cannot receive it, and the staging copy is scrubbed after.
+[[nodiscard]] SyscallDispatchResult dispatch_getentropy(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    DarwinHostServices& host,
+    std::uint64_t syscall_number) {
+
+    constexpr std::size_t max_entropy_size = 256;
+    const auto finish = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    };
+
+    const std::uint64_t guest_address = state.x[0];
+    const std::uint64_t size = state.x[1];
+    if (size > max_entropy_size) {
+        set_error(state, kDarwinErrnoEinval);
+        return finish();
+    }
+    if (size == 0U) {
+        // XNU copyout returns success for zero bytes before validating the
+        // user address, so even a null buffer succeeds without host entropy.
+        set_success(state, 0U);
+        return finish();
+    }
+    const auto requested = static_cast<std::size_t>(size);
+    if (!address_space.probe_write(guest_address, requested)) {
+        set_error(state, kDarwinErrnoEfault);
+        return finish();
+    }
+
+    std::array<std::byte, max_entropy_size> staging{};
+    const std::span<std::byte> filled(staging.data(), requested);
+    const HostEntropyResult host_result = host.fill_entropy(filled);
+    if (!host_result) {
+        set_error(state, host_result.error);
+    } else if (!address_space.write(guest_address, std::span<const std::byte>(filled))) {
+        set_error(state, kDarwinErrnoEfault);
+    } else {
+        set_success(state, 0U);
+    }
+    // Volatile stores keep the scrub from being elided as a dead write.
+    volatile std::byte* const scrub = staging.data();
+    for (std::size_t i = 0; i < staging.size(); ++i) {
+        scrub[i] = std::byte{0};
+    }
+    return finish();
+}
+
+// XNU bsd/kern/kern_resource.c: getrlimit(which, rlp) strips
+// _RLIMIT_POSIX_FLAG from the u_int which (only w0 counts), reports EINVAL
+// for a resource at or above RLIM_NLIMITS, then copies proc_limitget's soft
+// and hard limits out as the 16-byte LP64 struct rlimit { rlim_t rlim_cur;
+// rlim_t rlim_max; }, or EFAULT. proc_limitget has no side effects, so the
+// destination is probed before the host is asked and a bad pointer never
+// costs a host query. A host error is reported as is; a soft limit above the
+// hard limit, or a hard limit above RLIM_INFINITY, is a host contract
+// violation and nothing reaches the guest. Success returns 0 in x0, never a
+// limit in registers.
+[[nodiscard]] SyscallDispatchResult dispatch_getrlimit(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    DarwinHostServices& host,
+    std::uint64_t syscall_number) {
+
+    const auto finish = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    };
+
+    const std::uint32_t resource =
+        static_cast<std::uint32_t>(state.x[0]) & ~kDarwinRlimitPosixFlag;
+    const std::uint64_t limit_address = state.x[1];
+    if (resource >= kDarwinRlimNlimits) {
+        set_error(state, kDarwinErrnoEinval);
+        return finish();
+    }
+    if (!address_space.probe_write(limit_address, kDarwinRlimitSize)) {
+        set_error(state, kDarwinErrnoEfault);
+        return finish();
+    }
+
+    const HostResourceLimitResult limits = host.resource_limit(resource);
+    if (!limits) {
+        set_error(state, limits.error);
+        return finish();
+    }
+    if (limits.soft_limit > limits.hard_limit ||
+        limits.hard_limit > kDarwinRlimInfinity) {
+        return SyscallDispatchResult{
+            SyscallDispatchError::host_contract_violation,
+            SyscallAction::resume, syscall_number, 0};
+    }
+
+    // { rlim_t rlim_cur; rlim_t rlim_max; }, each a little-endian uint64.
+    std::array<std::byte, kDarwinRlimitSize> limit_record{};
+    for (std::size_t i = 0; i < 8U; ++i) {
+        limit_record[i] =
+            static_cast<std::byte>((limits.soft_limit >> (8U * i)) & 0xffU);
+        limit_record[8U + i] =
+            static_cast<std::byte>((limits.hard_limit >> (8U * i)) & 0xffU);
+    }
+    if (!address_space.write(limit_address,
+                             std::span<const std::byte>(limit_record))) {
+        set_error(state, kDarwinErrnoEfault);
+        return finish();
+    }
+    set_success(state, 0U);
+    return finish();
+}
+
+// XNU bsd/kern/kern_resource.c: setrlimit(which, rlp) copies the 16-byte
+// LP64 struct rlimit { rlim_t rlim_cur; rlim_t rlim_max; } in first, so a bad
+// rlp is EFAULT whatever which is. dosetrlimit then strips
+// _RLIMIT_POSIX_FLAG from the u_int which (only w0 counts) and reports
+// EINVAL for a resource at or above RLIM_NLIMITS before it snapshots the
+// current limits. A new soft limit above the new hard limit is EINVAL;
+// otherwise raising either limit above the snapshot's hard limit needs
+// suser(), which the synthetic non-root user never passes, so it is EPERM.
+// The snapshot comes from the host's resource_limit and is held to the
+// getrlimit contract: a host error is reported as is, and an inverted or
+// out-of-range snapshot is a host contract violation. Only a request that
+// passes every check reaches set_resource_limit, whose error is reported as
+// is. Success returns 0 in x0 and nothing is copied back out.
+[[nodiscard]] SyscallDispatchResult dispatch_setrlimit(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    DarwinHostServices& host,
+    std::uint64_t syscall_number) {
+
+    const auto finish = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    };
+    const auto fail = [&](std::uint32_t error) {
+        set_error(state, error);
+        return finish();
+    };
+
+    // { rlim_t rlim_cur; rlim_t rlim_max; }, each a little-endian uint64.
+    std::array<std::byte, kDarwinRlimitSize> limit_record{};
+    if (!address_space.read(state.x[1], std::span<std::byte>(limit_record))) {
+        return fail(kDarwinErrnoEfault);
+    }
+    std::uint64_t new_soft = 0;
+    std::uint64_t new_hard = 0;
+    for (std::size_t i = 0; i < 8U; ++i) {
+        new_soft |= static_cast<std::uint64_t>(
+                        std::to_integer<unsigned char>(limit_record[i]))
+                    << (8U * i);
+        new_hard |= static_cast<std::uint64_t>(
+                        std::to_integer<unsigned char>(limit_record[8U + i]))
+                    << (8U * i);
+    }
+
+    const std::uint32_t resource =
+        static_cast<std::uint32_t>(state.x[0]) & ~kDarwinRlimitPosixFlag;
+    if (resource >= kDarwinRlimNlimits) {
+        return fail(kDarwinErrnoEinval);
+    }
+
+    const HostResourceLimitResult current = host.resource_limit(resource);
+    if (!current) {
+        return fail(current.error);
+    }
+    if (current.soft_limit > current.hard_limit ||
+        current.hard_limit > kDarwinRlimInfinity) {
+        return SyscallDispatchResult{
+            SyscallDispatchError::host_contract_violation,
+            SyscallAction::resume, syscall_number, 0};
+    }
+
+    if (new_soft > new_hard) {
+        return fail(kDarwinErrnoEinval);
+    }
+    if (new_soft > current.hard_limit || new_hard > current.hard_limit) {
+        return fail(kDarwinErrnoEperm);
+    }
+
+    const HostSetResourceLimitResult committed =
+        host.set_resource_limit(resource, new_soft, new_hard);
+    if (!committed) {
+        return fail(committed.error);
+    }
+    set_success(state, 0U);
+    return finish();
+}
+
+// XNU bsd/kern/kern_descrip.c: sys_getdtablesize(p, uap, retval) always
+// succeeds with *retval = proc_limitgetcur_nofile(p), which kern_resource.c
+// defines as (int)MIN(proc_limitgetcur(p, RLIMIT_NOFILE), maxfilesperproc):
+// the soft RLIMIT_NOFILE limit capped at the int maxfilesperproc. The soft
+// limit comes only from the host's resource_limit and is held to the
+// getrlimit contract: a host error is reported as is, and an inverted or
+// out-of-range snapshot is a host contract violation. No maxfilesperproc
+// sysctl is modeled, so the only cap is INT_MAX, the most maxfilesperproc can
+// hold; a soft limit of RLIM_INFINITY therefore reports INT_MAX. The result
+// is never negative, so its zero and sign extensions into x0 agree. Nothing
+// touches guest memory.
+[[nodiscard]] SyscallDispatchResult dispatch_getdtablesize(
+    CpuState& state,
+    DarwinHostServices& host,
+    std::uint64_t syscall_number) {
+
+    const auto finish = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    };
+
+    const HostResourceLimitResult current = host.resource_limit(kDarwinRlimitNofile);
+    if (!current) {
+        set_error(state, current.error);
+        return finish();
+    }
+    if (current.soft_limit > current.hard_limit ||
+        current.hard_limit > kDarwinRlimInfinity) {
+        return SyscallDispatchResult{
+            SyscallDispatchError::host_contract_violation,
+            SyscallAction::resume, syscall_number, 0};
+    }
+
+    constexpr std::uint64_t kIntMax = 0x7fffffffU;
+    set_success(state, current.soft_limit < kIntMax ? current.soft_limit : kIntMax);
+    return finish();
+}
+
+// XNU bsd/kern/kern_time.c: gettimeofday(tp, tzp, mach_absolute_time)
+// samples the clock only when tp or mach_absolute_time is requested, then
+// copies out a 64-bit timeval (tv_sec cast through uint32_t to match the
+// arm64 commpage), the kernel timezone and the Mach absolute time, in that
+// order. A failing copyout returns EFAULT at once while earlier copyouts
+// stay visible; success returns 0 in x0, never the time in registers.
+// No Mach timebase exists yet, so a paired absolute-time request fails
+// closed with ENOSYS before any clock read or guest write. Each destination
+// is probed before it is written (the timeval before the host clock is even
+// read), and the timezone is always UTC without DST, never the host's zone.
+[[nodiscard]] SyscallDispatchResult dispatch_gettimeofday(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    DarwinHostServices& host,
+    std::uint64_t syscall_number) {
+
+    constexpr std::size_t timeval_size = 16; // struct user64_timeval
+    constexpr std::size_t timezone_size = 8; // struct timezone
+    constexpr std::uint32_t microseconds_per_second = 1000000U;
+    const auto finish = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    };
+    const auto fault = [&]() {
+        set_error(state, kDarwinErrnoEfault);
+        return finish();
+    };
+
+    const std::uint64_t timeval_address = state.x[0];
+    const std::uint64_t timezone_address = state.x[1];
+    const std::uint64_t absolute_time_address = state.x[2];
+    if (absolute_time_address != 0U) {
+        set_error(state, kDarwinErrnoEnosys);
+        return finish();
+    }
+
+    if (timeval_address != 0U) {
+        if (!address_space.probe_write(timeval_address, timeval_size)) {
+            return fault();
+        }
+        const HostWallClockResult now = host.wall_clock();
+        if (!now) {
+            set_error(state, now.error);
+            return finish();
+        }
+        if (now.microseconds >= microseconds_per_second) {
+            return SyscallDispatchResult{
+                SyscallDispatchError::host_contract_violation,
+                SyscallAction::resume, syscall_number, 0};
+        }
+        // { int64 tv_sec; int32 tv_usec; } plus four zeroed padding bytes.
+        // Keep all 64 signed tv_sec bits: a uint32 cast would wrap pre-epoch
+        // clocks into the far future and truncate times past 2106.
+        const auto seconds = static_cast<std::uint64_t>(now.seconds);
+        std::array<std::byte, timeval_size> time_record{};
+        for (std::size_t i = 0; i < 8U; ++i) {
+            time_record[i] = static_cast<std::byte>((seconds >> (8U * i)) & 0xffU);
+        }
+        for (std::size_t i = 0; i < 4U; ++i) {
+            time_record[8U + i] =
+                static_cast<std::byte>((now.microseconds >> (8U * i)) & 0xffU);
+        }
+        if (!address_space.write(timeval_address,
+                                 std::span<const std::byte>(time_record))) {
+            return fault();
+        }
+    }
+
+    if (timezone_address != 0U) {
+        // { int tz_minuteswest; int tz_dsttime; } is all zero for UTC.
+        const std::array<std::byte, timezone_size> zone_record{};
+        if (!address_space.probe_write(timezone_address, zone_record.size()) ||
+            !address_space.write(timezone_address,
+                                 std::span<const std::byte>(zone_record))) {
+            return fault();
+        }
+    }
+
+    set_success(state, 0U);
+    return finish();
+}
+
+// The guest-visible struct termios for ioctl(2) TIOCGETA: XNU
+// bsd/sys/ttydefaults.h TTYDEF_IFLAG, TTYDEF_OFLAG, TTYDEF_CFLAG,
+// TTYDEF_LFLAG, ttydefchars and TTYDEF_SPEED (B9600), the canonical, echoing
+// mode of a freshly opened terminal. It is synthetic: no host terminal
+// settings reach the guest. Little-endian LP64 layout; the c_cc padding at
+// offsets 52-55 stays zero.
+[[nodiscard]] std::array<std::byte, kDarwinTermiosSize> synthetic_termios() noexcept {
+    static_assert(kDarwinTermiosSize == 72U, "LP64 struct termios is 72 bytes");
+    static_assert(kDarwinTermiosControlCharCount == 20U, "Darwin NCCS is 20");
+    // bsd/sys/termios.h flag bits.
+    constexpr std::uint64_t input_flags = 0x2b02;   // BRKINT|ICRNL|IXON|IXANY|IMAXBEL
+    constexpr std::uint64_t output_flags = 0x0003;  // OPOST|ONLCR
+    constexpr std::uint64_t control_flags = 0x4b00; // CS8|CREAD|HUPCL
+    constexpr std::uint64_t local_flags = 0x05cb;   // ECHOKE|ECHOE|ECHO|ECHOCTL|ISIG|ICANON|IEXTEN
+    constexpr std::uint64_t speed = 9600;           // B9600
+    // ttydefchars in V* index order; 0xff is _POSIX_VDISABLE.
+    constexpr std::array<std::uint8_t, kDarwinTermiosControlCharCount> control_chars{
+        0x04, 0xff, 0xff, 0x7f, 0x17, 0x15, 0x12, 0xff, 0x03, 0x1c, // VEOF..VQUIT
+        0x1a, 0x19, 0x11, 0x13, 0x16, 0x0f, 0x01, 0x00, 0x14, 0xff, // VSUSP..spare
+    };
+
+    std::array<std::byte, kDarwinTermiosSize> record{};
+    const auto put = [&](std::size_t offset, std::uint64_t value) {
+        for (std::size_t i = 0; i < sizeof(std::uint64_t); ++i) {
+            record[offset + i] = static_cast<std::byte>((value >> (8U * i)) & 0xffU);
+        }
+    };
+    put(0U, input_flags);    // c_iflag
+    put(8U, output_flags);   // c_oflag
+    put(16U, control_flags); // c_cflag
+    put(24U, local_flags);   // c_lflag
+    for (std::size_t i = 0; i < control_chars.size(); ++i) {
+        record[32U + i] = static_cast<std::byte>(control_chars[i]);
+    }
+    put(56U, speed); // c_ispeed
+    put(64U, speed); // c_ospeed
+    return record;
+}
+
+// XNU bsd/kern/sys_generic.c: ioctl(fd, com, data) sizes the argument from
+// bits 16-28 of com and copies an IOC_IN argument in (EFAULT) before it
+// resolves the descriptor (EBADF). FIOCLEX, FIONCLEX, FIONBIO, FIOASYNC,
+// FIOSETOWN and FIOGETOWN act on the file table entry itself. FIOCLEX and
+// FIONCLEX set and clear the descriptor's own close-on-exec flag through the
+// host, as fcntl(2) F_SETFD does. FIONBIO and FIOASYNC read the int they
+// copied in: XNU sets FNONBLOCK (FASYNC) in f_flag when it is nonzero and
+// clears it otherwise, then hands the file the new mode through fo_ioctl.
+// The dispatcher likewise commits the new OFLAGS(f_flag) through
+// set_status_flags and then calls set_nonblocking_io (set_async_io); a mode
+// failure is reported with the status flags already changed, exactly as XNU
+// leaves f_flag, and nothing is undone. Ownership is not modeled for ioctl
+// yet, so FIOSETOWN and FIOGETOWN report ENOSYS and are never acknowledged.
+// XNU's FREAD | FWRITE check cannot fail here, since every OFLAGS(f_flag) a
+// host may report holds O_RDONLY, O_WRONLY or O_RDWR. Every other request
+// reaches the device, which reports ENOTTY for a request it does not
+// recognize, and an IOC_OUT result is copied out only on success (EFAULT).
+// Only TIOCGETA and TIOCGWINSZ on a host terminal are recognized; the host
+// reports just that fd is a terminal and its window size, and the dispatcher
+// encodes both records itself. A negative descriptor never reaches the host.
+[[nodiscard]] SyscallDispatchResult dispatch_ioctl(
+    CpuState& state,
+    GuestAddressSpace& address_space,
+    DarwinHostServices& host,
+    std::uint64_t syscall_number) {
+
+    const auto finish = [&]() {
+        return SyscallDispatchResult{
+            SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    };
+
+    const auto fd = static_cast<std::int32_t>(static_cast<std::uint32_t>(state.x[0]));
+    const std::uint64_t command = state.x[1];
+    const std::uint64_t guest_address = state.x[2];
+    const auto size = static_cast<std::size_t>((command >> 16U) & kDarwinIocParmMask);
+
+    // XNU copies an IOC_IN argument into its kernel buffer before it resolves
+    // the descriptor, so a fault is EFAULT even for a bad descriptor. Only
+    // FIONBIO and FIOASYNC consume what was copied in.
+    std::array<std::byte, kDarwinIocParmMask + 1U> argument{};
+    if ((command & kDarwinIocIn) != 0U && size != 0U) {
+        if (!address_space.read(guest_address, std::span<std::byte>(argument.data(), size))) {
+            set_error(state, kDarwinErrnoEfault);
+            return finish();
+        }
+    }
+    if (fd < 0) {
+        set_error(state, kDarwinErrnoEbadf);
+        return finish();
+    }
+    // The terminal query doubles as descriptor resolution: EBADF names no
+    // guest descriptor, ENOTTY an open descriptor that is not a terminal.
+    const HostTerminalResult terminal = host.terminal_status(fd);
+    if (terminal.error == kDarwinErrnoEbadf) {
+        set_error(state, kDarwinErrnoEbadf);
+        return finish();
+    }
+
+    const auto copy_out = [&](std::span<const std::byte> record) {
+        if (!address_space.probe_write(guest_address, record.size()) ||
+            !address_space.write(guest_address, record)) {
+            set_error(state, kDarwinErrnoEfault);
+        } else {
+            set_success(state, 0U);
+        }
+        return finish();
+    };
+
+    switch (command) {
+    case kDarwinIoctlFioclex:
+    case kDarwinIoctlFionclex: {
+        // Like fcntl(2) F_SETFD, these change only the descriptor's own
+        // close-on-exec flag. Neither the open file description nor the
+        // device sees them, so an open non-terminal accepts them too, and as
+        // _IO requests they read no argument and copy nothing out.
+        const HostSetCloseOnExecResult updated =
+            host.set_close_on_exec(fd, command == kDarwinIoctlFioclex);
+        if (!updated) {
+            set_error(state, updated.error);
+            return finish();
+        }
+        set_success(state, 0U);
+        return finish();
+    }
+    case kDarwinIoctlFionbio:
+    case kDarwinIoctlFioasync: {
+        // tmp = *(int *)datap: only the int copied in is read, and any
+        // nonzero value turns the mode on. The flag changes in f_flag first,
+        // whether or not the descriptor is a terminal, and fo_ioctl then
+        // hands the file its new mode; a mode failure is reported with
+        // f_flag already changed and nothing is undone.
+        std::uint32_t requested = 0U;
+        for (std::size_t i = 0; i < sizeof(requested); ++i) {
+            requested |= static_cast<std::uint32_t>(argument[i]) << (8U * i);
+        }
+        const bool enable = requested != 0U;
+        const HostDescriptorFlagsResult described = host.descriptor_flags(fd);
+        if (!described) {
+            set_error(state, described.error);
+            return finish();
+        }
+        // OFLAGS(f_flag) always holds exactly one access mode and only FMASK
+        // bits; anything else is a host contract violation, never guest data.
+        constexpr std::uint32_t reportable_status_flags =
+            kDarwinOpenAccessMode | kDarwinOpenNonblock | kDarwinOpenAppend |
+            kDarwinOpenAsync | kDarwinOpenFsync | kDarwinOpenDsync;
+        if ((described.status_flags & ~reportable_status_flags) != 0U ||
+            (described.status_flags & kDarwinOpenAccessMode) == kDarwinOpenAccessMode) {
+            return SyscallDispatchResult{
+                SyscallDispatchError::host_contract_violation,
+                SyscallAction::resume, syscall_number, 0};
+        }
+        const bool nonblocking_request = command == kDarwinIoctlFionbio;
+        const std::uint32_t flag = nonblocking_request ? kDarwinOpenNonblock : kDarwinOpenAsync;
+        const std::uint32_t status_flags =
+            enable ? (described.status_flags | flag) : (described.status_flags & ~flag);
+        const HostSetStatusFlagsResult committed = host.set_status_flags(fd, status_flags);
+        if (!committed) {
+            set_error(state, committed.error);
+            return finish();
+        }
+        const HostFileModeResult mode = nonblocking_request
+                                            ? host.set_nonblocking_io(fd, enable)
+                                            : host.set_async_io(fd, enable);
+        if (!mode) {
+            set_error(state, mode.error);
+            return finish();
+        }
+        set_success(state, 0U);
+        return finish();
+    }
+    case kDarwinIoctlFiogetown:
+    case kDarwinIoctlFiosetown:
+        set_error(state, kDarwinErrnoEnosys);
+        return finish();
+    case kDarwinIoctlTiocgeta: {
+        if (!terminal) {
+            set_error(state, terminal.error);
+            return finish();
+        }
+        const std::array<std::byte, kDarwinTermiosSize> record = synthetic_termios();
+        return copy_out(record);
+    }
+    case kDarwinIoctlTiocgwinsz: {
+        if (!terminal) {
+            set_error(state, terminal.error);
+            return finish();
+        }
+        static_assert(kDarwinWinsizeSize == 8U, "struct winsize is four unsigned shorts");
+        const std::array<std::uint16_t, 4> fields{
+            terminal.rows, terminal.columns, terminal.x_pixels, terminal.y_pixels};
+        std::array<std::byte, kDarwinWinsizeSize> record{};
+        for (std::size_t i = 0; i < fields.size(); ++i) {
+            record[2U * i] = static_cast<std::byte>(fields[i] & 0xffU);
+            record[2U * i + 1U] = static_cast<std::byte>(fields[i] >> 8U);
+        }
+        return copy_out(record);
+    }
+    default:
+        set_error(state, terminal ? kDarwinErrnoEnotty : terminal.error);
+        return finish();
+    }
+}
+
 } // namespace
 
 SyscallDispatchResult dispatch_darwin_syscall(
@@ -511,16 +1834,204 @@ SyscallDispatchResult dispatch_darwin_syscall(
         // error contract; only the pthread cancellation point differs, and
         // no guest pthread can be cancelled yet.
         return dispatch_read(state, address_space, host, syscall_number);
+    case kDarwinSysReadv:
+    case kDarwinSysReadvNocancel:
+        // XNU syscalls.master #120 readv / #411 readv_nocancel scatter one
+        // bounded host read across the guest's iovec array, in order. No
+        // guest pthread can be cancelled yet, so both entry points share one
+        // handler.
+        return dispatch_readv(state, address_space, host, syscall_number);
     case kDarwinSysWrite:
     case kDarwinSysWriteNocancel:
         // XNU syscalls.master #397 write_nocancel likewise aliases write.
         return dispatch_write(state, address_space, host, syscall_number);
+    case kDarwinSysWritev:
+    case kDarwinSysWritevNocancel:
+        // XNU syscalls.master #121 writev / #412 writev_nocancel gather the
+        // guest's iovec array; each vector reaches the host only through the
+        // same bounded write path, in order. No guest pthread can be
+        // cancelled yet, so both entry points share one handler.
+        return dispatch_writev(state, address_space, host, syscall_number);
     case kDarwinSysMmap:
         return dispatch_mmap(state, address_space, syscall_number);
     case kDarwinSysMprotect:
         return dispatch_mprotect(state, address_space, syscall_number);
     case kDarwinSysMunmap:
         return dispatch_munmap(state, address_space, syscall_number);
+    case kDarwinSysFstat64:
+        // XNU syscalls.master #339: int fstat64(int fd, user_addr_t ub). On
+        // arm64, libSystem's fstat(3) traps here. Metadata comes only from the
+        // host's guest-descriptor view and the dispatcher encodes the layout.
+        return dispatch_fstat64(state, address_space, host, syscall_number);
+    case kDarwinSysIoctl:
+        // XNU syscalls.master #54: int ioctl(int fd, u_long com, caddr_t data).
+        // libSystem's isatty(3) and stdio's line-buffering probe issue
+        // TIOCGETA; terminal state comes only from the host's view of the
+        // guest descriptor and the dispatcher encodes every record itself.
+        return dispatch_ioctl(state, address_space, host, syscall_number);
+    case kDarwinSysFcntl:
+    case kDarwinSysFcntlNocancel:
+        // XNU syscalls.master #92 fcntl / #406 fcntl_nocancel: int fcntl(int
+        // fd, int cmd, long arg). libSystem's fcntl(3) traps here. Descriptor
+        // flags come only from the host's view of the guest descriptor; the
+        // dispatcher validates them and encodes every result itself. No guest
+        // pthread can be cancelled yet, so both entry points share one
+        // handler.
+        return dispatch_fcntl(state, host, syscall_number);
+    case kDarwinSysPread:
+    case kDarwinSysPreadNocancel:
+        // XNU syscalls.master #153 pread / #414 pread_nocancel: user_ssize_t
+        // pread(int fd, user_addr_t buf, user_size_t nbyte, off_t offset).
+        // The read happens at an explicit offset and never moves the
+        // descriptor's file offset. No guest pthread can be cancelled yet, so
+        // both entry points share one handler.
+        return dispatch_pread(state, address_space, host, syscall_number);
+    case kDarwinSysPwrite:
+    case kDarwinSysPwriteNocancel:
+        // XNU syscalls.master #154 pwrite / #415 pwrite_nocancel: user_ssize_t
+        // pwrite(int fd, user_addr_t buf, user_size_t nbyte, off_t offset).
+        // The write happens at an explicit offset, ignores O_APPEND and never
+        // moves the descriptor's file offset. Both entry points share one
+        // handler.
+        return dispatch_pwrite(state, address_space, host, syscall_number);
+    case kDarwinSysLseek:
+        // XNU syscalls.master #199: off_t lseek(int fd, off_t offset, int whence).
+        // libSystem's lseek(3) traps here, and stdio's fseeko(3), ftello(3) and
+        // rewind(3) reach it through __sseek. arm64 passes the whole off_t in
+        // x1 and returns the new offset in x0. The current offset and size
+        // come only from the host's view of the guest descriptor; the
+        // dispatcher applies XNU's whence arithmetic and range checks itself.
+        return dispatch_lseek(state, host, syscall_number);
+    case kDarwinSysGetentropy:
+        // XNU syscalls.master #500: int getentropy(void *buffer, size_t size).
+        // libSystem seeds arc4random and malloc/stack guards from it; bytes
+        // come only from the host's secure source, never a fabricated seed.
+        return dispatch_getentropy(state, address_space, host, syscall_number);
+    case kDarwinSysGettimeofday:
+        // XNU syscalls.master #116: int gettimeofday(struct timeval *tp,
+        // struct timezone *tzp, uint64_t *mach_absolute_time). Time comes
+        // only from the host wall clock; the zone is always synthetic UTC.
+        return dispatch_gettimeofday(state, address_space, host, syscall_number);
+    case kDarwinSysGetrlimit:
+        // XNU syscalls.master #194: int getrlimit(u_int which, struct rlimit
+        // *rlp). libSystem sizes the main-thread stack and descriptor tables
+        // from it; limits come only from the host's view of the translated
+        // process, and the dispatcher encodes the LP64 struct rlimit itself.
+        return dispatch_getrlimit(state, address_space, host, syscall_number);
+    case kDarwinSysSetrlimit:
+        // XNU syscalls.master #195: int setrlimit(u_int which, struct rlimit
+        // *rlp). libSystem's setrlimit(3) traps here; programs commonly lower
+        // RLIMIT_CORE or raise the soft RLIMIT_NOFILE through it. The
+        // dispatcher copies the LP64 struct rlimit in and applies XNU's
+        // EINVAL and EPERM checks against the host's current limits; only a
+        // request that passes them reaches the host.
+        return dispatch_setrlimit(state, address_space, host, syscall_number);
+    case kDarwinSysGetdtablesize:
+        // XNU syscalls.master #89: int sys_getdtablesize(void). libSystem's
+        // getdtablesize(3) traps here and programs size descriptor loops
+        // from it. The result is the host's soft RLIMIT_NOFILE limit capped
+        // at INT_MAX, and no argument register is read.
+        return dispatch_getdtablesize(state, host, syscall_number);
+    case kDarwinSysClose:
+    case kDarwinSysCloseNocancel: {
+        // XNU bsd/kern/kern_descrip.c: close_nocancel rejects a descriptor
+        // outside the file table with EBADF before releasing anything. A
+        // negative fd can never name a guest descriptor, so it never reaches
+        // the host. Any other host error is reported once and the descriptor
+        // is never closed a second time.
+        const auto fd = static_cast<std::int32_t>(static_cast<std::uint32_t>(state.x[0]));
+        if (fd < 0) {
+            set_error(state, kDarwinErrnoEbadf);
+            return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+        }
+        const HostCloseResult closed = host.close(fd);
+        if (!closed) {
+            set_error(state, closed.error);
+        } else {
+            set_success(state, 0U);
+        }
+        return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    }
+    case kDarwinSysDup: {
+        // XNU syscalls.master #41: int dup(u_int fd). sys_dup looks fd up with
+        // fp_lookup, which rejects a descriptor outside the file table with
+        // EBADF, then fdalloc takes the lowest free descriptor at or above 0
+        // (EMFILE when the table is full) and finishdup points it at fd's
+        // open file description with close-on-exec clear. A u_int that is
+        // negative as an int can never name a guest descriptor, so it never
+        // reaches the host. A host success that is negative or fd itself is a
+        // host contract violation and never reaches the guest.
+        const auto fd = static_cast<std::int32_t>(static_cast<std::uint32_t>(state.x[0]));
+        if (fd < 0) {
+            set_error(state, kDarwinErrnoEbadf);
+            return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+        }
+        const HostDuplicateResult duplicated = host.duplicate(fd);
+        if (!duplicated) {
+            set_error(state, duplicated.error);
+            return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+        }
+        if (duplicated.descriptor < 0 || duplicated.descriptor == fd) {
+            return {SyscallDispatchError::host_contract_violation,
+                    SyscallAction::resume, syscall_number, 0};
+        }
+        set_success(state, static_cast<std::uint64_t>(duplicated.descriptor));
+        return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    }
+    case kDarwinSysDup2: {
+        // XNU syscalls.master #90: int dup2(u_int from, u_int to). dup2 looks
+        // from up with fp_lookup (EBADF), then rejects a to that is negative
+        // or at or above the soft RLIMIT_NOFILE limit (EBADF). A to equal to
+        // from returns to and changes nothing; otherwise any descriptor open
+        // at to is closed and to is pointed at from's open file description
+        // with close-on-exec clear. A u_int that is negative as an int is
+        // EBADF whichever check XNU reaches first, so it never reaches the
+        // host. A host success that names any descriptor but to is a host
+        // contract violation and never reaches the guest.
+        const auto from = static_cast<std::int32_t>(static_cast<std::uint32_t>(state.x[0]));
+        const auto to = static_cast<std::int32_t>(static_cast<std::uint32_t>(state.x[1]));
+        if (from < 0 || to < 0) {
+            set_error(state, kDarwinErrnoEbadf);
+            return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+        }
+        const HostDuplicateResult duplicated = host.duplicate_to(from, to);
+        if (!duplicated) {
+            set_error(state, duplicated.error);
+            return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+        }
+        if (duplicated.descriptor != to) {
+            return {SyscallDispatchError::host_contract_violation,
+                    SyscallAction::resume, syscall_number, 0};
+        }
+        set_success(state, static_cast<std::uint64_t>(to));
+        return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    }
+    case kDarwinSysFsync:
+    case kDarwinSysFsyncNocancel:
+    case kDarwinSysFdatasync: {
+        // XNU syscalls.master #95 fsync / #408 fsync_nocancel / #187
+        // fdatasync, each taking only int fd. fsync and fsync_nocancel call
+        // fsync_common with MNT_WAIT and fdatasync with MNT_DWAIT; no guest
+        // pthread can be cancelled yet, so all three share one handler.
+        // fp_getfvp resolves fd before anything else, so a negative
+        // descriptor, which can never name a guest file, is EBADF without
+        // asking the host. The host then reports EBADF for an unknown
+        // descriptor, ENOTSUP for one that names no vnode, or the outcome of
+        // VNOP_FSYNC. Success always returns 0.
+        const auto fd = static_cast<std::int32_t>(static_cast<std::uint32_t>(state.x[0]));
+        if (fd < 0) {
+            set_error(state, kDarwinErrnoEbadf);
+            return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+        }
+        const HostSyncResult synced =
+            host.synchronize_file(fd, syscall_number == kDarwinSysFdatasync);
+        if (!synced) {
+            set_error(state, synced.error);
+        } else {
+            set_success(state, 0U);
+        }
+        return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    }
     case kDarwinSysGetpid:
         // XNU bsd/kern/syscalls.master: BSD #20, int getpid(void).
         // Process identity belongs to the shared context, never to the host.
