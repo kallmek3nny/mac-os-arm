@@ -678,13 +678,14 @@ public:
         return {0};
     }
 
-    // fcntl(2) F_SETFL can only keep a standard stream's status flags as
-    // descriptor_flags reports them. Any change would have to reach the
-    // host's open file description, which macho-run shares with its own
-    // diagnostics and with the process that launched it, and the streams
-    // cannot honor nonblocking, asynchronous or synchronous I/O. A request
-    // to change them reports ENOTSUP, never a fabricated success, and leaves
-    // the flags as they were, so a later F_GETFL still tells the truth.
+    // fcntl(2) F_SETFL and ioctl(2) FIONBIO and FIOASYNC can only keep a
+    // standard stream's status flags as descriptor_flags reports them. Any
+    // change would have to reach the host's open file description, which
+    // macho-run shares with its own diagnostics and with the process that
+    // launched it, and the streams cannot honor nonblocking, asynchronous
+    // or synchronous I/O. A request to change them reports ENOTSUP, never a
+    // fabricated success, and leaves the flags as they were, so a later
+    // F_GETFL still tells the truth.
     macosarm::HostSetStatusFlagsResult set_status_flags(
         std::int32_t fd,
         std::uint32_t status_flags) override {
@@ -699,8 +700,9 @@ public:
     }
 
     // Every standard stream does blocking I/O, so the FIONBIO step of
-    // fcntl(2) F_SETFL can only confirm that mode; asking for nonblocking
-    // I/O reports ENOTSUP rather than a mode the stream would not honor.
+    // fcntl(2) F_SETFL and ioctl(2) FIONBIO can only confirm that mode;
+    // asking for nonblocking I/O reports ENOTSUP rather than a mode the
+    // stream would not honor.
     macosarm::HostFileModeResult set_nonblocking_io(
         std::int32_t fd,
         bool nonblocking) override {
@@ -711,8 +713,8 @@ public:
     }
 
     // No standard stream ever raises SIGIO, so the FIOASYNC step of fcntl(2)
-    // F_SETFL can only confirm ordinary I/O; asking for asynchronous I/O
-    // reports ENOTSUP.
+    // F_SETFL and ioctl(2) FIOASYNC can only confirm ordinary I/O; asking
+    // for asynchronous I/O reports ENOTSUP.
     macosarm::HostFileModeResult set_async_io(
         std::int32_t fd,
         bool asynchronous) override {

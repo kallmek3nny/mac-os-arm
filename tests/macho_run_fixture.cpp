@@ -997,12 +997,155 @@ constexpr std::array<std::uint32_t, 99> kIoctlFioclexStdioCode{
     0xd4001001U, // svc #0x80
 };
 
+// fcntl(1, F_GETFL); ioctl(1, FIONBIO, &1); ioctl(1, FIOASYNC, &1);
+// ioctl(1, FIONBIO, &0); ioctl(1, FIOASYNC, &0); ioctl(0, FIONBIO, &0);
+// fcntl(1, F_GETFL); ioctl(9, FIONBIO, &0); ioctl(9, FIONBIO, NULL);
+// write(1, "hello", 5); exit(getfl << 6 | errno). FIONBIO and FIOASYNC set
+// O_NONBLOCK and O_ASYNC in the open file description when the int they copy
+// in is nonzero and clear them when it is zero. macho-run's standard streams
+// only do blocking, ordinary I/O, so both requests to turn a mode on fail with
+// the same errno and leave the flags alone, while turning either mode off
+// changes nothing and succeeds with 0, on stdout and on stdin, which
+// macho_run_check.cmake redirects from a file and so is no terminal. The
+// second F_GETFL proves the flags never changed. Descriptor 9 is not open, so
+// ioctl(9, FIONBIO, &0) fails with EBADF (9), but XNU copies the int in before
+// it resolves the descriptor, so a NULL argument, inside __PAGEZERO, fails
+// with EFAULT (14) even for descriptor 9. macho_run_check.cmake captures guest
+// stdout through a pipe opened without O_APPEND, so F_GETFL reports O_WRONLY
+// (1), the mode requests fail with ENOTSUP (45), the host stdout shows "hello"
+// and a correct host exits 109. A failed first F_GETFL, a request to turn a
+// mode on that succeeds, a FIOASYNC errno that differs from the FIONBIO one, a
+// failed or nonzero request to turn a mode off on stdout, the same on stdin,
+// flags that changed or cannot be read, an ioctl on descriptor 9 that succeeds
+// or fails with any errno but EBADF, a NULL argument that succeeds or fails
+// with any errno but EFAULT, or a failed or short write exits 100 to 108
+// instead. The two ints live in 16 bytes reserved below the startup stack
+// pointer, 1 at sp and 0 at sp + 4, and the first F_GETFL result and the errno
+// are kept in x19 and x20 across the later calls.
+constexpr std::array<std::uint32_t, 115> kIoctlFionbioStdioCode{
+    0xd10043ffU, // sub sp, sp, #16 (two ints)
+    0x52800028U, // mov w8, #1
+    0xb90003e8U, // str w8, [sp] -> int 1
+    0xb90007ffU, // str wzr, [sp, #4] -> int 0
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd2800061U, // mov x1, #3 (F_GETFL)
+    0xd2800b90U, // mov x16, #92 (fcntl)
+    0xd4001001U, // svc #0x80
+    0x54000a02U, // b.cs first_getfl_failed (+320)
+    0xaa0003f3U, // mov x19, x0 -> status flags before any ioctl
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd28ccfc1U, // mov x1, #0x667e
+    0xf2b00081U, // movk x1, #0x8004, lsl #16 -> FIONBIO 0x8004667e
+    0x910003e2U, // mov x2, sp -> int 1
+    0xd28006d0U, // mov x16, #54 (ioctl)
+    0xd4001001U, // svc #0x80
+    0x54000963U, // b.cc mode_on_succeeded (+300)
+    0xaa0003f4U, // mov x20, x0 -> errno of FIONBIO on
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd28ccfa1U, // mov x1, #0x667d
+    0xf2b00081U, // movk x1, #0x8004, lsl #16 -> FIOASYNC 0x8004667d
+    0x910003e2U, // mov x2, sp -> int 1
+    0xd28006d0U, // mov x16, #54 (ioctl)
+    0xd4001001U, // svc #0x80
+    0x54000863U, // b.cc mode_on_succeeded (+268)
+    0xeb14001fU, // cmp x0, x20
+    0x54000881U, // b.ne async_errno_differs (+272)
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd28ccfc1U, // mov x1, #0x667e
+    0xf2b00081U, // movk x1, #0x8004, lsl #16
+    0x910013e2U, // add x2, sp, #4 -> int 0
+    0xd28006d0U, // mov x16, #54 (ioctl)
+    0xd4001001U, // svc #0x80
+    0x54000802U, // b.cs mode_off_failed (+256)
+    0xb50007e0U, // cbnz x0, mode_off_failed (+252)
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd28ccfa1U, // mov x1, #0x667d
+    0xf2b00081U, // movk x1, #0x8004, lsl #16
+    0x910013e2U, // add x2, sp, #4 -> int 0
+    0xd28006d0U, // mov x16, #54 (ioctl)
+    0xd4001001U, // svc #0x80
+    0x54000702U, // b.cs mode_off_failed (+224)
+    0xb50006e0U, // cbnz x0, mode_off_failed (+220)
+    0xd2800000U, // mov x0, #0 (stdin)
+    0xd28ccfc1U, // mov x1, #0x667e
+    0xf2b00081U, // movk x1, #0x8004, lsl #16
+    0x910013e2U, // add x2, sp, #4 -> int 0
+    0xd28006d0U, // mov x16, #54 (ioctl)
+    0xd4001001U, // svc #0x80
+    0x54000662U, // b.cs stdin_fionbio_failed (+204)
+    0xb5000640U, // cbnz x0, stdin_fionbio_failed (+200)
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd2800061U, // mov x1, #3 (F_GETFL)
+    0xd2800b90U, // mov x16, #92 (fcntl)
+    0xd4001001U, // svc #0x80
+    0x54000602U, // b.cs flags_changed (+192)
+    0xeb13001fU, // cmp x0, x19
+    0x540005c1U, // b.ne flags_changed (+184)
+    0xd2800120U, // mov x0, #9 -> no guest descriptor
+    0xd28ccfc1U, // mov x1, #0x667e
+    0xf2b00081U, // movk x1, #0x8004, lsl #16
+    0x910013e2U, // add x2, sp, #4 -> int 0
+    0xd28006d0U, // mov x16, #54 (ioctl)
+    0xd4001001U, // svc #0x80
+    0x54000543U, // b.cc closed_ioctl_wrong (+168)
+    0xf100241fU, // cmp x0, #9 (EBADF)
+    0x54000501U, // b.ne closed_ioctl_wrong (+160)
+    0xd2800120U, // mov x0, #9 -> no guest descriptor
+    0xd28ccfc1U, // mov x1, #0x667e
+    0xf2b00081U, // movk x1, #0x8004, lsl #16
+    0xd2800002U, // mov x2, #0 -> NULL, inside __PAGEZERO
+    0xd28006d0U, // mov x16, #54 (ioctl)
+    0xd4001001U, // svc #0x80
+    0x54000483U, // b.cc fault_ioctl_wrong (+144)
+    0xf100381fU, // cmp x0, #14 (EFAULT)
+    0x54000441U, // b.ne fault_ioctl_wrong (+136)
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd2880001U, // mov x1, #0x4000
+    0xf2c00021U, // movk x1, #1, lsl #32 -> "hello" at 0x100004000
+    0xd28000a2U, // mov x2, #5
+    0xd2800090U, // mov x16, #4 (write)
+    0xd4001001U, // svc #0x80
+    0x540003c2U, // b.cs write_failed (+120)
+    0xf100141fU, // cmp x0, #5
+    0x54000381U, // b.ne write_failed (+112)
+    0xaa131a80U, // orr x0, x20, x19, lsl #6 -> getfl << 6 | errno
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800c80U, // first_getfl_failed: mov x0, #100
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800ca0U, // mode_on_succeeded: mov x0, #101
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800cc0U, // async_errno_differs: mov x0, #102
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800ce0U, // mode_off_failed: mov x0, #103
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800d00U, // stdin_fionbio_failed: mov x0, #104
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800d20U, // flags_changed: mov x0, #105
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800d40U, // closed_ioctl_wrong: mov x0, #106
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800d60U, // fault_ioctl_wrong: mov x0, #107
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800d80U, // write_failed: mov x0, #108
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+};
+
 int usage() {
     std::cerr << "usage: macho_run_fixture "
                  "<hello|argc|echo|close-stdout|fstat-stdin|ioctl-stdin|writev-stdout|"
                  "readv-stdin|lseek-stdin|pread-stdin|fcntl-stdio|fcntl-setfl-stdio|"
                  "getrlimit-stack|setrlimit-stack|getdtablesize|dup-stdout|dup2-stdout|"
-                 "fcntl-dupfd-stdout|ioctl-fioclex-stdio> "
+                 "fcntl-dupfd-stdout|ioctl-fioclex-stdio|ioctl-fionbio-stdio> "
                  "<output-path>\n";
     return 2;
 }
@@ -1053,6 +1196,8 @@ int main(int argc, char** argv) {
         bytes = image(kFcntlDupfdStdoutCode);
     } else if (kind == "ioctl-fioclex-stdio") {
         bytes = image(kIoctlFioclexStdioCode);
+    } else if (kind == "ioctl-fionbio-stdio") {
+        bytes = image(kIoctlFionbioStdioCode);
     } else {
         return usage();
     }

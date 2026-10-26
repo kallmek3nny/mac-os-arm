@@ -610,6 +610,28 @@ if(BUILD_TESTING)
                 -DEXPECTED_EXIT=57
                 -DEXPECTED_STDOUT=hello
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
+
+        # ioctl(2) FIONBIO and FIOASYNC end to end: macho-run's standard
+        # streams only do blocking, ordinary I/O, so turning either mode on
+        # for stdout fails with ENOTSUP (45) and leaves F_GETFL as it was,
+        # while turning either mode off succeeds with 0 on stdout and on
+        # stdin, which is no terminal. ioctl(9, FIONBIO) fails with EBADF (9)
+        # because 9 is not open, and a NULL argument fails with EFAULT (14)
+        # even for descriptor 9, as XNU copies the int in before it resolves
+        # the descriptor. The pipe macho_run_check.cmake opens is not
+        # O_APPEND, so F_GETFL reports O_WRONLY (1). The guest writes "hello"
+        # and exits with getfl << 6 | errno, so a correct host exits 109; a
+        # failed call or wrong result along the way exits 100 to 108.
+        add_test(
+            NAME macho-run-ioctl-fionbio-stdio
+            COMMAND "${CMAKE_COMMAND}"
+                "-DFIXTURE_TOOL=$<TARGET_FILE:macho_run_fixture>"
+                "-DRUNNER=$<TARGET_FILE:macho-run>"
+                -DKIND=ioctl-fionbio-stdio
+                "-DIMAGE=${CMAKE_CURRENT_BINARY_DIR}/macho-run-ioctl-fionbio-stdio.bin"
+                -DEXPECTED_EXIT=109
+                -DEXPECTED_STDOUT=hello
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
     endif()
 endif()
 
