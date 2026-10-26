@@ -1,6 +1,7 @@
 #include "macosarm/dynarmic_backend.hpp"
 #include "macosarm/session.hpp"
 
+#include <array>
 #include <charconv>
 #include <chrono>
 #include <cstddef>
@@ -354,6 +355,11 @@ class ConsoleHost final : public macosarm::DarwinHostServices {
     // That mapping never grows, so getrlimit(2) RLIMIT_STACK reports it as
     // both the soft and the hard limit.
     std::uint64_t stack_size_;
+    // FG_NOSIGPIPE of each host standard stream's open file description,
+    // indexed by stream (0, 1 or 2). fcntl(2) F_SETNOSIGPIPE through any
+    // descriptor naming a stream changes that stream's entry, so every dup(2)
+    // copy reports the same flag. Each starts clear, as for a fresh open.
+    std::array<bool, 3> no_sigpipe_{};
 
     // The host standard stream guest descriptor fd names, or -1 when fd is
     // not an open guest descriptor.
@@ -722,6 +728,32 @@ public:
             return {kGuestErrnoEbadf};
         }
         return {asynchronous ? kGuestErrnoEnotsup : 0U};
+    }
+
+    // fcntl(2) F_SETNOSIGPIPE and F_GETNOSIGPIPE keep FG_NOSIGPIPE with the
+    // open file description, which for a guest descriptor is the standard
+    // stream it names: setting it through one descriptor shows through every
+    // dup(2) copy of that stream, while another stream keeps its own flag.
+    // Every flag starts clear, as for a freshly opened file. Only the guest's
+    // view changes; the host stream and macho-run's own diagnostics are never
+    // touched, and a write keeps reporting failures exactly as before.
+    macosarm::HostSetNoSigpipeResult set_no_sigpipe(
+        std::int32_t fd,
+        bool enabled) override {
+        const std::int32_t stream = stream_of(fd);
+        if (stream < 0) {
+            return {kGuestErrnoEbadf};
+        }
+        no_sigpipe_.at(static_cast<std::size_t>(stream)) = enabled;
+        return {0};
+    }
+
+    macosarm::HostNoSigpipeResult no_sigpipe(std::int32_t fd) override {
+        const std::int32_t stream = stream_of(fd);
+        if (stream < 0) {
+            return {false, kGuestErrnoEbadf};
+        }
+        return {no_sigpipe_.at(static_cast<std::size_t>(stream)), 0};
     }
 
     // Like a canonical-mode terminal read, return after a newline, a full

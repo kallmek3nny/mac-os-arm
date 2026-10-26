@@ -1140,12 +1140,128 @@ constexpr std::array<std::uint32_t, 115> kIoctlFionbioStdioCode{
     0xd4001001U, // svc #0x80
 };
 
+// fcntl(1, F_GETNOSIGPIPE); fcntl(1, F_SETNOSIGPIPE, 1); copy = dup(1);
+// fcntl(copy, F_GETNOSIGPIPE); fcntl(2, F_GETNOSIGPIPE);
+// fcntl(copy, F_SETNOSIGPIPE, 1 << 32); fcntl(1, F_GETNOSIGPIPE);
+// fcntl(9, F_SETNOSIGPIPE, 1); write(copy, "hello", 5);
+// exit(nosigpipe << 6 | copy << 4 | errno). FG_NOSIGPIPE belongs to the open
+// file description, so it starts clear on stdout, setting it through stdout
+// shows through the dup(2) copy that names the same description, and stderr,
+// another description, keeps its own flag clear. F_SETNOSIGPIPE reads only
+// the int low half of arg, so 1 << 32 clears the flag through the copy and
+// stdout then reports 0 again. Descriptor 9 is not open, so
+// fcntl(9, F_SETNOSIGPIPE, 1) fails with EBADF (9). copy is 3, the lowest
+// free descriptor, the copy reports FG_NOSIGPIPE as 1, the host stdout shows
+// "hello" and a correct host exits 121. A flag that is set or unreadable at
+// the start, a failed or nonzero set, a failed dup, a copy that does not
+// report 1, a set or unreadable flag on stderr, a failed or nonzero clear, a
+// flag still set or unreadable on stdout, an fcntl on descriptor 9 that
+// succeeds or fails with any errno but EBADF, or a failed or short write
+// exits 100 to 108 instead. copy, the errno and the flag read through the
+// copy are kept in x19, x20 and x21 across the later calls.
+constexpr std::array<std::uint32_t, 93> kFcntlNosigpipeStdioCode{
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd2800941U, // mov x1, #74 (F_GETNOSIGPIPE)
+    0xd2800b90U, // mov x16, #92 (fcntl)
+    0xd4001001U, // svc #0x80
+    0x540007c2U, // b.cs first_get_wrong (+248)
+    0xb50007a0U, // cbnz x0, first_get_wrong (+244)
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd2800921U, // mov x1, #73 (F_SETNOSIGPIPE)
+    0xd2800022U, // mov x2, #1 -> set FG_NOSIGPIPE
+    0xd2800b90U, // mov x16, #92 (fcntl)
+    0xd4001001U, // svc #0x80
+    0x54000742U, // b.cs set_failed (+232)
+    0xb5000720U, // cbnz x0, set_failed (+228)
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd2800530U, // mov x16, #41 (dup)
+    0xd4001001U, // svc #0x80
+    0x54000702U, // b.cs dup_failed (+224)
+    0xaa0003f3U, // mov x19, x0 -> copy
+    0xd2800941U, // mov x1, #74 (F_GETNOSIGPIPE), x0 is still copy
+    0xd2800b90U, // mov x16, #92 (fcntl)
+    0xd4001001U, // svc #0x80
+    0x540006c2U, // b.cs copy_get_wrong (+216)
+    0xaa0003f5U, // mov x21, x0 -> FG_NOSIGPIPE seen through copy
+    0xf100041fU, // cmp x0, #1
+    0x54000661U, // b.ne copy_get_wrong (+204)
+    0xd2800040U, // mov x0, #2 (stderr)
+    0xd2800941U, // mov x1, #74 (F_GETNOSIGPIPE)
+    0xd2800b90U, // mov x16, #92 (fcntl)
+    0xd4001001U, // svc #0x80
+    0x54000622U, // b.cs stderr_get_wrong (+196)
+    0xb5000600U, // cbnz x0, stderr_get_wrong (+192)
+    0xaa1303e0U, // mov x0, x19 (copy)
+    0xd2800921U, // mov x1, #73 (F_SETNOSIGPIPE)
+    0xd2c00022U, // mov x2, #0x100000000 -> int low half 0
+    0xd2800b90U, // mov x16, #92 (fcntl)
+    0xd4001001U, // svc #0x80
+    0x540005a2U, // b.cs clear_failed (+180)
+    0xb5000580U, // cbnz x0, clear_failed (+176)
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd2800941U, // mov x1, #74 (F_GETNOSIGPIPE)
+    0xd2800b90U, // mov x16, #92 (fcntl)
+    0xd4001001U, // svc #0x80
+    0x54000542U, // b.cs still_set (+168)
+    0xb5000520U, // cbnz x0, still_set (+164)
+    0xd2800120U, // mov x0, #9 -> no guest descriptor
+    0xd2800921U, // mov x1, #73 (F_SETNOSIGPIPE)
+    0xd2800022U, // mov x2, #1
+    0xd2800b90U, // mov x16, #92 (fcntl)
+    0xd4001001U, // svc #0x80
+    0x540004c3U, // b.cc closed_fcntl_wrong (+152)
+    0xf100241fU, // cmp x0, #9 (EBADF)
+    0x54000481U, // b.ne closed_fcntl_wrong (+144)
+    0xaa0003f4U, // mov x20, x0 -> errno
+    0xaa1303e0U, // mov x0, x19 (copy)
+    0xd2880001U, // mov x1, #0x4000
+    0xf2c00021U, // movk x1, #1, lsl #32 -> "hello" at 0x100004000
+    0xd28000a2U, // mov x2, #5
+    0xd2800090U, // mov x16, #4 (write)
+    0xd4001001U, // svc #0x80
+    0x540003e2U, // b.cs write_failed (+124)
+    0xf100141fU, // cmp x0, #5
+    0x540003a1U, // b.ne write_failed (+116)
+    0xaa131280U, // orr x0, x20, x19, lsl #4 -> copy << 4 | errno
+    0xaa151800U, // orr x0, x0, x21, lsl #6 -> | nosigpipe << 6
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800c80U, // first_get_wrong: mov x0, #100
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800ca0U, // set_failed: mov x0, #101
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800cc0U, // dup_failed: mov x0, #102
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800ce0U, // copy_get_wrong: mov x0, #103
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800d00U, // stderr_get_wrong: mov x0, #104
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800d20U, // clear_failed: mov x0, #105
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800d40U, // still_set: mov x0, #106
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800d60U, // closed_fcntl_wrong: mov x0, #107
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800d80U, // write_failed: mov x0, #108
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+};
+
 int usage() {
     std::cerr << "usage: macho_run_fixture "
                  "<hello|argc|echo|close-stdout|fstat-stdin|ioctl-stdin|writev-stdout|"
                  "readv-stdin|lseek-stdin|pread-stdin|fcntl-stdio|fcntl-setfl-stdio|"
                  "getrlimit-stack|setrlimit-stack|getdtablesize|dup-stdout|dup2-stdout|"
-                 "fcntl-dupfd-stdout|ioctl-fioclex-stdio|ioctl-fionbio-stdio> "
+                 "fcntl-dupfd-stdout|ioctl-fioclex-stdio|ioctl-fionbio-stdio|"
+                 "fcntl-nosigpipe-stdio> "
                  "<output-path>\n";
     return 2;
 }
@@ -1198,6 +1314,8 @@ int main(int argc, char** argv) {
         bytes = image(kIoctlFioclexStdioCode);
     } else if (kind == "ioctl-fionbio-stdio") {
         bytes = image(kIoctlFionbioStdioCode);
+    } else if (kind == "fcntl-nosigpipe-stdio") {
+        bytes = image(kFcntlNosigpipeStdioCode);
     } else {
         return usage();
     }

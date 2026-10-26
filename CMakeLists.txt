@@ -632,6 +632,25 @@ if(BUILD_TESTING)
                 -DEXPECTED_EXIT=109
                 -DEXPECTED_STDOUT=hello
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
+
+        # fcntl(2) F_SETNOSIGPIPE and F_GETNOSIGPIPE end to end: FG_NOSIGPIPE
+        # belongs to the open file description, so setting it on stdout shows
+        # through a dup(2) copy while stderr keeps its own flag clear, and an
+        # arg whose int low half is 0 clears it again through the copy.
+        # fcntl(9, F_SETNOSIGPIPE) fails with EBADF (9) because 9 is not open.
+        # The guest writes "hello" through the copy, descriptor 3, and exits
+        # with nosigpipe << 6 | copy << 4 | errno, so a correct host exits
+        # 121; a failed call or wrong result along the way exits 100 to 108.
+        add_test(
+            NAME macho-run-fcntl-nosigpipe-stdio
+            COMMAND "${CMAKE_COMMAND}"
+                "-DFIXTURE_TOOL=$<TARGET_FILE:macho_run_fixture>"
+                "-DRUNNER=$<TARGET_FILE:macho-run>"
+                -DKIND=fcntl-nosigpipe-stdio
+                "-DIMAGE=${CMAKE_CURRENT_BINARY_DIR}/macho-run-fcntl-nosigpipe-stdio.bin"
+                -DEXPECTED_EXIT=121
+                -DEXPECTED_STDOUT=hello
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
     endif()
 endif()
 
