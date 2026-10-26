@@ -2006,6 +2006,32 @@ SyscallDispatchResult dispatch_darwin_syscall(
         set_success(state, static_cast<std::uint64_t>(to));
         return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
     }
+    case kDarwinSysFsync:
+    case kDarwinSysFsyncNocancel:
+    case kDarwinSysFdatasync: {
+        // XNU syscalls.master #95 fsync / #408 fsync_nocancel / #187
+        // fdatasync, each taking only int fd. fsync and fsync_nocancel call
+        // fsync_common with MNT_WAIT and fdatasync with MNT_DWAIT; no guest
+        // pthread can be cancelled yet, so all three share one handler.
+        // fp_getfvp resolves fd before anything else, so a negative
+        // descriptor, which can never name a guest file, is EBADF without
+        // asking the host. The host then reports EBADF for an unknown
+        // descriptor, ENOTSUP for one that names no vnode, or the outcome of
+        // VNOP_FSYNC. Success always returns 0.
+        const auto fd = static_cast<std::int32_t>(static_cast<std::uint32_t>(state.x[0]));
+        if (fd < 0) {
+            set_error(state, kDarwinErrnoEbadf);
+            return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+        }
+        const HostSyncResult synced =
+            host.synchronize_file(fd, syscall_number == kDarwinSysFdatasync);
+        if (!synced) {
+            set_error(state, synced.error);
+        } else {
+            set_success(state, 0U);
+        }
+        return {SyscallDispatchError::none, SyscallAction::resume, syscall_number, 0};
+    }
     case kDarwinSysGetpid:
         // XNU bsd/kern/syscalls.master: BSD #20, int getpid(void).
         // Process identity belongs to the shared context, never to the host.

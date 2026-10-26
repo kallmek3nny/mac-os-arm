@@ -1251,6 +1251,71 @@ bool fcntl_failed_with(const macosarm::CpuState& state, std::uint32_t error) {
     return carry_is_set(state) && state.x[0] == error;
 }
 
+// Scripted descriptor table for fsync(2), fsync_nocancel and fdatasync(2).
+// Descriptors in vnode_fds name files, those in socket_fds name no vnode
+// and report ENOTSUP, as fp_getfvp does, and every other descriptor reports
+// EBADF. A nonzero sync_error fails the next flush of a file once, as
+// VNOP_FSYNC can. Every request is recorded in call order so tests can
+// prove a negative descriptor never reaches the host and that only
+// fdatasync asks for the data-only MNT_DWAIT flush.
+struct SyncHost final : macosarm::DarwinHostServices {
+    struct Request {
+        std::int32_t fd{};
+        bool data_only{};
+
+        friend bool operator==(const Request&, const Request&) = default;
+    };
+
+    std::vector<std::int32_t> vnode_fds{0, 1, 2};
+    std::vector<std::int32_t> socket_fds;
+    std::uint32_t sync_error{};
+    std::vector<Request> requests;
+
+    macosarm::HostWriteResult write(
+        std::int32_t fd,
+        std::span<const std::byte> bytes) override {
+        static_cast<void>(fd);
+        static_cast<void>(bytes);
+        return {0, macosarm::kDarwinErrnoEbadf};
+    }
+
+    macosarm::HostSyncResult synchronize_file(
+        std::int32_t fd,
+        bool data_only) override {
+        requests.push_back({fd, data_only});
+        if (std::find(socket_fds.begin(), socket_fds.end(), fd) != socket_fds.end()) {
+            return {macosarm::kDarwinErrnoEnotsup};
+        }
+        if (std::find(vnode_fds.begin(), vnode_fds.end(), fd) == vnode_fds.end()) {
+            return {macosarm::kDarwinErrnoEbadf};
+        }
+        if (sync_error != 0) {
+            const std::uint32_t error = sync_error;
+            sync_error = 0;
+            return {error};
+        }
+        return {0};
+    }
+};
+
+// Issues fsync, fsync_nocancel or fdatasync with fd_register in x0. Every
+// other argument register is poisoned so tests prove only w0 counts, and
+// carry is preset so every success test proves the dispatcher clears it.
+macosarm::SyscallDispatchResult run_sync(
+    macosarm::GuestAddressSpace& vm,
+    macosarm::DarwinHostServices& host,
+    macosarm::CpuState& state,
+    std::uint64_t syscall_number,
+    std::uint64_t fd_register) {
+    state = {};
+    state.x[0] = fd_register;
+    state.x[1] = 0xFFFFFFFFFFFFFFFFULL;
+    state.x[2] = 0xFFFFFFFFFFFFFFFFULL;
+    state.x[16] = syscall_number;
+    state.pstate = macosarm::kA64PstateCarry;
+    return macosarm::dispatch_darwin_syscall(state, vm, svc(), host);
+}
+
 } // namespace
 
 int main() {
@@ -5444,6 +5509,83 @@ int main() {
                                     macosarm::kDarwinFcntlGetnosigpipe, 0U));
         expect(!carry_is_set(state) && state.x[0] == 0U,
                "a failed F_SETNOSIGPIPE leaves FG_NOSIGPIPE clear");
+    }
+
+    {
+        // fsync(2), fsync_nocancel and fdatasync(2) take only int fd. A file
+        // descriptor is flushed and returns 0 with carry cleared, and only
+        // fdatasync asks the host for the data-only MNT_DWAIT flush.
+        using Request = SyncHost::Request;
+        macosarm::GuestAddressSpace vm;
+        macosarm::CpuState state{};
+        SyncHost host;
+
+        static_cast<void>(run_sync(vm, host, state, macosarm::kDarwinSysFsync, 1U));
+        expect(!carry_is_set(state) && state.x[0] == 0U &&
+                   (host.requests == std::vector<Request>{{1, false}}),
+               "fsync flushes a guest file with a full MNT_WAIT sync and returns 0");
+
+        host.requests.clear();
+        static_cast<void>(run_sync(vm, host, state, macosarm::kDarwinSysFsyncNocancel, 2U));
+        expect(!carry_is_set(state) && state.x[0] == 0U &&
+                   (host.requests == std::vector<Request>{{2, false}}),
+               "fsync_nocancel flushes a guest file exactly as fsync does");
+
+        host.requests.clear();
+        static_cast<void>(run_sync(vm, host, state, macosarm::kDarwinSysFdatasync, 0U));
+        expect(!carry_is_set(state) && state.x[0] == 0U &&
+                   (host.requests == std::vector<Request>{{0, true}}),
+               "fdatasync asks the host for a data-only MNT_DWAIT flush and returns 0");
+
+        host.requests.clear();
+        static_cast<void>(run_sync(vm, host, state, macosarm::kDarwinSysFsync,
+                                   0xFFFFFFFF00000002ULL));
+        expect(!carry_is_set(state) && state.x[0] == 0U &&
+                   (host.requests == std::vector<Request>{{2, false}}),
+               "fsync reads its descriptor from w0 and ignores the upper half of x0");
+    }
+
+    {
+        // fp_getfvp resolves the descriptor before anything is flushed: a
+        // negative fd is EBADF without asking the host, an unknown one is the
+        // host's EBADF, and one naming no vnode is ENOTSUP. A file system
+        // failure is reported once and leaves the descriptor usable.
+        using Request = SyncHost::Request;
+        macosarm::GuestAddressSpace vm;
+        macosarm::CpuState state{};
+        SyncHost host;
+        host.socket_fds = {5};
+
+        for (const std::uint64_t number : {macosarm::kDarwinSysFsync,
+                                           macosarm::kDarwinSysFsyncNocancel,
+                                           macosarm::kDarwinSysFdatasync}) {
+            static_cast<void>(run_sync(vm, host, state, number, 0xFFFFFFFFU));
+            expect(carry_is_set(state) && state.x[0] == macosarm::kDarwinErrnoEbadf &&
+                       host.requests.empty(),
+                   "a negative descriptor reports EBADF without asking the host to flush");
+        }
+
+        static_cast<void>(run_sync(vm, host, state, macosarm::kDarwinSysFsync, 9U));
+        expect(carry_is_set(state) && state.x[0] == macosarm::kDarwinErrnoEbadf &&
+                   (host.requests == std::vector<Request>{{9, false}}),
+               "fsync on an unknown descriptor reports the host's EBADF");
+
+        host.requests.clear();
+        static_cast<void>(run_sync(vm, host, state, macosarm::kDarwinSysFdatasync, 5U));
+        expect(carry_is_set(state) && state.x[0] == macosarm::kDarwinErrnoEnotsup &&
+                   (host.requests == std::vector<Request>{{5, true}}),
+               "fdatasync on a descriptor that names no vnode reports ENOTSUP");
+
+        host.requests.clear();
+        host.sync_error = macosarm::kDarwinErrnoEio;
+        static_cast<void>(run_sync(vm, host, state, macosarm::kDarwinSysFsyncNocancel, 1U));
+        expect(carry_is_set(state) && state.x[0] == macosarm::kDarwinErrnoEio &&
+                   (host.requests == std::vector<Request>{{1, false}}),
+               "a file system flush failure is reported to the guest");
+
+        static_cast<void>(run_sync(vm, host, state, macosarm::kDarwinSysFsync, 1U));
+        expect(!carry_is_set(state) && state.x[0] == 0U && host.requests.size() == 2U,
+               "a failed flush leaves the descriptor open for the next fsync");
     }
 
     if (failures != 0) {

@@ -270,6 +270,21 @@ constexpr std::uint32_t kDarwinOpenExec = 0x40000000;   // O_EXEC
 constexpr std::uint32_t kDarwinFcntlSettableFlags =
     kDarwinOpenNonblock | kDarwinOpenAppend | kDarwinOpenAsync | kDarwinOpenFsync |
     kDarwinOpenDsync;
+// XNU syscalls.master #95: int fsync(int fd), #408 fsync_nocancel with the
+// same argument and error contract, and #187: int fdatasync(int fd). Only
+// the pthread cancellation point differs between fsync and fsync_nocancel.
+// fd is an int, so only w0 counts. All three reach fsync_common in
+// bsd/vfs/vfs_syscalls.c, which first resolves fd through fp_getfvp: a
+// negative or unknown descriptor is EBADF, and one that names no vnode, such
+// as a pipe or socket, is ENOTSUP. VNOP_FSYNC then asks the file system to
+// move the file to stable storage: MNT_WAIT for fsync and fsync_nocancel,
+// and for fdatasync MNT_DWAIT, which needs only the data and the metadata
+// that retrieving it depends on. A character device such as a terminal
+// keeps no buffered data, so spec_fsync succeeds without writing anything.
+// No guest memory is read or written, and success always returns 0.
+constexpr std::uint64_t kDarwinSysFsync = 95;
+constexpr std::uint64_t kDarwinSysFdatasync = 187;
+constexpr std::uint64_t kDarwinSysFsyncNocancel = 408;
 constexpr std::uint32_t kDarwinErrnoEperm = 1;
 constexpr std::uint32_t kDarwinErrnoEio = 5;
 constexpr std::uint32_t kDarwinErrnoEnxio = 6;
@@ -284,6 +299,7 @@ constexpr std::uint32_t kDarwinErrnoEoverflow = 84;
 constexpr std::uint32_t kDarwinErrnoEnotty = 25;
 constexpr std::uint32_t kDarwinErrnoEfault = 14;
 constexpr std::uint32_t kDarwinErrnoEnosys = 78;
+constexpr std::uint32_t kDarwinErrnoEnotsup = 45;
 
 // Synthetic POSIX credentials for a translated process: an ordinary,
 // non-setugid macOS login user (uid 501, gid 20 "staff") whose parent is
@@ -578,6 +594,18 @@ struct HostSetNoSigpipeResult {
 // error without raising SIGPIPE.
 struct HostNoSigpipeResult {
     bool no_sigpipe{};
+    std::uint32_t error{};
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return error == 0;
+    }
+};
+
+// Outcome of moving the file behind descriptor fd to stable storage for
+// fsync(2), fsync_nocancel and fdatasync(2), as fsync_common does. EBADF
+// means the guest does not have fd open and ENOTSUP that fd names no vnode;
+// any other error is the file system's own and leaves fd open.
+struct HostSyncResult {
     std::uint32_t error{};
 
     [[nodiscard]] explicit operator bool() const noexcept {
@@ -882,6 +910,21 @@ public:
     [[nodiscard]] virtual HostNoSigpipeResult no_sigpipe(std::int32_t fd) {
         static_cast<void>(fd);
         return {false, kDarwinErrnoEbadf};
+    }
+
+    // Move the file behind descriptor fd to stable storage for fsync(2),
+    // fsync_nocancel and fdatasync(2). data_only asks for the MNT_DWAIT
+    // flush fdatasync makes instead of the full MNT_WAIT one. The host
+    // reports EBADF for a descriptor the guest does not have open, ENOTSUP
+    // for one that names no vnode, or the file system's own error, which
+    // leaves fd open. Hosts that do not override this report EBADF, never a
+    // fabricated success.
+    [[nodiscard]] virtual HostSyncResult synchronize_file(
+        std::int32_t fd,
+        bool data_only) {
+        static_cast<void>(fd);
+        static_cast<void>(data_only);
+        return {kDarwinErrnoEbadf};
     }
 };
 
