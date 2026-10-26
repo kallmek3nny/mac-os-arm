@@ -1176,6 +1176,51 @@ struct DescriptorFlagsHost final : macosarm::DarwinHostServices {
         return {0, macosarm::kDarwinErrnoEmfile};
     }
 
+    // fcntl(2) F_SETNOSIGPIPE and F_GETNOSIGPIPE. Descriptors listed in
+    // no_sigpipe_fds have FG_NOSIGPIPE set. A nonzero no_sigpipe_error fails
+    // the next set_no_sigpipe call once, leaving the flag unchanged. Every
+    // update and query is recorded in call order.
+    struct NoSigpipeUpdate {
+        std::int32_t fd{};
+        bool enabled{};
+
+        friend bool operator==(const NoSigpipeUpdate&, const NoSigpipeUpdate&) = default;
+    };
+
+    std::vector<std::int32_t> no_sigpipe_fds;
+    std::uint32_t no_sigpipe_error{};
+    std::vector<NoSigpipeUpdate> no_sigpipe_updates;
+    std::vector<std::int32_t> no_sigpipe_queries;
+
+    macosarm::HostSetNoSigpipeResult set_no_sigpipe(
+        std::int32_t fd,
+        bool enabled) override {
+        no_sigpipe_updates.push_back({fd, enabled});
+        if (find(fd) == nullptr) {
+            return {macosarm::kDarwinErrnoEbadf};
+        }
+        if (no_sigpipe_error != 0) {
+            return {take(no_sigpipe_error)};
+        }
+        const auto found = std::find(no_sigpipe_fds.begin(), no_sigpipe_fds.end(), fd);
+        if (enabled && found == no_sigpipe_fds.end()) {
+            no_sigpipe_fds.push_back(fd);
+        } else if (!enabled && found != no_sigpipe_fds.end()) {
+            no_sigpipe_fds.erase(found);
+        }
+        return {0};
+    }
+
+    macosarm::HostNoSigpipeResult no_sigpipe(std::int32_t fd) override {
+        no_sigpipe_queries.push_back(fd);
+        if (find(fd) == nullptr) {
+            return {false, macosarm::kDarwinErrnoEbadf};
+        }
+        const bool enabled =
+            std::find(no_sigpipe_fds.begin(), no_sigpipe_fds.end(), fd) != no_sigpipe_fds.end();
+        return {enabled, 0};
+    }
+
     // True when descriptor fd is scripted with exactly this close-on-exec flag.
     [[nodiscard]] bool close_on_exec_is(std::int32_t fd, bool expected) noexcept {
         const Descriptor* entry = find(fd);
@@ -5305,6 +5350,100 @@ int main() {
                                     macosarm::kDarwinFcntlDupfd, 255U));
         expect(!carry_is_set(state) && state.x[0] == 255U && host.close_on_exec_is(255, false),
                "fcntl F_DUPFD accepts a minimum just below the soft RLIMIT_NOFILE limit");
+    }
+
+    {
+        // fcntl(2) F_SETNOSIGPIPE sets the open file description's
+        // FG_NOSIGPIPE flag while the int low half of arg is nonzero and
+        // clears it otherwise, returning 0. F_GETNOSIGPIPE ignores arg and
+        // reports 1 while the flag is set and 0 otherwise. fcntl and
+        // fcntl_nocancel share one handler, and only w0 and w1 count.
+        using NoSigpipeUpdate = DescriptorFlagsHost::NoSigpipeUpdate;
+        macosarm::GuestAddressSpace vm;
+        macosarm::CpuState state{};
+        DescriptorFlagsHost host;
+        host.descriptors = {
+            {1, false, macosarm::kDarwinOpenWriteOnly},
+            {2, false, macosarm::kDarwinOpenWriteOnly | macosarm::kDarwinOpenAppend},
+        };
+
+        const auto initial =
+            run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl, 1U,
+                      macosarm::kDarwinFcntlGetnosigpipe, 0xFFFFFFFFFFFFFFFFULL);
+        expect(static_cast<bool>(initial) && !carry_is_set(state) && state.x[0] == 0U &&
+                   initial.syscall_number == macosarm::kDarwinSysFcntl &&
+                   (host.no_sigpipe_queries == std::vector<std::int32_t>{1}) &&
+                   host.no_sigpipe_updates.empty(),
+               "fcntl F_GETNOSIGPIPE ignores arg and reports 0 while FG_NOSIGPIPE is clear");
+
+        const auto enabled = run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl, 1U,
+                                       macosarm::kDarwinFcntlSetnosigpipe, 2U);
+        expect(static_cast<bool>(enabled) && !carry_is_set(state) && state.x[0] == 0U &&
+                   (host.no_sigpipe_updates == std::vector<NoSigpipeUpdate>{{1, true}}),
+               "fcntl F_SETNOSIGPIPE with any nonzero arg sets FG_NOSIGPIPE and returns 0");
+
+        static_cast<void>(run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl, 1U,
+                                    macosarm::kDarwinFcntlGetnosigpipe, 0U));
+        expect(!carry_is_set(state) && state.x[0] == 1U,
+               "fcntl F_GETNOSIGPIPE reports 1 while FG_NOSIGPIPE is set");
+
+        static_cast<void>(run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl, 2U,
+                                    macosarm::kDarwinFcntlGetnosigpipe, 0U));
+        expect(!carry_is_set(state) && state.x[0] == 0U,
+               "F_SETNOSIGPIPE leaves another open file description's flag clear");
+
+        // A nonzero high half with a zero int low half still clears the flag.
+        host.no_sigpipe_updates.clear();
+        const auto cleared =
+            run_fcntl(vm, host, state, macosarm::kDarwinSysFcntlNocancel, 0xFFFFFFFF00000001ULL,
+                      0xFFFFFFFF00000000ULL | macosarm::kDarwinFcntlSetnosigpipe,
+                      0xFFFFFFFF00000000ULL);
+        expect(static_cast<bool>(cleared) && !carry_is_set(state) && state.x[0] == 0U &&
+                   cleared.syscall_number == macosarm::kDarwinSysFcntlNocancel &&
+                   (host.no_sigpipe_updates == std::vector<NoSigpipeUpdate>{{1, false}}),
+               "fcntl_nocancel F_SETNOSIGPIPE reads only w0, w1 and the int low half of arg");
+
+        static_cast<void>(run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl, 1U,
+                                    macosarm::kDarwinFcntlGetnosigpipe, 1U));
+        expect(!carry_is_set(state) && state.x[0] == 0U,
+               "fcntl F_GETNOSIGPIPE reports 0 again once FG_NOSIGPIPE is cleared");
+    }
+
+    {
+        // F_SETNOSIGPIPE and F_GETNOSIGPIPE resolve the descriptor first: a
+        // negative fd is EBADF without asking the host, and an unknown one is
+        // the host's EBADF before the flag is touched. A host failure is
+        // reported and leaves FG_NOSIGPIPE unchanged.
+        using NoSigpipeUpdate = DescriptorFlagsHost::NoSigpipeUpdate;
+        macosarm::GuestAddressSpace vm;
+        macosarm::CpuState state{};
+        DescriptorFlagsHost host;
+        host.descriptors = {{2, false, macosarm::kDarwinOpenWriteOnly}};
+
+        static_cast<void>(run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl, 0xFFFFFFFFU,
+                                    macosarm::kDarwinFcntlSetnosigpipe, 1U));
+        expect(fcntl_failed_with(state, macosarm::kDarwinErrnoEbadf) && host.described.empty() &&
+                   host.no_sigpipe_updates.empty(),
+               "fcntl F_SETNOSIGPIPE on a negative descriptor reports EBADF without the host");
+
+        static_cast<void>(run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl, 9U,
+                                    macosarm::kDarwinFcntlGetnosigpipe, 0U));
+        expect(fcntl_failed_with(state, macosarm::kDarwinErrnoEbadf) &&
+                   (host.described == std::vector<std::int32_t>{9}) &&
+                   host.no_sigpipe_queries.empty(),
+               "fcntl F_GETNOSIGPIPE on an unknown descriptor reports EBADF before the query");
+
+        host.no_sigpipe_error = macosarm::kDarwinErrnoEio;
+        static_cast<void>(run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl, 2U,
+                                    macosarm::kDarwinFcntlSetnosigpipe, 1U));
+        expect(fcntl_failed_with(state, macosarm::kDarwinErrnoEio) &&
+                   (host.no_sigpipe_updates == std::vector<NoSigpipeUpdate>{{2, true}}),
+               "a host F_SETNOSIGPIPE failure is reported to the guest");
+
+        static_cast<void>(run_fcntl(vm, host, state, macosarm::kDarwinSysFcntl, 2U,
+                                    macosarm::kDarwinFcntlGetnosigpipe, 0U));
+        expect(!carry_is_set(state) && state.x[0] == 0U,
+               "a failed F_SETNOSIGPIPE leaves FG_NOSIGPIPE clear");
     }
 
     if (failures != 0) {

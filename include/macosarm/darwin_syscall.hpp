@@ -234,8 +234,13 @@ constexpr std::uint64_t kDarwinSysDup2 = 90;
 // below the limit, and finishdup points it at fd's open file description
 // with its own close-on-exec flag set only for F_DUPFD_CLOEXEC; the
 // duplicate is returned in x0. Guarded descriptors are not modeled, so
-// GUARD_DUP never applies. Every other command reports ENOSYS once the
-// descriptor resolves, never a fabricated success.
+// GUARD_DUP never applies. F_SETNOSIGPIPE reads only the int low half of
+// arg and sets the open file description's FG_NOSIGPIPE flag while it is
+// nonzero, clearing the flag otherwise, so every descriptor naming that
+// description sees the change; F_GETNOSIGPIPE returns 1 while the flag is
+// set and 0 otherwise. Sockets, which keep SO_NOSIGPIPE instead, are not
+// modeled. Every other command reports ENOSYS once the descriptor
+// resolves, never a fabricated success.
 constexpr std::uint64_t kDarwinSysFcntl = 92;
 constexpr std::uint64_t kDarwinSysFcntlNocancel = 406;
 constexpr std::uint32_t kDarwinFcntlDupfd = 0; // F_DUPFD
@@ -244,6 +249,8 @@ constexpr std::uint32_t kDarwinFcntlSetfd = 2; // F_SETFD
 constexpr std::uint32_t kDarwinFcntlGetfl = 3; // F_GETFL
 constexpr std::uint32_t kDarwinFcntlSetfl = 4; // F_SETFL
 constexpr std::uint32_t kDarwinFcntlDupfdCloexec = 67; // F_DUPFD_CLOEXEC
+constexpr std::uint32_t kDarwinFcntlSetnosigpipe = 73; // F_SETNOSIGPIPE
+constexpr std::uint32_t kDarwinFcntlGetnosigpipe = 74; // F_GETNOSIGPIPE
 constexpr std::uint32_t kDarwinFdCloexec = 1;  // FD_CLOEXEC
 // XNU bsd/sys/fcntl.h status flags F_GETFL can report: an access mode plus
 // FMASK's O_NONBLOCK, O_APPEND, O_ASYNC, O_FSYNC and O_DSYNC.
@@ -555,6 +562,29 @@ struct HostFileModeResult {
     }
 };
 
+// Outcome of setting or clearing the FG_NOSIGPIPE flag of descriptor fd's
+// open file description for fcntl(2) F_SETNOSIGPIPE. On error the flag stays
+// unchanged.
+struct HostSetNoSigpipeResult {
+    std::uint32_t error{};
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return error == 0;
+    }
+};
+
+// FG_NOSIGPIPE state of descriptor fd's open file description for fcntl(2)
+// F_GETNOSIGPIPE. While it is set, a write that fails with EPIPE reports the
+// error without raising SIGPIPE.
+struct HostNoSigpipeResult {
+    bool no_sigpipe{};
+    std::uint32_t error{};
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return error == 0;
+    }
+};
+
 class DarwinHostServices {
 public:
     virtual ~DarwinHostServices() = default;
@@ -831,6 +861,27 @@ public:
         static_cast<void>(fd);
         static_cast<void>(asynchronous);
         return {kDarwinErrnoEbadf};
+    }
+
+    // Set (enabled true) or clear the FG_NOSIGPIPE flag of the open file
+    // description behind descriptor fd, as fcntl(2) F_SETNOSIGPIPE does. The
+    // flag belongs to the description, so every descriptor naming it sees the
+    // change, and on error it stays unchanged. Hosts that do not override
+    // this report EBADF, never a fabricated success.
+    [[nodiscard]] virtual HostSetNoSigpipeResult set_no_sigpipe(
+        std::int32_t fd,
+        bool enabled) {
+        static_cast<void>(fd);
+        static_cast<void>(enabled);
+        return {kDarwinErrnoEbadf};
+    }
+
+    // Report the FG_NOSIGPIPE flag of the open file description behind
+    // descriptor fd for fcntl(2) F_GETNOSIGPIPE. Hosts that do not override
+    // this report EBADF, never a fabricated success.
+    [[nodiscard]] virtual HostNoSigpipeResult no_sigpipe(std::int32_t fd) {
+        static_cast<void>(fd);
+        return {false, kDarwinErrnoEbadf};
     }
 };
 

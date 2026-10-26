@@ -1098,12 +1098,14 @@ void set_error(CpuState& state, std::uint32_t error) noexcept {
 // XNU bsd/kern/kern_descrip.c: sys_fcntl_nocancel(fd, cmd, arg) resolves fd
 // through fp_lookup before it looks at cmd, so a negative or unknown
 // descriptor reports EBADF for every command. Only F_DUPFD, F_GETFD,
-// F_SETFD, F_GETFL, F_SETFL and F_DUPFD_CLOEXEC are modeled; any other
-// command reports ENOSYS once the descriptor resolves, never a fabricated
-// success. The host supplies only the descriptor's close-on-exec flag,
-// OFLAGS(f_flag) and the soft RLIMIT_NOFILE limit, applies the changes
-// F_SETFD and F_SETFL ask for and allocates the duplicate F_DUPFD and
-// F_DUPFD_CLOEXEC ask for; the dispatcher validates the flags, the limit
+// F_SETFD, F_GETFL, F_SETFL, F_DUPFD_CLOEXEC, F_SETNOSIGPIPE and
+// F_GETNOSIGPIPE are modeled; any other command reports ENOSYS once the
+// descriptor resolves, never a fabricated success. The host supplies only
+// the descriptor's close-on-exec flag, OFLAGS(f_flag), the open file
+// description's FG_NOSIGPIPE flag and the soft RLIMIT_NOFILE limit, applies
+// the changes F_SETFD, F_SETFL and F_SETNOSIGPIPE ask for and allocates the
+// duplicate F_DUPFD and F_DUPFD_CLOEXEC ask for; the dispatcher validates
+// the flags, the limit
 // and the duplicate, computes every new flag word and encodes every result
 // itself.
 [[nodiscard]] SyscallDispatchResult dispatch_fcntl(
@@ -1249,6 +1251,31 @@ void set_error(CpuState& state, std::uint32_t error) noexcept {
                 SyscallAction::resume, syscall_number, 0};
         }
         set_success(state, static_cast<std::uint64_t>(duplicated.descriptor));
+        return finish();
+    }
+    case kDarwinFcntlSetnosigpipe: {
+        // tmp = CAST_DOWN_EXPLICIT(int, arg): only the int low half of arg
+        // is read, and any nonzero value sets FG_NOSIGPIPE. Sockets, which
+        // keep SO_NOSIGPIPE instead, are not modeled, so the flag always
+        // belongs to the open file description and every descriptor naming
+        // it sees the change.
+        const HostSetNoSigpipeResult updated =
+            host.set_no_sigpipe(fd, static_cast<std::uint32_t>(argument) != 0U);
+        if (!updated) {
+            set_error(state, updated.error);
+            return finish();
+        }
+        set_success(state, 0U);
+        return finish();
+    }
+    case kDarwinFcntlGetnosigpipe: {
+        // *retval = (fg_lflags & FG_NOSIGPIPE) ? 1 : 0; arg is ignored.
+        const HostNoSigpipeResult current = host.no_sigpipe(fd);
+        if (!current) {
+            set_error(state, current.error);
+            return finish();
+        }
+        set_success(state, current.no_sigpipe ? 1U : 0U);
         return finish();
     }
     default:
