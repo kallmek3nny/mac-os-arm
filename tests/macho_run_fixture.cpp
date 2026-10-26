@@ -1255,13 +1255,101 @@ constexpr std::array<std::uint32_t, 93> kFcntlNosigpipeStdioCode{
     0xd4001001U, // svc #0x80
 };
 
+// fsync(1); fdatasync(1); copy = dup(1); fsync_nocancel(copy); fsync(2);
+// close(copy); fdatasync(copy); write(1, "hello", 5);
+// exit(copy << 6 | errno). This fixture runs with stdout redirected to a
+// regular file, which fsync(2) and fdatasync(2) flush through the host, so
+// both succeed with 0, and fsync_nocancel succeeds through the dup(2) copy
+// that names the same file. stderr reaches the test through a pipe or
+// socket, which names no vnode, so fsync(2) on it fails with ENOTSUP (45),
+// and once the guest closes the copy fdatasync on it fails with EBADF (9).
+// copy is 3, the lowest free descriptor, the host stdout file holds "hello"
+// and a correct host exits 237. A failed or nonzero fsync or fdatasync on
+// stdout, a failed dup, a failed or nonzero fsync_nocancel on the copy, an
+// fsync on stderr that succeeds, a failed close, an fdatasync on the closed
+// copy that succeeds or fails with any errno but EBADF, or a failed or short
+// write exits 100 to 107 instead. copy and the errno are kept in x19 and x20
+// across the later calls.
+constexpr std::array<std::uint32_t, 70> kFsyncStdioCode{
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd2800bf0U, // mov x16, #95 (fsync)
+    0xd4001001U, // svc #0x80
+    0x54000562U, // b.cs stdout_fsync_failed (+172)
+    0xb5000540U, // cbnz x0, stdout_fsync_failed (+168)
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd2801770U, // mov x16, #187 (fdatasync)
+    0xd4001001U, // svc #0x80
+    0x54000522U, // b.cs stdout_fdatasync_failed (+164)
+    0xb5000500U, // cbnz x0, stdout_fdatasync_failed (+160)
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd2800530U, // mov x16, #41 (dup)
+    0xd4001001U, // svc #0x80
+    0x540004e2U, // b.cs dup_failed (+156)
+    0xaa0003f3U, // mov x19, x0 -> copy
+    0xd2803310U, // mov x16, #408 (fsync_nocancel), x0 is still copy
+    0xd4001001U, // svc #0x80
+    0x540004c2U, // b.cs copy_fsync_failed (+152)
+    0xb50004a0U, // cbnz x0, copy_fsync_failed (+148)
+    0xd2800040U, // mov x0, #2 (stderr)
+    0xd2800bf0U, // mov x16, #95 (fsync)
+    0xd4001001U, // svc #0x80
+    0x54000483U, // b.cc stderr_fsync_succeeded (+144)
+    0xaa0003f4U, // mov x20, x0 -> errno
+    0xaa1303e0U, // mov x0, x19 (copy)
+    0xd28000d0U, // mov x16, #6 (close)
+    0xd4001001U, // svc #0x80
+    0x54000442U, // b.cs close_failed (+136)
+    0xaa1303e0U, // mov x0, x19 (copy)
+    0xd2801770U, // mov x16, #187 (fdatasync)
+    0xd4001001U, // svc #0x80
+    0x54000423U, // b.cc closed_sync_wrong (+132)
+    0xf100241fU, // cmp x0, #9 (EBADF)
+    0x540003e1U, // b.ne closed_sync_wrong (+124)
+    0xd2800020U, // mov x0, #1 (stdout)
+    0xd2880001U, // mov x1, #0x4000
+    0xf2c00021U, // movk x1, #1, lsl #32 -> "hello" at 0x100004000
+    0xd28000a2U, // mov x2, #5
+    0xd2800090U, // mov x16, #4 (write)
+    0xd4001001U, // svc #0x80
+    0x54000362U, // b.cs write_failed (+108)
+    0xf100141fU, // cmp x0, #5
+    0x54000321U, // b.ne write_failed (+100)
+    0xaa131a80U, // orr x0, x20, x19, lsl #6 -> copy << 6 | errno
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800c80U, // stdout_fsync_failed: mov x0, #100
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800ca0U, // stdout_fdatasync_failed: mov x0, #101
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800cc0U, // dup_failed: mov x0, #102
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800ce0U, // copy_fsync_failed: mov x0, #103
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800d00U, // stderr_fsync_succeeded: mov x0, #104
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800d20U, // close_failed: mov x0, #105
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800d40U, // closed_sync_wrong: mov x0, #106
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+    0xd2800d60U, // write_failed: mov x0, #107
+    0xd2800030U, // mov x16, #1 (exit)
+    0xd4001001U, // svc #0x80
+};
+
 int usage() {
     std::cerr << "usage: macho_run_fixture "
                  "<hello|argc|echo|close-stdout|fstat-stdin|ioctl-stdin|writev-stdout|"
                  "readv-stdin|lseek-stdin|pread-stdin|fcntl-stdio|fcntl-setfl-stdio|"
                  "getrlimit-stack|setrlimit-stack|getdtablesize|dup-stdout|dup2-stdout|"
                  "fcntl-dupfd-stdout|ioctl-fioclex-stdio|ioctl-fionbio-stdio|"
-                 "fcntl-nosigpipe-stdio> "
+                 "fcntl-nosigpipe-stdio|fsync-stdio> "
                  "<output-path>\n";
     return 2;
 }
@@ -1316,6 +1404,8 @@ int main(int argc, char** argv) {
         bytes = image(kIoctlFionbioStdioCode);
     } else if (kind == "fcntl-nosigpipe-stdio") {
         bytes = image(kFcntlNosigpipeStdioCode);
+    } else if (kind == "fsync-stdio") {
+        bytes = image(kFsyncStdioCode);
     } else {
         return usage();
     }

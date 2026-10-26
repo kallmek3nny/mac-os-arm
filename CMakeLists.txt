@@ -651,6 +651,28 @@ if(BUILD_TESTING)
                 -DEXPECTED_EXIT=121
                 -DEXPECTED_STDOUT=hello
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
+
+        # fsync(2), fsync_nocancel and fdatasync(2) end to end: with stdout
+        # redirected to a regular file, fsync(1) and fdatasync(1) flush it
+        # through the host and succeed with 0, as does fsync_nocancel through
+        # the dup(2) copy, 3, that names the same file. stderr reaches
+        # macho_run_check.cmake through a pipe or socket, neither of which
+        # names a vnode, so fsync(2) on it fails with ENOTSUP (45), and once
+        # the guest closes the copy fdatasync on it fails with EBADF (9). The
+        # guest writes "hello" and exits with copy << 6 | the ENOTSUP errno,
+        # so a correct host exits 237; a failed call or wrong result along the
+        # way exits 100 to 107 instead.
+        add_test(
+            NAME macho-run-fsync-stdio
+            COMMAND "${CMAKE_COMMAND}"
+                "-DFIXTURE_TOOL=$<TARGET_FILE:macho_run_fixture>"
+                "-DRUNNER=$<TARGET_FILE:macho-run>"
+                -DKIND=fsync-stdio
+                "-DIMAGE=${CMAKE_CURRENT_BINARY_DIR}/macho-run-fsync-stdio.bin"
+                -DSTDOUT_TO_FILE=ON
+                -DEXPECTED_EXIT=237
+                -DEXPECTED_STDOUT=hello
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/macho_run_check.cmake")
     endif()
 endif()
 

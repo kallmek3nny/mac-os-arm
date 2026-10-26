@@ -330,6 +330,38 @@ std::int64_t write_host_stream_at(
 #endif
 }
 
+// Move the file behind standard stream fd (0, 1 or 2) to stable storage for
+// fsync(2), fsync_nocancel and fdatasync(2), reporting whether the host
+// managed it. stdout and stderr flush their host C stream first, though
+// write(2) already flushes after every guest write, so nothing the guest
+// wrote can stay behind in stdio. stdin is never written through, and
+// fflush on an input stream is undefined, so it goes straight to the host.
+// data_only asks for fdatasync(2)'s data-only flush where the host has one;
+// elsewhere the full flush, which covers it, runs instead.
+bool sync_host_stream(std::int32_t fd, bool data_only) noexcept {
+    if (fd < 0 || fd > 2) {
+        return false;
+    }
+    if (fd != 0 && std::fflush(host_stream(fd)) != 0) {
+        return false;
+    }
+#if defined(_WIN32)
+    static_cast<void>(data_only);
+    constexpr DWORD kStandardHandles[] = {STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE};
+    const HANDLE handle = ::GetStdHandle(kStandardHandles[static_cast<std::size_t>(fd)]);
+    // FlushFileBuffers needs write access, so a stdin handle opened only for
+    // reading fails here rather than reporting a flush that never happened.
+    return handle != nullptr && handle != INVALID_HANDLE_VALUE && ::FlushFileBuffers(handle) != 0;
+#elif defined(__APPLE__)
+    // The macOS SDK declares no fdatasync, so the full fsync, which covers
+    // it, runs for both.
+    static_cast<void>(data_only);
+    return ::fsync(fd) == 0;
+#else
+    return (data_only ? ::fdatasync(fd) : ::fsync(fd)) == 0;
+#endif
+}
+
 // The guest's stdin, stdout and stderr reach the host's, as raw bytes. Each
 // open guest descriptor names one of those three host streams: the guest
 // starts with descriptors 0, 1 and 2 naming them in order, and dup(2) and
@@ -754,6 +786,39 @@ public:
             return {false, kGuestErrnoEbadf};
         }
         return {no_sigpipe_.at(static_cast<std::size_t>(stream)), 0};
+    }
+
+    // fsync(2), fsync_nocancel and fdatasync(2), as fsync_common does: a
+    // descriptor the guest does not have open reports EBADF. fp_getfvp
+    // accepts only a vnode, so a standard stream backed by a pipe or socket
+    // reports ENOTSUP. A terminal is a character device, whose VNOP_FSYNC
+    // succeeds without flushing anything, so it reports success without
+    // asking the host, which may refuse to sync a terminal. A regular file,
+    // directory or block device is flushed through the host, data_only
+    // choosing fdatasync(2)'s data-only flush, and a host failure reports
+    // EIO, leaving the descriptor open. A stream the host cannot classify
+    // names no file the host could flush, so it reports EIO too rather than
+    // a fabricated success.
+    macosarm::HostSyncResult synchronize_file(
+        std::int32_t fd,
+        bool data_only) override {
+        const std::int32_t stream = stream_of(fd);
+        if (stream < 0) {
+            return {kGuestErrnoEbadf};
+        }
+        switch (host_stream_type(stream)) {
+        case macosarm::kDarwinModeFifo:
+        case macosarm::kDarwinModeSocket:
+            return {kGuestErrnoEnotsup};
+        case macosarm::kDarwinModeCharDevice:
+            return {0};
+        case macosarm::kDarwinModeRegular:
+        case macosarm::kDarwinModeDirectory:
+        case macosarm::kDarwinModeBlockDevice:
+            return {sync_host_stream(stream, data_only) ? 0U : kGuestErrnoEio};
+        default:
+            return {kGuestErrnoEio};
+        }
     }
 
     // Like a canonical-mode terminal read, return after a newline, a full
