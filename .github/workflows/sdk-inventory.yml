@@ -14,7 +14,7 @@ permissions:
 jobs:
   inventory:
     runs-on: xcode-27
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7.0.1
       - name: install the pinned TBD parser
@@ -24,7 +24,7 @@ jobs:
         timeout-minutes: 2
       - name: inventory installed Apple SDK definitions
         run: '"$RUNNER_TEMP/sdk-inventory-python/bin/python" tools/inventory_sdk.py --sdk-major 27 --output build/sdk-inventory.json'
-        timeout-minutes: 5
+        timeout-minutes: 10
       - uses: actions/upload-artifact@v7.0.2
         with:
           name: macos-sdk-inventory

@@ -11,7 +11,7 @@ import subprocess
 import yaml
 
 
-class TbdLoader(yaml.CSafeLoader):
+class TbdLoader(getattr(yaml, "CSafeLoader", yaml.SafeLoader)):
     pass
 
 
@@ -53,6 +53,8 @@ def main():
     version = settings["Version"]
     if int(version.split(".")[0]) != args.sdk_major:
         raise ValueError(f"Expected macOS {args.sdk_major} SDK, found {version}")
+    print(json.dumps({"sdk_version": version, "xcode": command("xcodebuild", "-version"),
+                      "host": command("sw_vers")}), flush=True)
     libraries = {}
     files = sorted({path.resolve() for path in sdk.rglob("*.tbd") if path.is_file()})
     key_counts = Counter()
