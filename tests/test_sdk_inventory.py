@@ -69,6 +69,25 @@ exports:
             with self.assertRaisesRegex(ValueError, "Uncounted export keys"):
                 collect_libraries(root)
 
+    def test_symlinked_sdk_roots_record_paths_relative_to_the_resolved_root(self):
+        """macOS reaches temporary and SDK folders through links such as /var -> /private/var."""
+        with tempfile.TemporaryDirectory() as folder:
+            real = Path(folder) / "real"
+            (real / "usr/lib").mkdir(parents=True)
+            (real / "usr/lib/libLinked.tbd").write_text(
+                "--- !tapi-tbd\ntbd-version: 4\ntargets: [ arm64-macos ]\n"
+                "install-name: /usr/lib/libLinked.dylib\nexports:\n"
+                "  - targets: [ arm64-macos ]\n    symbols: [ _linked ]\n...\n")
+            link = Path(folder) / "link"
+            try:
+                link.symlink_to(real, target_is_directory=True)
+            except (OSError, NotImplementedError) as error:
+                self.skipTest(f"directory symlinks are unavailable: {error}")
+            records, full, count, _ = collect_libraries(link)
+            self.assertEqual(count, 1)
+            self.assertEqual(records[0]["sources"][0]["path"], str(Path("usr/lib/libLinked.tbd")))
+            self.assertEqual(full, [{"install_name": "/usr/lib/libLinked.dylib", "symbols": ["_linked"]}])
+
 
 if __name__ == "__main__":
     unittest.main()
