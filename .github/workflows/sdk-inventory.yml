@@ -13,15 +13,22 @@ permissions:
 
 jobs:
   inventory:
-    runs-on: macos-latest
+    runs-on: xcode-27
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
+      - name: install the pinned TBD parser
+        run: |
+          python3 -m venv "$RUNNER_TEMP/sdk-inventory-python"
+          "$RUNNER_TEMP/sdk-inventory-python/bin/python" -m pip install PyYAML==6.0.3
+        timeout-minutes: 2
       - name: inventory installed Apple SDK definitions
-        run: python3 tools/inventory_sdk.py --output build/sdk-inventory.json
+        run: '"$RUNNER_TEMP/sdk-inventory-python/bin/python" tools/inventory_sdk.py --sdk-major 27 --output build/sdk-inventory.json'
         timeout-minutes: 5
       - uses: actions/upload-artifact@v7.0.2
         with:
           name: macos-sdk-inventory
-          path: build/sdk-inventory.json
+          path: |
+            build/sdk-inventory.json
+            build/sdk-symbols.json.gz
           retention-days: 90
