@@ -77,6 +77,7 @@ def tapi_yaml(content):
 
 
 def collect_libraries(sdk):
+    sdk = sdk.resolve()
     libraries = {}
     files = sorted({path.resolve() for path in sdk.rglob("*.tbd") if path.is_file()})
     key_counts = Counter()

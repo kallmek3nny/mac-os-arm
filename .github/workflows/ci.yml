@@ -26,6 +26,10 @@ jobs:
         if: runner.os == 'Linux'
         run: python3 tools/render_status.py --check
         timeout-minutes: 1
+      - name: test reference-derived SDK coverage classification
+        if: runner.os == 'Linux'
+        run: python3 -m unittest discover -s tests -p test_measure_coverage.py -v
+        timeout-minutes: 1
 
   dynarmic-jit:
     runs-on: ubuntu-latest

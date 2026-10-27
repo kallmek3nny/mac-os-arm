@@ -7,7 +7,9 @@ on:
     paths:
       - .github/workflows/sdk-inventory.yml
       - tools/inventory_sdk.py
+      - tools/measure_coverage.py
       - tests/test_sdk_inventory.py
+      - tests/test_measure_coverage.py
 
 permissions:
   contents: read
@@ -15,7 +17,7 @@ permissions:
 jobs:
   inventory:
     runs-on: xcode-27
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: actions/setup-python@v7.1.0
@@ -29,13 +31,21 @@ jobs:
       - name: test architecture filters and exact symbol counting
         run: '"$RUNNER_TEMP/sdk-inventory-python/bin/python" -m unittest discover -s tests -p test_sdk_inventory.py -v'
         timeout-minutes: 1
+      - name: test reference-derived coverage classification
+        run: '"$RUNNER_TEMP/sdk-inventory-python/bin/python" -m unittest discover -s tests -p test_measure_coverage.py -v'
+        timeout-minutes: 1
       - name: inventory installed Apple SDK definitions
         run: '"$RUNNER_TEMP/sdk-inventory-python/bin/python" tools/inventory_sdk.py --sdk-major 27 --output build/sdk-inventory.json'
         timeout-minutes: 10
+      - name: classify runtime paths against the SDK reference
+        run: '"$RUNNER_TEMP/sdk-inventory-python/bin/python" tools/measure_coverage.py --reference build/sdk-inventory.json --output build/sdk-coverage.json'
+        timeout-minutes: 2
       - uses: actions/upload-artifact@v7.0.2
+        if: ${{ !cancelled() }}
         with:
           name: macos-sdk-inventory
           path: |
             build/sdk-inventory.json
             build/sdk-symbols.json.gz
+            build/sdk-coverage.json
           retention-days: 90
