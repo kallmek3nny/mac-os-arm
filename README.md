@@ -2,6 +2,12 @@
 
 Experimental ARM64/ARM64e macOS userspace rehosting and translation research for x86_64 macOS hosts. This project is separate from [`kallmek3nny/mac-os`](https://github.com/kallmek3nny/mac-os), which handles GPU/driver research.
 
+## Status
+
+[![Capability checklist and full test-suite status](docs/assets/status.svg)](docs/PROGRESS.md)
+
+The graphic tracks explicitly defined capabilities and a dated full test run. Its checklist percentage measures the [listed fixture/model checks](docs/PROGRESS.md), not overall macOS or real-application compatibility. Click it for the evidence, pending milestones and update instructions.
+
 ## current state (through phase 82)
 
 The runtime contains an ARM64 Mach-O loader and memory model, dyld dependency/symbol/fixup machinery, a model of selected Darwin BSD syscalls and Mach traps, thread-startup and guest TLS scaffolding, and optional Dynarmic ARM64 execution. Recent work adds executable-memory JIT invalidation, synthetic BSD process credentials, a small `macho-run` CLI, guest stdin read support, and non-canceling read/write syscall aliases. Phases 62–82 additionally cover selected time, entropy, descriptor lifecycle, stat, ioctl, vectored/positional I/O, resource-limit, duplication and sync syscalls, with bounded guest execution tests.

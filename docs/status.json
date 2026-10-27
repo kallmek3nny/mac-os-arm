@@ -1,0 +1,524 @@
+{
+  "verified_date": "2026-10-26",
+  "source_revision": "9fc67572c602c205fc2b8c196b2d0336aae1e361",
+  "platform": "Windows x86_64, GCC 16.1, Release",
+  "core_test_count": 21,
+  "ci_url": "https://github.com/kallmek3nny/mac-os-arm/actions/runs/40256796551",
+  "tests": [
+    "macho-parser",
+    "guest-address-space",
+    "image-loader",
+    "dyld-path-resolution",
+    "dyld-dependency-planning",
+    "dyld-exports-trie",
+    "dyld-loaded-image-graph",
+    "dyld-symbol-resolution",
+    "dyld-chained-fixups-metadata",
+    "dyld-generic-chained-fixup-apply",
+    "dyld-arm64e-chained-fixup-apply",
+    "dyld-authenticated-arm64e-fixup-apply",
+    "pointer-auth-policy",
+    "parse-load-integration",
+    "execution-contract",
+    "darwin-syscall-dispatch",
+    "mach-trap-dispatch",
+    "mach-msg-transport",
+    "process-runner",
+    "macho-session-bootstrap",
+    "dynarmic-arm64-jit",
+    "raw-macho-dynarmic-session",
+    "raw-macho-dynarmic-session-program-vars",
+    "dynarmic-mach-msg-transport",
+    "macho-run-hello-exit-status",
+    "macho-run-guest-argc",
+    "macho-run-stdin-echo",
+    "macho-run-stdin-eof",
+    "macho-run-close-stdout",
+    "macho-run-fstat-stdin",
+    "macho-run-ioctl-stdin",
+    "macho-run-writev-stdout",
+    "macho-run-readv-stdin",
+    "macho-run-lseek-stdin",
+    "macho-run-pread-stdin",
+    "macho-run-fcntl-stdio",
+    "macho-run-fcntl-setfl-stdio",
+    "macho-run-getrlimit-stack",
+    "macho-run-setrlimit-stack",
+    "macho-run-getdtablesize",
+    "macho-run-dup-stdout",
+    "macho-run-dup2-stdout",
+    "macho-run-fcntl-dupfd-stdout",
+    "macho-run-ioctl-fioclex-stdio",
+    "macho-run-ioctl-fionbio-stdio",
+    "macho-run-fcntl-nosigpipe-stdio",
+    "macho-run-fsync-stdio",
+    "darwin-commpage-bootstrap",
+    "raw-macho-dynarmic-session-commpage"
+  ],
+  "groups": [
+    {
+      "id": "loader",
+      "label": "Mach-O loader",
+      "short": "Loader",
+      "checks": [
+        {
+          "id": "L1",
+          "label": "Parse little-endian ARM64 Mach-O",
+          "status": "verified",
+          "tests": [
+            "macho-parser"
+          ],
+          "source": "src/macho.cpp"
+        },
+        {
+          "id": "L2",
+          "label": "Reject invalid load-command ranges",
+          "status": "verified",
+          "tests": [
+            "macho-parser"
+          ],
+          "source": "tests/test_macho_legacy.inc"
+        },
+        {
+          "id": "L3",
+          "label": "Load bounded segments and zero-fill",
+          "status": "verified",
+          "tests": [
+            "image-loader"
+          ],
+          "source": "src/image_loader.cpp"
+        },
+        {
+          "id": "L4",
+          "label": "Resolve a supported executable entry point",
+          "status": "verified",
+          "tests": [
+            "parse-load-integration"
+          ],
+          "source": "tests/test_parse_load_integration.cpp"
+        },
+        {
+          "id": "L5",
+          "label": "Load supported dependent dylib images",
+          "status": "verified",
+          "tests": [
+            "dyld-loaded-image-graph"
+          ],
+          "source": "src/dyld_graph.cpp"
+        },
+        {
+          "id": "L6",
+          "label": "Bootstrap a parsed image into a guest session",
+          "status": "verified",
+          "tests": [
+            "macho-session-bootstrap"
+          ],
+          "source": "src/session.cpp"
+        }
+      ]
+    },
+    {
+      "id": "memory",
+      "label": "Guest memory",
+      "short": "Memory",
+      "checks": [
+        {
+          "id": "M1",
+          "label": "Enforce guest mapping bounds and permissions",
+          "status": "verified",
+          "tests": [
+            "guest-address-space"
+          ],
+          "source": "src/address_space.cpp"
+        },
+        {
+          "id": "M2",
+          "label": "Unmap subranges and split mappings",
+          "status": "verified",
+          "tests": [
+            "dynarmic-arm64-jit"
+          ],
+          "source": "tests/test_dynarmic_munmap.inc"
+        },
+        {
+          "id": "M3",
+          "label": "Create supported anonymous mmap regions",
+          "status": "verified",
+          "tests": [
+            "dynarmic-arm64-jit"
+          ],
+          "source": "tests/test_dynarmic_anonymous_mmap.inc"
+        },
+        {
+          "id": "M4",
+          "label": "Change subrange protection with mprotect",
+          "status": "verified",
+          "tests": [
+            "dynarmic-arm64-jit"
+          ],
+          "source": "tests/test_dynarmic_mprotect.inc"
+        },
+        {
+          "id": "M5",
+          "label": "Read and write across adjacent mapping fragments",
+          "status": "verified",
+          "tests": [
+            "dynarmic-arm64-jit"
+          ],
+          "source": "tests/test_dynarmic_cross_mapping_memory.inc"
+        },
+        {
+          "id": "M6",
+          "label": "Allocate owned guest stacks with sealed guards",
+          "status": "verified",
+          "tests": [
+            "dynarmic-arm64-jit"
+          ],
+          "source": "tests/test_dynarmic_owned_stacks.inc"
+        }
+      ]
+    },
+    {
+      "id": "execution",
+      "label": "ARM64 execution",
+      "short": "Execution",
+      "checks": [
+        {
+          "id": "E1",
+          "label": "Execute ARM64 instructions with pinned Dynarmic",
+          "status": "verified",
+          "tests": [
+            "dynarmic-arm64-jit"
+          ],
+          "source": "src/dynarmic_backend.cpp"
+        },
+        {
+          "id": "E2",
+          "label": "Connect translated memory accesses to guest memory",
+          "status": "verified",
+          "tests": [
+            "dynarmic-arm64-jit"
+          ],
+          "source": "tests/test_dynarmic_legacy.inc"
+        },
+        {
+          "id": "E3",
+          "label": "Bound process execution with instruction budgets",
+          "status": "verified",
+          "tests": [
+            "execution-contract",
+            "process-runner"
+          ],
+          "source": "src/process.cpp"
+        },
+        {
+          "id": "E4",
+          "label": "Dispatch guest supervisor calls and resume execution",
+          "status": "verified",
+          "tests": [
+            "raw-macho-dynarmic-session"
+          ],
+          "source": "tests/test_session_dynarmic.cpp"
+        },
+        {
+          "id": "E5",
+          "label": "Invalidate translated code after executable-memory changes",
+          "status": "verified",
+          "tests": [
+            "dynarmic-arm64-jit"
+          ],
+          "source": "tests/test_dynarmic_code_generation.inc"
+        },
+        {
+          "id": "E6",
+          "label": "Run raw Mach-O CLI fixtures with stdout and exit status",
+          "status": "verified",
+          "tests": [
+            "macho-run-hello-exit-status",
+            "macho-run-guest-argc"
+          ],
+          "source": "src/macho_run.cpp"
+        }
+      ]
+    },
+    {
+      "id": "dyld",
+      "label": "dyld / ARM64e",
+      "short": "dyld / PAC",
+      "checks": [
+        {
+          "id": "D1",
+          "label": "Resolve supported dyld paths and dependency plans",
+          "status": "verified",
+          "tests": [
+            "dyld-path-resolution",
+            "dyld-dependency-planning"
+          ],
+          "source": "src/dyld_paths.cpp"
+        },
+        {
+          "id": "D2",
+          "label": "Read export tries and resolve modeled symbols",
+          "status": "verified",
+          "tests": [
+            "dyld-exports-trie",
+            "dyld-symbol-resolution"
+          ],
+          "source": "src/dyld_symbols.cpp"
+        },
+        {
+          "id": "D3",
+          "label": "Parse and apply supported generic chained fixups",
+          "status": "verified",
+          "tests": [
+            "dyld-chained-fixups-metadata",
+            "dyld-generic-chained-fixup-apply"
+          ],
+          "source": "src/dyld_fixup_apply.cpp"
+        },
+        {
+          "id": "D4",
+          "label": "Apply supported ARM64e fixups with software PAC policy",
+          "status": "verified",
+          "tests": [
+            "dyld-arm64e-chained-fixup-apply",
+            "dyld-authenticated-arm64e-fixup-apply",
+            "pointer-auth-policy"
+          ],
+          "source": "src/dyld_fixup_pauth.cpp"
+        },
+        {
+          "id": "D5",
+          "label": "Execute ordered synthetic image initializers",
+          "status": "verified",
+          "tests": [
+            "dynarmic-arm64-jit"
+          ],
+          "source": "tests/test_dynarmic_authenticated_initializers.inc"
+        },
+        {
+          "id": "D6",
+          "label": "Materialize program variables and commpage bootstrap",
+          "status": "verified",
+          "tests": [
+            "raw-macho-dynarmic-session-program-vars",
+            "raw-macho-dynarmic-session-commpage"
+          ],
+          "source": "tests/test_program_vars_dynarmic.cpp"
+        },
+        {
+          "id": "D7",
+          "label": "Load and execute a stock dyld shared-cache dependency closure",
+          "status": "pending"
+        },
+        {
+          "id": "D8",
+          "label": "Bootstrap unmodified stock libSystem successfully",
+          "status": "pending"
+        }
+      ]
+    },
+    {
+      "id": "darwin",
+      "label": "Darwin / Mach",
+      "short": "Darwin / Mach",
+      "checks": [
+        {
+          "id": "B1",
+          "label": "Support scoped scalar, vectored and positional I/O",
+          "status": "verified",
+          "tests": [
+            "darwin-syscall-dispatch",
+            "macho-run-stdin-echo",
+            "macho-run-writev-stdout",
+            "macho-run-readv-stdin",
+            "macho-run-pread-stdin"
+          ],
+          "source": "src/darwin_syscall.cpp"
+        },
+        {
+          "id": "B2",
+          "label": "Model descriptor close, duplication and fcntl flags",
+          "status": "verified",
+          "tests": [
+            "macho-run-close-stdout",
+            "macho-run-dup2-stdout",
+            "macho-run-fcntl-dupfd-stdout",
+            "macho-run-fcntl-nosigpipe-stdio"
+          ],
+          "source": "src/macho_run.cpp"
+        },
+        {
+          "id": "B3",
+          "label": "Model selected stat, ioctl, seek and sync operations",
+          "status": "verified",
+          "tests": [
+            "macho-run-fstat-stdin",
+            "macho-run-ioctl-stdin",
+            "macho-run-lseek-stdin",
+            "macho-run-fsync-stdio"
+          ],
+          "source": "tests/macho_run_fixture.cpp"
+        },
+        {
+          "id": "B4",
+          "label": "Provide host-backed entropy and scoped time calls",
+          "status": "verified",
+          "tests": [
+            "darwin-syscall-dispatch"
+          ],
+          "source": "tests/test_darwin_syscall.cpp"
+        },
+        {
+          "id": "B5",
+          "label": "Report synthetic process identity and selected resource limits",
+          "status": "verified",
+          "tests": [
+            "darwin-syscall-dispatch",
+            "macho-run-getrlimit-stack",
+            "macho-run-getdtablesize"
+          ],
+          "source": "src/darwin_syscall.cpp"
+        },
+        {
+          "id": "B6",
+          "label": "Handle modeled Mach VM, port and guest IPC operations",
+          "status": "verified",
+          "tests": [
+            "mach-trap-dispatch",
+            "mach-msg-transport",
+            "dynarmic-mach-msg-transport"
+          ],
+          "source": "src/mach_trap.cpp"
+        },
+        {
+          "id": "B7",
+          "label": "Open guest filesystem paths with application-level semantics",
+          "status": "pending"
+        },
+        {
+          "id": "B8",
+          "label": "Support guest sockets and networking",
+          "status": "pending"
+        },
+        {
+          "id": "B9",
+          "label": "Deliver guest signals with Darwin process semantics",
+          "status": "pending"
+        },
+        {
+          "id": "B10",
+          "label": "Connect guest Mach IPC to required host services",
+          "status": "pending"
+        }
+      ]
+    },
+    {
+      "id": "threads",
+      "label": "Guest threads",
+      "short": "Threads",
+      "checks": [
+        {
+          "id": "T1",
+          "label": "Schedule manually constructed cooperative guest contexts",
+          "status": "verified",
+          "tests": [
+            "dynarmic-arm64-jit"
+          ],
+          "source": "tests/test_dynarmic_cooperative_threads.inc"
+        },
+        {
+          "id": "T2",
+          "label": "Keep worker pthread TSD and errno state isolated",
+          "status": "verified",
+          "tests": [
+            "dynarmic-arm64-jit"
+          ],
+          "source": "tests/test_dynarmic_owned_errno_tsd.inc"
+        },
+        {
+          "id": "T3",
+          "label": "Bootstrap modeled main-thread pthread layout and errno",
+          "status": "verified",
+          "tests": [
+            "dynarmic-arm64-jit"
+          ],
+          "source": "tests/test_dynarmic_main_thread_errno_tsd.inc"
+        },
+        {
+          "id": "T4",
+          "label": "Retire a resource-free guest context without killing siblings",
+          "status": "verified",
+          "tests": [
+            "dynarmic-arm64-jit"
+          ],
+          "source": "tests/test_dynarmic_thread_termination.inc"
+        },
+        {
+          "id": "T5",
+          "label": "Successfully register libpthread and create threads through bsdthread",
+          "status": "pending"
+        },
+        {
+          "id": "T6",
+          "label": "Run real pthread synchronization, waits and cancellation",
+          "status": "pending"
+        }
+      ]
+    },
+    {
+      "id": "frameworks",
+      "label": "Apps / frameworks",
+      "short": "Apps / frameworks",
+      "checks": [
+        {
+          "id": "A1",
+          "label": "Run an independently compiled, unmodified ARM64 CLI program",
+          "status": "pending"
+        },
+        {
+          "id": "A2",
+          "label": "Execute stock Objective-C runtime and message dispatch",
+          "status": "pending"
+        },
+        {
+          "id": "A3",
+          "label": "Run an unmodified Foundation program",
+          "status": "pending"
+        },
+        {
+          "id": "A4",
+          "label": "Launch an unmodified AppKit application",
+          "status": "pending"
+        }
+      ]
+    },
+    {
+      "id": "graphics",
+      "label": "Graphics / desktop",
+      "short": "Graphics",
+      "checks": [
+        {
+          "id": "G1",
+          "label": "Implement a guest graphics API translation path",
+          "status": "pending"
+        },
+        {
+          "id": "G2",
+          "label": "Connect the architecture-neutral GPU handoff",
+          "status": "pending"
+        },
+        {
+          "id": "G3",
+          "label": "Present guest windows through the required display services",
+          "status": "pending"
+        },
+        {
+          "id": "G4",
+          "label": "Demonstrate an unmodified graphical application end to end",
+          "status": "pending"
+        }
+      ]
+    }
+  ]
+}

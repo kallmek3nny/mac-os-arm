@@ -22,6 +22,10 @@ jobs:
       - name: test
         run: ctest --test-dir build --output-on-failure --timeout 30
         timeout-minutes: 3
+      - name: check generated status graphic and evidence links
+        if: runner.os == 'Linux'
+        run: python3 tools/render_status.py --check
+        timeout-minutes: 1
 
   dynarmic-jit:
     runs-on: ubuntu-latest
@@ -39,6 +43,9 @@ jobs:
       - name: build JIT backend
         run: timeout 420s cmake --build build-jit --config Release --parallel 2
         timeout-minutes: 8
-      - name: test real ARM64 JIT, Mach IPC, and raw Mach-O session
-        run: timeout 120s ctest --test-dir build-jit --output-on-failure --timeout 30 -R 'dynarmic-arm64-jit|dynarmic-mach-msg-transport|raw-macho-dynarmic-session|execution-contract'
+      - name: check complete status test inventory
+        run: python3 tools/render_status.py --check --ctest-build build-jit
+        timeout-minutes: 1
+      - name: test all core, ARM64 JIT, Mach IPC and CLI fixtures
+        run: timeout 120s ctest --test-dir build-jit --output-on-failure --timeout 30
         timeout-minutes: 3
