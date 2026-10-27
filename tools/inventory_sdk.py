@@ -76,19 +76,7 @@ def tapi_yaml(content):
     return "".join(result)
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--sdk", type=Path)
-    parser.add_argument("--sdk-major", type=int, default=27)
-    args = parser.parse_args()
-    sdk = (args.sdk or Path(command("xcrun", "--sdk", "macosx", "--show-sdk-path"))).resolve()
-    settings = json.loads((sdk / "SDKSettings.json").read_text())
-    version = settings["Version"]
-    if int(version.split(".")[0]) != args.sdk_major:
-        raise ValueError(f"Expected macOS {args.sdk_major} SDK, found {version}")
-    print(json.dumps({"sdk_version": version, "xcode": command("xcodebuild", "-version"),
-                      "host": command("sw_vers")}), flush=True)
+def collect_libraries(sdk):
     libraries = {}
     files = sorted({path.resolve() for path in sdk.rglob("*.tbd") if path.is_file()})
     key_counts = Counter()
@@ -126,10 +114,27 @@ def main():
         records.append({"install_name": install_name, "defined_symbols": len(symbols), "symbols_sha256": digest,
                         "sources": lib["sources"], "reexported_libraries": sorted(lib["reexported_libraries"])})
         full.append({"install_name": install_name, "symbols": symbols})
+    return records, full, len(files), dict(key_counts)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--sdk", type=Path)
+    parser.add_argument("--sdk-major", type=int, default=27)
+    args = parser.parse_args()
+    sdk = (args.sdk or Path(command("xcrun", "--sdk", "macosx", "--show-sdk-path"))).resolve()
+    settings = json.loads((sdk / "SDKSettings.json").read_text())
+    version = settings["Version"]
+    if int(version.split(".")[0]) != args.sdk_major:
+        raise ValueError(f"Expected macOS {args.sdk_major} SDK, found {version}")
+    print(json.dumps({"sdk_version": version, "xcode": command("xcodebuild", "-version"),
+                      "host": command("sw_vers")}), flush=True)
+    records, full, file_count, key_counts = collect_libraries(sdk)
     result = {"schema": 1, "sdk_version": version, "sdk_settings": settings,
               "host": command("sw_vers"), "host_architecture": command("uname", "-m"),
               "xcode": command("xcodebuild", "-version"), "targets": sorted(TARGETS),
-              "tbd_files_scanned": len(files), "libraries": records,
+              "tbd_files_scanned": file_count, "libraries": records,
               "total_defined_symbols": sum(row["defined_symbols"] for row in records),
               "raw_export_key_counts": dict(key_counts)}
     mig = {}
@@ -170,7 +175,7 @@ def main():
     result["symbol_manifest"] = {"file": "sdk-symbols.json.gz", "sha256": hashlib.sha256(compressed).hexdigest(),
                                  "uncompressed_sha256": hashlib.sha256(full_bytes).hexdigest()}
     args.output.write_text(json.dumps(result, indent=2) + "\n")
-    print(json.dumps({"sdk_version": version, "xcode": result["xcode"], "tbd_files": len(files),
+    print(json.dumps({"sdk_version": version, "xcode": result["xcode"], "tbd_files": file_count,
                       "libraries": len(records), "defined_symbols": result["total_defined_symbols"],
                       "mig_routines": len(mig), "definitions": {key: len(value["definitions"]) for key, value in facts.items()},
                       "trap_headers": result["trap_headers"], "symbol_manifest": result["symbol_manifest"]}, indent=2))

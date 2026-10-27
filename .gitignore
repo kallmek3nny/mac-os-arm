@@ -2,3 +2,4 @@
 /build-*/
 /build*.log
 /ctest*.log
+__pycache__/

@@ -7,6 +7,7 @@ on:
     paths:
       - .github/workflows/sdk-inventory.yml
       - tools/inventory_sdk.py
+      - tests/test_sdk_inventory.py
 
 permissions:
   contents: read
@@ -17,11 +18,17 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.1.0
+        with:
+          python-version: '3.13'
       - name: install the pinned TBD parser
         run: |
-          python3 -m venv "$RUNNER_TEMP/sdk-inventory-python"
+          python -m venv "$RUNNER_TEMP/sdk-inventory-python"
           "$RUNNER_TEMP/sdk-inventory-python/bin/python" -m pip install PyYAML==6.0.3
         timeout-minutes: 2
+      - name: test architecture filters and exact symbol counting
+        run: '"$RUNNER_TEMP/sdk-inventory-python/bin/python" -m unittest discover -s tests -p test_sdk_inventory.py -v'
+        timeout-minutes: 1
       - name: inventory installed Apple SDK definitions
         run: '"$RUNNER_TEMP/sdk-inventory-python/bin/python" tools/inventory_sdk.py --sdk-major 27 --output build/sdk-inventory.json'
         timeout-minutes: 10
