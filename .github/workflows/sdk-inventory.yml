@@ -1,0 +1,27 @@
+name: sdk-inventory
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/authoritative-coverage]
+    paths:
+      - .github/workflows/sdk-inventory.yml
+      - tools/inventory_sdk.py
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: inventory installed Apple SDK definitions
+        run: python3 tools/inventory_sdk.py --output build/sdk-inventory.json
+        timeout-minutes: 5
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: macos-sdk-inventory
+          path: build/sdk-inventory.json
+          retention-days: 90
