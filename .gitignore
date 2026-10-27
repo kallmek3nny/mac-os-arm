@@ -1,2 +1,4 @@
 /build/
 /build-*/
+/build*.log
+/ctest*.log

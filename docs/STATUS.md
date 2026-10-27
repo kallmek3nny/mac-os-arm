@@ -2,6 +2,8 @@
 
 This handoff covers the implementation through phase 82. This is an experimental ARM64 userspace translation runtime, **not** a complete macOS 27 virtual machine, dyld, kernel or Rosetta replacement.
 
+See the [progress graphic and evidence checklist](PROGRESS.md) for a dated capability inventory and full test results. Checklist coverage is not an overall macOS compatibility percentage.
+
 ## execution path
 
 | subsystem | entry points | current scope |
