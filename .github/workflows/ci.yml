@@ -12,7 +12,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - name: configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
         timeout-minutes: 2
@@ -31,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - name: install Dynarmic host prerequisite
         run: |
           sudo timeout 120s apt-get update
