@@ -11,7 +11,7 @@ import subprocess
 import yaml
 
 
-class TbdLoader(getattr(yaml, "CSafeLoader", yaml.SafeLoader)):
+class TbdLoader(getattr(yaml, "CBaseLoader", yaml.BaseLoader)):
     pass
 
 
@@ -42,6 +42,40 @@ def expanded(key, name):
     return [name]
 
 
+def tapi_yaml(content):
+    """LLVM TAPI permits empty flow-list items which strict YAML rejects."""
+    result, quote, depth, previous, index = [], None, 0, "", 0
+    while index < len(content):
+        char = content[index]
+        if quote:
+            result.append(char)
+            if quote == '"' and char == "\\" and index + 1 < len(content):
+                index += 1
+                result.append(content[index])
+            elif char == quote:
+                if quote == "'" and index + 1 < len(content) and content[index + 1] == "'":
+                    index += 1
+                    result.append(content[index])
+                else:
+                    quote = None
+                    previous = "scalar"
+        elif char in "\"'":
+            quote = char
+            result.append(char)
+        elif char == "," and depth and previous in {"[", ","}:
+            pass
+        else:
+            result.append(char)
+            if char == "[":
+                depth += 1
+            elif char == "]":
+                depth -= 1
+            if not char.isspace():
+                previous = char
+        index += 1
+    return "".join(result)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
@@ -59,8 +93,12 @@ def main():
     files = sorted({path.resolve() for path in sdk.rglob("*.tbd") if path.is_file()})
     key_counts = Counter()
     for path in files:
-        for doc in yaml.load_all(path.read_text(), Loader=TbdLoader):
-            if not isinstance(doc, dict) or doc.get("tbd-version") != 4:
+        try:
+            documents = list(yaml.load_all(tapi_yaml(path.read_text()), Loader=TbdLoader))
+        except yaml.YAMLError as error:
+            raise ValueError(f"Cannot parse complete SDK inventory: {path}: {error}") from error
+        for doc in documents:
+            if not isinstance(doc, dict) or str(doc.get("tbd-version")) != "4":
                 raise ValueError(f"Audit new TBD format before counting: {path}")
             if not selected(doc):
                 continue
