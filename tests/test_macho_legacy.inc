@@ -368,6 +368,22 @@ int main() {
     }
 
     {
+        // dyld rejects a segment whose [vmaddr, vmaddr + vmsize) range wraps past 2^64, including one that ends
+        // exactly at 2^64. Only __TEXT's vmaddr moves, so its file range and LC_MAIN offset stay valid.
+        const auto parse_with_text_address = [](std::uint64_t vm_address) {
+            auto bytes = valid_image();
+            put_u64(bytes, 32 + 24, vm_address);
+            return macosarm::macho::parse(bytes);
+        };
+        expect(parse_with_text_address(0xffffffffffffff00ULL).error == macosarm::macho::ErrorCode::malformed_segment,
+               "segment vm range wrapping 64 bits rejected");
+        expect(parse_with_text_address(0xfffffffffffffe00ULL).error == macosarm::macho::ErrorCode::malformed_segment,
+               "segment vm range ending exactly at 2^64 rejected");
+        expect(static_cast<bool>(parse_with_text_address(0xfffffffffffffdffULL)),
+               "segment vm range ending at the last 64-bit address accepted");
+    }
+
+    {
         // A non-allocated SG_NORELOC segment with vmsize 0, such as the __LLVM bitcode segment, may still carry
         // file bytes. The same segment without SG_NORELOC is rejected. It follows LC_MAIN at offset 128 and maps
         // file bytes 0x200-0x240 appended past the 0x200-byte image, as its file content may not overlap __TEXT's.

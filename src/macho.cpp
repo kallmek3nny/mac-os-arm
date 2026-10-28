@@ -241,6 +241,11 @@ ParseResult parse(std::span<const std::byte> bytes) {
                 (segment.vm_size != 0 || (segment_flags & kSgNoReloc) == 0)) {
                 return fail(ErrorCode::malformed_segment, "LC_SEGMENT_64 filesize exceeds vmsize");
             }
+            // dyld rejects a segment whose [vmaddr, vmaddr + vmsize) range wraps past the top of the 64-bit address
+            // space, including one ending exactly at 2^64, because that end address does not fit in 64 bits.
+            if (add_overflows(segment.vm_address, segment.vm_size)) {
+                return fail(ErrorCode::malformed_segment, "LC_SEGMENT_64 vm range wraps");
+            }
 
             constexpr std::uint64_t kSection64Size = 80;
             const std::uint64_t required_size =
