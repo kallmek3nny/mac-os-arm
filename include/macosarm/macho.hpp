@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -17,16 +18,24 @@ constexpr std::uint32_t kMhExecute = 2;
 constexpr std::uint32_t kMhDylib = 6;
 constexpr std::uint32_t kMhDylinker = 7;
 constexpr std::uint32_t kLcReqDyld = 0x80000000U;
+constexpr std::uint32_t kLcSymtab = 0x02;
+constexpr std::uint32_t kLcDysymtab = 0x0b;
 constexpr std::uint32_t kLcLoadDylib = 0x0c;
 constexpr std::uint32_t kLcIdDylib = 0x0d;
 constexpr std::uint32_t kLcLoadDylinker = 0x0e;
 constexpr std::uint32_t kLcLoadWeakDylib = 0x18U | kLcReqDyld;
 constexpr std::uint32_t kLcSegment64 = 0x19;
+constexpr std::uint32_t kLcUuid = 0x1b;
 constexpr std::uint32_t kLcRpath = 0x1cU | kLcReqDyld;
+constexpr std::uint32_t kLcCodeSignature = 0x1d;
 constexpr std::uint32_t kLcReexportDylib = 0x1fU | kLcReqDyld;
 constexpr std::uint32_t kLcLazyLoadDylib = 0x20;
 constexpr std::uint32_t kLcLoadUpwardDylib = 0x23U | kLcReqDyld;
+constexpr std::uint32_t kLcFunctionStarts = 0x26;
 constexpr std::uint32_t kLcMain = 0x80000028U;
+constexpr std::uint32_t kLcDataInCode = 0x29;
+constexpr std::uint32_t kLcSourceVersion = 0x2a;
+constexpr std::uint32_t kLcBuildVersion = 0x32;
 constexpr std::uint32_t kLcDyldExportsTrie = 0x33U | kLcReqDyld;
 constexpr std::uint32_t kLcDyldChainedFixups = 0x34U | kLcReqDyld;
 
@@ -69,6 +78,38 @@ struct FileRange {
     bool present{};
 };
 
+struct SymbolTable {
+    std::uint32_t symbol_offset{};
+    std::uint32_t symbol_count{};
+    std::uint32_t string_offset{};
+    std::uint32_t string_size{};
+    bool present{};
+};
+
+struct DynamicSymbolTable {
+    std::uint32_t local_symbol_index{};
+    std::uint32_t local_symbol_count{};
+    std::uint32_t external_symbol_index{};
+    std::uint32_t external_symbol_count{};
+    std::uint32_t undefined_symbol_index{};
+    std::uint32_t undefined_symbol_count{};
+    std::uint32_t indirect_symbol_offset{};
+    std::uint32_t indirect_symbol_count{};
+    bool present{};
+};
+
+struct BuildTool {
+    std::uint32_t tool{};
+    std::uint32_t version{};
+};
+
+struct BuildVersion {
+    std::uint32_t platform{};
+    std::uint32_t minimum_os{};
+    std::uint32_t sdk{};
+    std::vector<BuildTool> tools;
+};
+
 struct Image {
     std::int32_t cpu_type{};
     std::int32_t cpu_subtype{};
@@ -85,6 +126,16 @@ struct Image {
     FileRange exports_trie;
     FileRange chained_fixups;
     std::vector<Segment> segments;
+    SymbolTable symbol_table;
+    DynamicSymbolTable dynamic_symbol_table;
+    std::array<std::uint8_t, 16> uuid{};
+    bool has_uuid{};
+    std::vector<BuildVersion> build_versions;
+    std::uint64_t source_version{};
+    bool has_source_version{};
+    FileRange code_signature;
+    FileRange function_starts;
+    FileRange data_in_code;
 };
 
 enum class ErrorCode {
@@ -106,6 +157,12 @@ enum class ErrorCode {
     duplicate_dylib_identity,
     duplicate_exports_trie,
     duplicate_chained_fixups,
+    malformed_symbol_table,
+    malformed_dynamic_symbol_table,
+    malformed_uuid,
+    malformed_build_version,
+    malformed_source_version,
+    duplicate_load_command,
 };
 
 struct ParseResult {

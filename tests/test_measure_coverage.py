@@ -34,7 +34,7 @@ def reference():
         "definitions": {
             "usr/include/sys/syscall.h": {"definitions": rows(*syscalls)},
             "usr/include/mach-o/loader.h": {"definitions": rows(
-                ("LC_REQ_DYLD", "0x80000000"), ("LC_SYMTAB", "0x2"), ("LC_SEGMENT_64", "0x19"),
+                ("LC_REQ_DYLD", "0x80000000"), ("LC_SYMTAB", "0x2"), ("LC_SYMSEG", "0x3"), ("LC_SEGMENT_64", "0x19"),
                 ("LC_MAIN", "(0x28|LC_REQ_DYLD)"))},
             "usr/include/mach-o/fixup-chains.h": {"definitions": rows(
                 ("DYLD_CHAINED_PTR_ARM64E", "1"), ("DYLD_CHAINED_PTR_64", "2"), ("DYLD_CHAINED_PTR_32", "3"),
@@ -53,7 +53,8 @@ class MeasureCoverageTests(unittest.TestCase):
         self.assertEqual(metrics["bsd"]["mapped"], metrics["bsd"]["total"] - 3)
         alias = next(row for row in metrics["bsd"]["entries"] if row["id"] == 9999)
         self.assertEqual(alias["aliases"], ["SYS_alias_fixture"])
-        self.assertEqual(status["loader"], {"LC_SYMTAB": "missing", "LC_SEGMENT_64": "modeled", "LC_MAIN": "modeled"})
+        self.assertEqual(status["loader"], {"LC_SYMTAB": "modeled", "LC_SYMSEG": "missing",
+                                            "LC_SEGMENT_64": "modeled", "LC_MAIN": "modeled"})
         self.assertEqual(status["fixups"], {"DYLD_CHAINED_PTR_ARM64E": "modeled", "DYLD_CHAINED_PTR_64": "modeled",
                                             "DYLD_CHAINED_PTR_32": "missing", "DYLD_CHAINED_PTR_64_OFFSET": "modeled"})
         self.assertEqual(status["mig"], {"host_info": "modeled", "clock_get_time": "missing"})

@@ -36,6 +36,14 @@ macosarm_enable_warnings(macosarm_macho)
 
 add_executable(macho-inspect src/macho_inspect.cpp)
 target_link_libraries(macho-inspect PRIVATE macosarm_macho)
+macosarm_enable_warnings(macho-inspect)
+# MinGW: macho-inspect prints its report through libstdc++ iostreams. If PATH
+# resolves an older, ABI-incompatible libstdc++-6.dll first (for example Git's
+# mingw64/bin), the tool segfaults instead of printing. Link the GCC runtime
+# statically so it behaves the same from any shell.
+if(MINGW)
+    target_link_options(macho-inspect PRIVATE -static-libstdc++ -static-libgcc)
+endif()
 
 option(MACOSARM_ENABLE_DYNARMIC "Build the pinned Dynarmic ARM64 JIT backend" OFF)
 

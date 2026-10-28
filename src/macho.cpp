@@ -309,7 +309,120 @@ ParseResult parse(std::span<const std::byte> bytes) {
                 return fail(ErrorCode::malformed_runpath, "invalid LC_RPATH path");
             }
             result.image.runpaths.push_back(std::move(path));
-        } else if (command == kLcDyldExportsTrie || command == kLcDyldChainedFixups) {
+        } else if (command == kLcSymtab) {
+            constexpr std::size_t kSymtabCommandSize = 24;
+            constexpr std::uint64_t kNlist64Size = 16;
+            if (command_size < kSymtabCommandSize) {
+                return fail(ErrorCode::malformed_symbol_table, "LC_SYMTAB is too small");
+            }
+            if (result.image.symbol_table.present) {
+                return fail(ErrorCode::duplicate_load_command, "multiple LC_SYMTAB commands are not supported");
+            }
+            SymbolTable& table = result.image.symbol_table;
+            if (!reader.read_u32(cursor + 8, table.symbol_offset) ||
+                !reader.read_u32(cursor + 12, table.symbol_count) ||
+                !reader.read_u32(cursor + 16, table.string_offset) ||
+                !reader.read_u32(cursor + 20, table.string_size)) {
+                return fail(ErrorCode::malformed_symbol_table, "truncated LC_SYMTAB");
+            }
+            const std::uint64_t symbols_end = static_cast<std::uint64_t>(table.symbol_offset) +
+                                              static_cast<std::uint64_t>(table.symbol_count) * kNlist64Size;
+            if (symbols_end > bytes.size() ||
+                !linkedit_range_valid(bytes.size(), table.string_offset, table.string_size)) {
+                return fail(ErrorCode::malformed_symbol_table, "LC_SYMTAB range exceeds image size");
+            }
+            table.present = true;
+        } else if (command == kLcDysymtab) {
+            constexpr std::size_t kDysymtabCommandSize = 80;
+            constexpr std::uint64_t kIndirectSymbolSize = 4;
+            if (command_size < kDysymtabCommandSize) {
+                return fail(ErrorCode::malformed_dynamic_symbol_table, "LC_DYSYMTAB is too small");
+            }
+            if (result.image.dynamic_symbol_table.present) {
+                return fail(ErrorCode::duplicate_load_command, "multiple LC_DYSYMTAB commands are not supported");
+            }
+            DynamicSymbolTable& table = result.image.dynamic_symbol_table;
+            if (!reader.read_u32(cursor + 8, table.local_symbol_index) ||
+                !reader.read_u32(cursor + 12, table.local_symbol_count) ||
+                !reader.read_u32(cursor + 16, table.external_symbol_index) ||
+                !reader.read_u32(cursor + 20, table.external_symbol_count) ||
+                !reader.read_u32(cursor + 24, table.undefined_symbol_index) ||
+                !reader.read_u32(cursor + 28, table.undefined_symbol_count) ||
+                !reader.read_u32(cursor + 56, table.indirect_symbol_offset) ||
+                !reader.read_u32(cursor + 60, table.indirect_symbol_count)) {
+                return fail(ErrorCode::malformed_dynamic_symbol_table, "truncated LC_DYSYMTAB");
+            }
+            const std::uint64_t indirect_end = static_cast<std::uint64_t>(table.indirect_symbol_offset) +
+                                               static_cast<std::uint64_t>(table.indirect_symbol_count) * kIndirectSymbolSize;
+            if (indirect_end > bytes.size()) {
+                return fail(ErrorCode::malformed_dynamic_symbol_table, "LC_DYSYMTAB indirect symbol table exceeds image size");
+            }
+            table.present = true;
+        } else if (command == kLcUuid) {
+            constexpr std::size_t kUuidCommandSize = 24;
+            if (command_size < kUuidCommandSize) {
+                return fail(ErrorCode::malformed_uuid, "LC_UUID is too small");
+            }
+            if (result.image.has_uuid) {
+                return fail(ErrorCode::duplicate_load_command, "multiple LC_UUID commands are not supported");
+            }
+            std::uint64_t low = 0;
+            std::uint64_t high = 0;
+            if (!reader.read_u64(cursor + 8, low) || !reader.read_u64(cursor + 16, high)) {
+                return fail(ErrorCode::malformed_uuid, "truncated LC_UUID");
+            }
+            for (std::size_t i = 0; i < 8; ++i) {
+                result.image.uuid[i] = static_cast<std::uint8_t>((low >> (i * 8)) & 0xffU);
+                result.image.uuid[i + 8] = static_cast<std::uint8_t>((high >> (i * 8)) & 0xffU);
+            }
+            result.image.has_uuid = true;
+        } else if (command == kLcBuildVersion) {
+            constexpr std::uint64_t kBuildVersionCommandSize = 24;
+            constexpr std::uint64_t kBuildToolVersionSize = 8;
+            if (command_size < kBuildVersionCommandSize) {
+                return fail(ErrorCode::malformed_build_version, "LC_BUILD_VERSION is too small");
+            }
+            BuildVersion build;
+            std::uint32_t tool_count = 0;
+            if (!reader.read_u32(cursor + 8, build.platform) ||
+                !reader.read_u32(cursor + 12, build.minimum_os) ||
+                !reader.read_u32(cursor + 16, build.sdk) ||
+                !reader.read_u32(cursor + 20, tool_count)) {
+                return fail(ErrorCode::malformed_build_version, "truncated LC_BUILD_VERSION");
+            }
+            if (kBuildVersionCommandSize + static_cast<std::uint64_t>(tool_count) * kBuildToolVersionSize > command_size) {
+                return fail(ErrorCode::malformed_build_version, "LC_BUILD_VERSION tool table exceeds command size");
+            }
+            for (const auto& existing : result.image.build_versions) {
+                if (existing.platform == build.platform) {
+                    return fail(ErrorCode::duplicate_load_command, "multiple LC_BUILD_VERSION commands name one platform");
+                }
+            }
+            build.tools.reserve(tool_count);
+            for (std::uint32_t tool = 0; tool < tool_count; ++tool) {
+                const std::size_t entry = cursor + static_cast<std::size_t>(kBuildVersionCommandSize) +
+                                          static_cast<std::size_t>(tool) * static_cast<std::size_t>(kBuildToolVersionSize);
+                BuildTool tool_version;
+                if (!reader.read_u32(entry, tool_version.tool) || !reader.read_u32(entry + 4, tool_version.version)) {
+                    return fail(ErrorCode::malformed_build_version, "truncated LC_BUILD_VERSION tool entry");
+                }
+                build.tools.push_back(tool_version);
+            }
+            result.image.build_versions.push_back(std::move(build));
+        } else if (command == kLcSourceVersion) {
+            constexpr std::size_t kSourceVersionCommandSize = 16;
+            if (command_size < kSourceVersionCommandSize) {
+                return fail(ErrorCode::malformed_source_version, "LC_SOURCE_VERSION is too small");
+            }
+            if (result.image.has_source_version) {
+                return fail(ErrorCode::duplicate_load_command, "multiple LC_SOURCE_VERSION commands are not supported");
+            }
+            if (!reader.read_u64(cursor + 8, result.image.source_version)) {
+                return fail(ErrorCode::malformed_source_version, "truncated LC_SOURCE_VERSION");
+            }
+            result.image.has_source_version = true;
+        } else if (command == kLcDyldExportsTrie || command == kLcDyldChainedFixups || command == kLcCodeSignature ||
+                   command == kLcFunctionStarts || command == kLcDataInCode) {
             if (command_size < kLinkeditDataCommandSize) {
                 return fail(ErrorCode::malformed_linkedit_data, "dyld linkedit command is too small");
             }
@@ -322,13 +435,19 @@ ParseResult parse(std::span<const std::byte> bytes) {
             }
 
             FileRange* destination = nullptr;
-            ErrorCode duplicate_error = ErrorCode::duplicate_exports_trie;
+            ErrorCode duplicate_error = ErrorCode::duplicate_load_command;
             if (command == kLcDyldExportsTrie) {
                 destination = &result.image.exports_trie;
                 duplicate_error = ErrorCode::duplicate_exports_trie;
-            } else {
+            } else if (command == kLcDyldChainedFixups) {
                 destination = &result.image.chained_fixups;
                 duplicate_error = ErrorCode::duplicate_chained_fixups;
+            } else if (command == kLcCodeSignature) {
+                destination = &result.image.code_signature;
+            } else if (command == kLcFunctionStarts) {
+                destination = &result.image.function_starts;
+            } else {
+                destination = &result.image.data_in_code;
             }
             if (destination->present) {
                 return fail(duplicate_error, "duplicate dyld linkedit command");
@@ -391,6 +510,12 @@ std::string_view error_name(ErrorCode error) noexcept {
     case ErrorCode::duplicate_dylib_identity: return "duplicate_dylib_identity";
     case ErrorCode::duplicate_exports_trie: return "duplicate_exports_trie";
     case ErrorCode::duplicate_chained_fixups: return "duplicate_chained_fixups";
+    case ErrorCode::malformed_symbol_table: return "malformed_symbol_table";
+    case ErrorCode::malformed_dynamic_symbol_table: return "malformed_dynamic_symbol_table";
+    case ErrorCode::malformed_uuid: return "malformed_uuid";
+    case ErrorCode::malformed_build_version: return "malformed_build_version";
+    case ErrorCode::malformed_source_version: return "malformed_source_version";
+    case ErrorCode::duplicate_load_command: return "duplicate_load_command";
     }
     return "unknown";
 }

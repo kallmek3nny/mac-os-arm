@@ -8,7 +8,7 @@ See the [progress graphic and evidence checklist](PROGRESS.md) for a dated capab
 
 | subsystem | entry points | current scope |
 | --- | --- | --- |
-| mach-o | `src/macho.cpp`, `src/image_loader.cpp` | bounded ARM64 Mach-O parsing and segment loading |
+| mach-o | `src/macho.cpp`, `src/image_loader.cpp`, `src/macho_inspect.cpp` | bounded ARM64 Mach-O parsing, validated LC_SYMTAB/LC_DYSYMTAB/LC_UUID/LC_BUILD_VERSION/LC_SOURCE_VERSION and linkedit-range metadata, `macho-inspect` reporting and segment loading |
 | guest memory | `src/address_space.cpp` | guest mappings, permissions, splits, guarded stacks and cross-fragment reads/writes |
 | dyld | `src/dyld_*.cpp`, `include/macosarm/dyld_*.hpp` | dependency plans, symbols, selected chained fixups, initializers and startup state |
 | cpu | `src/dynarmic_backend.cpp`, `include/macosarm/execution.hpp` | optional translated ARM64 execution, memory callbacks and code invalidation |
