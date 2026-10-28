@@ -277,6 +277,24 @@ ParseResult parse(std::span<const std::byte> bytes) {
                     return fail(ErrorCode::malformed_segment, "segment file range exceeds image size");
                 }
             }
+            // dyld rejects a segment whose non-empty [vmaddr, vmaddr + vmsize) or [fileoff, fileoff + filesize) range
+            // intersects another segment's. Empty ranges never overlap, so __PAGEZERO and __TEXT may share fileoff 0.
+            // Measuring the start distance against the lower range's size never computes an end that could wrap.
+            const auto ranges_overlap = [](std::uint64_t start_a, std::uint64_t size_a, std::uint64_t start_b,
+                                           std::uint64_t size_b) {
+                if (size_a == 0 || size_b == 0) {
+                    return false;
+                }
+                return start_a <= start_b ? start_b - start_a < size_a : start_a - start_b < size_b;
+            };
+            for (const Segment& earlier : result.image.segments) {
+                if (ranges_overlap(earlier.vm_address, earlier.vm_size, segment.vm_address, segment.vm_size)) {
+                    return fail(ErrorCode::malformed_segment, "LC_SEGMENT_64 vm range overlaps an earlier segment");
+                }
+                if (ranges_overlap(earlier.file_offset, earlier.file_size, segment.file_offset, segment.file_size)) {
+                    return fail(ErrorCode::malformed_segment, "LC_SEGMENT_64 file range overlaps an earlier segment");
+                }
+            }
             result.image.segments.push_back(std::move(segment));
         } else if (command == kLcMain) {
             if (command_size < kEntryPointSize) {

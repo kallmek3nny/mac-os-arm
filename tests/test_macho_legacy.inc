@@ -370,9 +370,10 @@ int main() {
     {
         // A non-allocated SG_NORELOC segment with vmsize 0, such as the __LLVM bitcode segment, may still carry
         // file bytes. The same segment without SG_NORELOC is rejected. It follows LC_MAIN at offset 128 and maps
-        // file bytes 0x180-0x1c0, which stay inside the 0x200-byte image.
+        // file bytes 0x200-0x240 appended past the 0x200-byte image, as its file content may not overlap __TEXT's.
         const auto parse_with_unallocated_segment = [](std::uint32_t flags) {
             auto bytes = valid_image();
+            bytes.resize(0x240, std::byte{0});
             put_u32(bytes, 16, 3);
             put_u32(bytes, 20, 72 + 24 + 72);
             constexpr std::size_t extra = 32 + 72 + 24;
@@ -381,7 +382,7 @@ int main() {
             put_name(bytes, extra + 8, "__LLVM");
             put_u64(bytes, extra + 24, 0x100000200ULL);
             put_u64(bytes, extra + 32, 0);
-            put_u64(bytes, extra + 40, 0x180ULL);
+            put_u64(bytes, extra + 40, 0x200ULL);
             put_u64(bytes, extra + 48, 0x40ULL);
             put_u32(bytes, extra + 56, 3);
             put_u32(bytes, extra + 60, 3);
@@ -397,6 +398,56 @@ int main() {
                "unallocated SG_NORELOC segment keeps its parsed sizes");
         expect(parse_with_unallocated_segment(0U).error == macosarm::macho::ErrorCode::malformed_segment,
                "vmsize 0 segment with file bytes but no SG_NORELOC rejected");
+    }
+
+    {
+        // dyld rejects a segment whose non-empty vm or file range intersects an earlier segment's, while empty
+        // ranges never overlap. A second segment follows LC_MAIN at offset 128 in an image grown to 0x400 bytes,
+        // so __TEXT keeps vm range [0x100000000, 0x100000200) and file range [0, 0x200).
+        const auto parse_with_second_segment = [](std::uint64_t vm_address, std::uint64_t vm_size,
+                                                  std::uint64_t file_offset, std::uint64_t file_size) {
+            auto bytes = valid_image();
+            bytes.resize(0x400, std::byte{0});
+            put_u32(bytes, 16, 3);
+            put_u32(bytes, 20, 72 + 24 + 72);
+            constexpr std::size_t extra = 32 + 72 + 24;
+            put_u32(bytes, extra, macosarm::macho::kLcSegment64);
+            put_u32(bytes, extra + 4, 72);
+            put_name(bytes, extra + 8, "__DATA");
+            put_u64(bytes, extra + 24, vm_address);
+            put_u64(bytes, extra + 32, vm_size);
+            put_u64(bytes, extra + 40, file_offset);
+            put_u64(bytes, extra + 48, file_size);
+            put_u32(bytes, extra + 56, 3);
+            put_u32(bytes, extra + 60, 3);
+            put_u32(bytes, extra + 64, 0);
+            put_u32(bytes, extra + 68, 0);
+            return macosarm::macho::parse(bytes);
+        };
+        const auto rejected = [](const macosarm::macho::ParseResult& result, const std::string& message) {
+            return result.error == macosarm::macho::ErrorCode::malformed_segment && result.message == message;
+        };
+        const std::string vm_overlap = "LC_SEGMENT_64 vm range overlaps an earlier segment";
+        const std::string file_overlap = "LC_SEGMENT_64 file range overlaps an earlier segment";
+
+        expect(static_cast<bool>(parse_with_second_segment(0x100000200ULL, 0x200ULL, 0x200ULL, 0x200ULL)),
+               "segment starting exactly at the earlier segment's vm and file ends parses");
+        expect(static_cast<bool>(parse_with_second_segment(0x0ffffff00ULL, 0x100ULL, 0x200ULL, 0x100ULL)),
+               "segment ending exactly at the earlier segment's vm start parses");
+        expect(static_cast<bool>(parse_with_second_segment(0, 0x100000000ULL, 0, 0)),
+               "__PAGEZERO-style segment with an empty file range may share fileoff 0");
+        expect(static_cast<bool>(parse_with_second_segment(0x100000100ULL, 0, 0x100ULL, 0)),
+               "empty segment inside the earlier segment's ranges parses");
+        expect(rejected(parse_with_second_segment(0x1000001ffULL, 0x200ULL, 0x200ULL, 0x200ULL), vm_overlap),
+               "segment starting inside the earlier segment's vm range rejected");
+        expect(rejected(parse_with_second_segment(0x0ffffff00ULL, 0x101ULL, 0x200ULL, 0x100ULL), vm_overlap),
+               "segment ending inside the earlier segment's vm range rejected");
+        expect(rejected(parse_with_second_segment(0x0fffff000ULL, 0x2000ULL, 0x200ULL, 0x200ULL), vm_overlap),
+               "segment enclosing the earlier segment's vm range rejected");
+        expect(rejected(parse_with_second_segment(0x100000200ULL, 0x200ULL, 0x1ffULL, 0x200ULL), file_overlap),
+               "segment starting inside the earlier segment's file range rejected");
+        expect(rejected(parse_with_second_segment(0x100000200ULL, 0x200ULL, 0x100ULL, 0x40ULL), file_overlap),
+               "segment inside the earlier segment's file range rejected");
     }
 
     {
