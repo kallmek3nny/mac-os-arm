@@ -248,6 +248,29 @@ ParseResult parse(std::span<const std::byte> bytes) {
             if (required_size > command_size) {
                 return fail(ErrorCode::malformed_segment, "LC_SEGMENT_64 section table exceeds command size");
             }
+            // dyld rejects a section_64 whose size sets the sign bit or whose [addr, addr + size) range leaves its
+            // segment's [vmaddr, vmaddr + vmsize) range. The section table already fits inside command_size.
+            for (std::uint32_t section_index = 0; section_index < section_count; ++section_index) {
+                const std::size_t section_header = cursor + kSegment64Size +
+                                                   static_cast<std::size_t>(section_index) *
+                                                       static_cast<std::size_t>(kSection64Size);
+                std::uint64_t section_address = 0;
+                std::uint64_t section_size = 0;
+                if (!reader.read_u64(section_header + 32, section_address) ||
+                    !reader.read_u64(section_header + 40, section_size)) {
+                    return fail(ErrorCode::malformed_segment, "truncated section_64");
+                }
+                if (section_size > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+                    return fail(ErrorCode::malformed_segment, "section_64 size is too large");
+                }
+                if (section_address < segment.vm_address) {
+                    return fail(ErrorCode::malformed_segment, "section_64 starts before its segment");
+                }
+                const std::uint64_t section_start = section_address - segment.vm_address;
+                if (section_start > segment.vm_size || section_size > segment.vm_size - section_start) {
+                    return fail(ErrorCode::malformed_segment, "section_64 ends beyond its segment");
+                }
+            }
             if (segment.file_size != 0) {
                 if (add_overflows(segment.file_offset, segment.file_size) ||
                     segment.file_offset + segment.file_size > bytes.size()) {

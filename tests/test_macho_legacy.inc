@@ -241,6 +241,65 @@ int main() {
     }
 
     {
+        // One __TEXT segment at 0x100000000 with vmsize 0x200 carrying a single section_64.
+        const auto section_image = [](std::uint64_t address, std::uint64_t size) {
+            constexpr std::uint32_t segment_bytes = 72 + 80;
+            std::vector<std::byte> bytes(0x200, std::byte{0});
+            put_u32(bytes, 0, macosarm::macho::kMhMagic64);
+            put_u32(bytes, 4, static_cast<std::uint32_t>(macosarm::macho::kCpuTypeArm64));
+            put_u32(bytes, 8, static_cast<std::uint32_t>(macosarm::macho::kCpuSubtypeArm64All));
+            put_u32(bytes, 12, macosarm::macho::kMhExecute);
+            put_u32(bytes, 16, 2);
+            put_u32(bytes, 20, segment_bytes + 24);
+            put_u32(bytes, 24, 0x00200000U);
+
+            constexpr std::size_t segment = 32;
+            put_u32(bytes, segment, macosarm::macho::kLcSegment64);
+            put_u32(bytes, segment + 4, segment_bytes);
+            put_name(bytes, segment + 8, "__TEXT");
+            put_u64(bytes, segment + 24, 0x100000000ULL);
+            put_u64(bytes, segment + 32, 0x200ULL);
+            put_u64(bytes, segment + 40, 0);
+            put_u64(bytes, segment + 48, 0x200ULL);
+            put_u32(bytes, segment + 56, 5);
+            put_u32(bytes, segment + 60, 5);
+            put_u32(bytes, segment + 64, 1);
+
+            constexpr std::size_t section = segment + 72;
+            put_name(bytes, section, "__text");
+            put_name(bytes, section + 16, "__TEXT");
+            put_u64(bytes, section + 32, address);
+            put_u64(bytes, section + 40, size);
+
+            constexpr std::size_t main = segment + segment_bytes;
+            put_u32(bytes, main, macosarm::macho::kLcMain);
+            put_u32(bytes, main + 4, 24);
+            put_u64(bytes, main + 8, 0x100ULL);
+            return bytes;
+        };
+        const auto rejected = [](const macosarm::macho::ParseResult& result, const std::string& message) {
+            return result.error == macosarm::macho::ErrorCode::malformed_segment && result.message == message;
+        };
+
+        expect(static_cast<bool>(macosarm::macho::parse(section_image(0x100000100ULL, 0x100ULL))),
+               "section_64 ending exactly at its segment end parses");
+        expect(static_cast<bool>(macosarm::macho::parse(section_image(0x100000200ULL, 0))),
+               "empty section_64 at its segment end parses");
+        expect(rejected(macosarm::macho::parse(section_image(0x0fffffff0ULL, 0x10ULL)),
+                        "section_64 starts before its segment"),
+               "section_64 starting before its segment rejected");
+        expect(rejected(macosarm::macho::parse(section_image(0x100000100ULL, 0x101ULL)),
+                        "section_64 ends beyond its segment"),
+               "section_64 ending past its segment rejected");
+        expect(rejected(macosarm::macho::parse(section_image(0x100000300ULL, 0)),
+                        "section_64 ends beyond its segment"),
+               "section_64 starting past its segment rejected");
+        expect(rejected(macosarm::macho::parse(section_image(0x100000000ULL, 0x8000000000000000ULL)),
+                        "section_64 size is too large"),
+               "section_64 size with the sign bit set rejected");
+    }
+
+    {
         std::vector<std::byte> bytes(8, std::byte{0});
         const auto result = macosarm::macho::parse(bytes);
         expect(result.error == macosarm::macho::ErrorCode::truncated, "short header rejected");

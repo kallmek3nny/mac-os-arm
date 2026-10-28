@@ -255,6 +255,82 @@ int macho_load_metadata_main() {
                         std::string(m::error_name(repeated.error)) + ")");
     }
 
+    {
+        // dyld requires each section_64 to keep [addr, addr + size) inside its segment's [vmaddr, vmaddr + vmsize)
+        // and rejects a size with the sign bit set. Both sections of this __TEXT segment lie inside it and __const
+        // ends exactly at vmaddr + vmsize. Each case below rewrites one section's addr and size.
+        constexpr std::size_t kSegment = 32;
+        constexpr std::size_t kText = kSegment + 72;
+        constexpr std::size_t kConst = kText + 80;
+        constexpr std::uint64_t kBase = 0x100000000ULL;
+        const auto put_name = [](Bytes& bytes, std::size_t at, const std::string& name) {
+            for (std::size_t i = 0; i < name.size(); ++i) {
+                bytes.at(at + i) = static_cast<std::byte>(name[i]);
+            }
+        };
+        const auto section_image = [&]() {
+            Bytes bytes(0x400, std::byte{0});
+            meta_put_u32(bytes, 0, m::kMhMagic64);
+            meta_put_u32(bytes, 4, static_cast<std::uint32_t>(m::kCpuTypeArm64));
+            meta_put_u32(bytes, 8, static_cast<std::uint32_t>(m::kCpuSubtypeArm64e));
+            meta_put_u32(bytes, 12, m::kMhExecute);
+            meta_put_u32(bytes, 16, 2U);
+            meta_put_u32(bytes, 20, 72U + 2U * 80U + 24U);
+
+            meta_command(bytes, kSegment, m::kLcSegment64, 72U + 2U * 80U, 0, 0);
+            put_name(bytes, kSegment + 8, "__TEXT");
+            meta_put_u64(bytes, kSegment + 24, kBase);
+            meta_put_u64(bytes, kSegment + 32, 0x400ULL);
+            meta_put_u64(bytes, kSegment + 48, 0x400ULL);
+            meta_put_u32(bytes, kSegment + 56, 5);
+            meta_put_u32(bytes, kSegment + 60, 5);
+            meta_put_u32(bytes, kSegment + 64, 2);
+
+            put_name(bytes, kText, "__text");
+            put_name(bytes, kText + 16, "__TEXT");
+            meta_put_u64(bytes, kText + 32, kBase + 0x100ULL);
+            meta_put_u64(bytes, kText + 40, 0x100ULL);
+            meta_put_u32(bytes, kText + 48, 0x100);
+            meta_put_u32(bytes, kText + 52, 2);
+            meta_put_u32(bytes, kText + 64, 0x80000400U); // S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS
+
+            put_name(bytes, kConst, "__const");
+            put_name(bytes, kConst + 16, "__TEXT");
+            meta_put_u64(bytes, kConst + 32, kBase + 0x300ULL);
+            meta_put_u64(bytes, kConst + 40, 0x100ULL);
+            meta_put_u32(bytes, kConst + 48, 0x300);
+            meta_put_u32(bytes, kConst + 52, 3);
+
+            meta_command(bytes, kConst + 80, m::kLcMain, 24, 0x180, 0);
+            return bytes;
+        };
+
+        const auto valid = m::parse(section_image());
+        meta_expect(static_cast<bool>(valid) && valid.image.segments.size() == 1 &&
+                        valid.image.segments[0].name == "__TEXT" && valid.image.segments[0].vm_size == 0x400ULL,
+                    "section_64 table inside its segment parses (got " + std::string(m::error_name(valid.error)) + ")");
+        const auto expect_section = [&](std::size_t section, std::uint64_t address, std::uint64_t size, bool accepted,
+                                        const std::string& label) {
+            Bytes bytes = section_image();
+            meta_put_u64(bytes, section + 32, address);
+            meta_put_u64(bytes, section + 40, size);
+            const auto result = m::parse(bytes);
+            meta_expect(accepted ? static_cast<bool>(result)
+                                 : !result && result.error == m::ErrorCode::malformed_segment,
+                        label + " (got " + std::string(m::error_name(result.error)) + ")");
+        };
+        expect_section(kConst, kBase + 0x400ULL, 0, true, "an empty section_64 at its segment end parses");
+        expect_section(kText, kBase - 0x10ULL, 0x20ULL, false, "a section_64 starting before its segment is rejected");
+        expect_section(kConst, kBase + 0x300ULL, 0x101ULL, false,
+                       "a section_64 ending one byte past its segment is rejected");
+        expect_section(kConst, kBase + 0x401ULL, 0, false, "an empty section_64 past its segment end is rejected");
+        expect_section(kText, kBase + 0x100ULL, 0x8000000000000000ULL, false,
+                       "a section_64 size with the sign bit set is rejected");
+        // Summing addr + size here wraps to 0x100, so only a subtraction-based bound rejects this range.
+        expect_section(kConst, 0xffffffffffffff00ULL, 0x200ULL, false,
+                       "a section_64 whose addr + size wraps 64 bits is rejected");
+    }
+
     if (meta_failures != 0) {
         std::cerr << meta_failures << " Mach-O load-command metadata test(s) failed\n";
         return EXIT_FAILURE;
