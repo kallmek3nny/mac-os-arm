@@ -209,6 +209,33 @@ int macho_load_metadata_main() {
     expect_error([](Bytes& b) { meta_put_u32(b, kMetaDysymtab + 16, 0xffffffffU); },
                  m::ErrorCode::malformed_dynamic_symbol_table, "LC_DYSYMTAB iextdefsym wrapping 32 bits is rejected");
 
+    // The other LC_DYSYMTAB file tables hold 8-byte table-of-contents and relocation entries, 56-byte modules and
+    // 4-byte external references. Each table below starts at offset 0 and each count is the smallest past 0x400.
+    expect_error([](Bytes& b) { meta_put_u32(b, kMetaDysymtab + 36, 0x81); },
+                 m::ErrorCode::malformed_dynamic_symbol_table, "LC_DYSYMTAB table of contents past the image is rejected");
+    expect_error([](Bytes& b) { meta_put_u32(b, kMetaDysymtab + 44, 19); },
+                 m::ErrorCode::malformed_dynamic_symbol_table, "LC_DYSYMTAB module table past the image is rejected");
+    expect_error([](Bytes& b) { meta_put_u32(b, kMetaDysymtab + 52, 0x101); },
+                 m::ErrorCode::malformed_dynamic_symbol_table, "LC_DYSYMTAB external refs past the image are rejected");
+    expect_error([](Bytes& b) { meta_put_u32(b, kMetaDysymtab + 68, 0x81); },
+                 m::ErrorCode::malformed_dynamic_symbol_table, "LC_DYSYMTAB external relocs past the image are rejected");
+    expect_error([](Bytes& b) { meta_put_u32(b, kMetaDysymtab + 76, 0x81); },
+                 m::ErrorCode::malformed_dynamic_symbol_table, "LC_DYSYMTAB local relocs past the image are rejected");
+    // 0x20000000 eight-byte entries total exactly 2^32 bytes, which a 32-bit size would wrap to 0.
+    expect_error([](Bytes& b) { meta_put_u32(b, kMetaDysymtab + 36, 0x20000000U); },
+                 m::ErrorCode::malformed_dynamic_symbol_table, "LC_DYSYMTAB ntoc wrapping 32 bits is rejected");
+    {
+        // Tables that end exactly at the end of the file are still inside it.
+        Bytes bytes = load_metadata_image();
+        meta_put_u32(bytes, kMetaDysymtab + 36, 0x80);
+        meta_put_u32(bytes, kMetaDysymtab + 40, 0x3c8);
+        meta_put_u32(bytes, kMetaDysymtab + 44, 1);
+        meta_put_u32(bytes, kMetaDysymtab + 52, 0x100);
+        meta_put_u32(bytes, kMetaDysymtab + 68, 0x80);
+        meta_put_u32(bytes, kMetaDysymtab + 76, 0x80);
+        meta_expect(static_cast<bool>(m::parse(bytes)), "LC_DYSYMTAB file tables ending at the image end parse");
+    }
+
     {
         // Zippered images carry one LC_BUILD_VERSION per platform, so only a repeated platform is a duplicate.
         Bytes bytes = load_metadata_image();

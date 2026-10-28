@@ -352,10 +352,33 @@ ParseResult parse(std::span<const std::byte> bytes) {
                 !reader.read_u32(cursor + 60, table.indirect_symbol_count)) {
                 return fail(ErrorCode::malformed_dynamic_symbol_table, "truncated LC_DYSYMTAB");
             }
-            const std::uint64_t indirect_end = static_cast<std::uint64_t>(table.indirect_symbol_offset) +
-                                               static_cast<std::uint64_t>(table.indirect_symbol_count) * kIndirectSymbolSize;
-            if (indirect_end > bytes.size()) {
-                return fail(ErrorCode::malformed_dynamic_symbol_table, "LC_DYSYMTAB indirect symbol table exceeds image size");
+            // Each LC_DYSYMTAB file table is an (offset, count) pair of fixed-size entries, summed in 64 bits so
+            // counts near UINT32_MAX cannot wrap back inside the image.
+            struct DysymtabTable {
+                std::size_t field;
+                std::uint64_t entry_size;
+                const char* message;
+            };
+            constexpr DysymtabTable kDysymtabTables[] = {
+                {32, 8, "LC_DYSYMTAB table of contents exceeds image size"},
+                {40, 56, "LC_DYSYMTAB module table exceeds image size"},
+                {48, 4, "LC_DYSYMTAB external reference table exceeds image size"},
+                {56, kIndirectSymbolSize, "LC_DYSYMTAB indirect symbol table exceeds image size"},
+                {64, 8, "LC_DYSYMTAB external relocation table exceeds image size"},
+                {72, 8, "LC_DYSYMTAB local relocation table exceeds image size"},
+            };
+            for (const auto& file_table : kDysymtabTables) {
+                std::uint32_t table_offset = 0;
+                std::uint32_t entry_count = 0;
+                if (!reader.read_u32(cursor + file_table.field, table_offset) ||
+                    !reader.read_u32(cursor + file_table.field + 4, entry_count)) {
+                    return fail(ErrorCode::malformed_dynamic_symbol_table, "truncated LC_DYSYMTAB");
+                }
+                const std::uint64_t table_end = static_cast<std::uint64_t>(table_offset) +
+                                                static_cast<std::uint64_t>(entry_count) * file_table.entry_size;
+                if (table_end > bytes.size()) {
+                    return fail(ErrorCode::malformed_dynamic_symbol_table, file_table.message);
+                }
             }
             table.present = true;
         } else if (command == kLcUuid) {
