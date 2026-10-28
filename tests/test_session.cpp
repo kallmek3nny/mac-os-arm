@@ -105,7 +105,10 @@ std::vector<std::byte> synthetic_executable(
     put_u64(bytes, command + 24, 0x100000000ULL);
     put_u64(bytes, command + 32, text_vm_size);
     put_u64(bytes, command + 40, 0);
-    put_u64(bytes, command + 48, 0x4000);
+    // A segment cannot carry more file bytes than it maps, so an unaligned TEXT
+    // vmsize trims the file-backed range to fit. The parser accepts the image
+    // and the loader still reports the alignment fault.
+    put_u64(bytes, command + 48, text_vm_size < 0x4000ULL ? text_vm_size : 0x4000ULL);
     put_u32(bytes, command + 56, 5);
     put_u32(bytes, command + 60, 5);
 

@@ -219,6 +219,7 @@ ParseResult parse(std::span<const std::byte> bytes) {
             std::uint32_t max_protection = 0;
             std::uint32_t initial_protection = 0;
             std::uint32_t section_count = 0;
+            std::uint32_t segment_flags = 0;
 
             if (!reader.read_u64(cursor + 24, segment.vm_address) ||
                 !reader.read_u64(cursor + 32, segment.vm_size) ||
@@ -226,11 +227,20 @@ ParseResult parse(std::span<const std::byte> bytes) {
                 !reader.read_u64(cursor + 48, segment.file_size) ||
                 !reader.read_u32(cursor + 56, max_protection) ||
                 !reader.read_u32(cursor + 60, initial_protection) ||
-                !reader.read_u32(cursor + 64, section_count)) {
+                !reader.read_u32(cursor + 64, section_count) ||
+                !reader.read_u32(cursor + 68, segment_flags)) {
                 return fail(ErrorCode::malformed_segment, "truncated LC_SEGMENT_64");
             }
             segment.max_protection = max_protection;
             segment.initial_protection = initial_protection;
+
+            // dyld rejects a segment that maps more file bytes than it reserves in memory. The only exception is a
+            // non-allocated SG_NORELOC segment with vmsize 0, such as the __LLVM bitcode segment.
+            constexpr std::uint32_t kSgNoReloc = 0x4;
+            if (segment.file_size > segment.vm_size &&
+                (segment.vm_size != 0 || (segment_flags & kSgNoReloc) == 0)) {
+                return fail(ErrorCode::malformed_segment, "LC_SEGMENT_64 filesize exceeds vmsize");
+            }
 
             constexpr std::uint64_t kSection64Size = 80;
             const std::uint64_t required_size =

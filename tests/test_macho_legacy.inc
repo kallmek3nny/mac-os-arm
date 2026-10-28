@@ -300,6 +300,47 @@ int main() {
     }
 
     {
+        // dyld rejects a segment that maps more file bytes than it reserves in memory.
+        auto bytes = valid_image();
+        put_u64(bytes, 32 + 32, 0x100ULL);
+        const auto result = macosarm::macho::parse(bytes);
+        expect(result.error == macosarm::macho::ErrorCode::malformed_segment,
+               "segment filesize larger than vmsize rejected");
+    }
+
+    {
+        // A non-allocated SG_NORELOC segment with vmsize 0, such as the __LLVM bitcode segment, may still carry
+        // file bytes. The same segment without SG_NORELOC is rejected. It follows LC_MAIN at offset 128 and maps
+        // file bytes 0x180-0x1c0, which stay inside the 0x200-byte image.
+        const auto parse_with_unallocated_segment = [](std::uint32_t flags) {
+            auto bytes = valid_image();
+            put_u32(bytes, 16, 3);
+            put_u32(bytes, 20, 72 + 24 + 72);
+            constexpr std::size_t extra = 32 + 72 + 24;
+            put_u32(bytes, extra, macosarm::macho::kLcSegment64);
+            put_u32(bytes, extra + 4, 72);
+            put_name(bytes, extra + 8, "__LLVM");
+            put_u64(bytes, extra + 24, 0x100000200ULL);
+            put_u64(bytes, extra + 32, 0);
+            put_u64(bytes, extra + 40, 0x180ULL);
+            put_u64(bytes, extra + 48, 0x40ULL);
+            put_u32(bytes, extra + 56, 3);
+            put_u32(bytes, extra + 60, 3);
+            put_u32(bytes, extra + 64, 0);
+            put_u32(bytes, extra + 68, flags);
+            return macosarm::macho::parse(bytes);
+        };
+        constexpr std::uint32_t kSgNoReloc = 0x4U;
+        const auto accepted = parse_with_unallocated_segment(kSgNoReloc);
+        expect(static_cast<bool>(accepted), "SG_NORELOC segment with vmsize 0 may carry file bytes");
+        expect(accepted.image.segments.size() == 2 && accepted.image.segments[1].name == "__LLVM" &&
+                   accepted.image.segments[1].vm_size == 0 && accepted.image.segments[1].file_size == 0x40ULL,
+               "unallocated SG_NORELOC segment keeps its parsed sizes");
+        expect(parse_with_unallocated_segment(0U).error == macosarm::macho::ErrorCode::malformed_segment,
+               "vmsize 0 segment with file bytes but no SG_NORELOC rejected");
+    }
+
+    {
         auto bytes = valid_image();
         put_u64(bytes, 32 + 72 + 8, 0x400);
         const auto result = macosarm::macho::parse(bytes);
