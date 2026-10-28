@@ -241,6 +241,14 @@ ParseResult parse(std::span<const std::byte> bytes) {
                 (segment.vm_size != 0 || (segment_flags & kSgNoReloc) == 0)) {
                 return fail(ErrorCode::malformed_segment, "LC_SEGMENT_64 filesize exceeds vmsize");
             }
+            // dyld rejects a segment whose initprot sets bits outside VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE.
+            // dyld instead holds __TEXT and __LINKEDIT to exact r-x and r-- protections on newer binaries, so the
+            // invalid-bits test skips those two names. This parser does not enforce the exact-protection rule yet.
+            constexpr std::uint32_t kVmProtAll = 0x7;
+            if ((segment.initial_protection & ~kVmProtAll) != 0 && segment.name != "__TEXT" &&
+                segment.name != "__LINKEDIT") {
+                return fail(ErrorCode::malformed_segment, "LC_SEGMENT_64 initprot has invalid bits set");
+            }
             // dyld rejects a segment whose [vmaddr, vmaddr + vmsize) range wraps past the top of the 64-bit address
             // space, including one ending exactly at 2^64, because that end address does not fit in 64 bits.
             if (add_overflows(segment.vm_address, segment.vm_size)) {

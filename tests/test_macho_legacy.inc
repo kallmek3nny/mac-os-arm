@@ -467,6 +467,50 @@ int main() {
     }
 
     {
+        // dyld rejects a segment whose initprot sets bits outside VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE.
+        // It skips that test for __TEXT and __LINKEDIT, which it holds to exact protections instead. A second
+        // segment follows LC_MAIN at offset 128 in an image grown to 0x400 bytes, clear of __TEXT's ranges.
+        const auto parse_with_second_protection = [](const char* name, std::uint32_t initial_protection) {
+            auto bytes = valid_image();
+            bytes.resize(0x400, std::byte{0});
+            put_u32(bytes, 16, 3);
+            put_u32(bytes, 20, 72 + 24 + 72);
+            constexpr std::size_t extra = 32 + 72 + 24;
+            put_u32(bytes, extra, macosarm::macho::kLcSegment64);
+            put_u32(bytes, extra + 4, 72);
+            put_name(bytes, extra + 8, name);
+            put_u64(bytes, extra + 24, 0x100000200ULL);
+            put_u64(bytes, extra + 32, 0x200ULL);
+            put_u64(bytes, extra + 40, 0x200ULL);
+            put_u64(bytes, extra + 48, 0x200ULL);
+            put_u32(bytes, extra + 56, 7);
+            put_u32(bytes, extra + 60, initial_protection);
+            put_u32(bytes, extra + 64, 0);
+            put_u32(bytes, extra + 68, 0);
+            return macosarm::macho::parse(bytes);
+        };
+        const auto rejected = [](const macosarm::macho::ParseResult& result) {
+            return result.error == macosarm::macho::ErrorCode::malformed_segment &&
+                   result.message == "LC_SEGMENT_64 initprot has invalid bits set";
+        };
+
+        expect(static_cast<bool>(parse_with_second_protection("__DATA", 0x7U)),
+               "segment initprot using only read, write and execute bits parses");
+        expect(static_cast<bool>(parse_with_second_protection("__DATA", 0U)),
+               "segment initprot with no bits set parses");
+        expect(rejected(parse_with_second_protection("__DATA", 0x8U)),
+               "segment initprot with the first bit past VM_PROT_EXECUTE rejected");
+        expect(rejected(parse_with_second_protection("__DATA", 0x80000003U)),
+               "segment initprot with the top bit set rejected");
+        expect(static_cast<bool>(parse_with_second_protection("__LINKEDIT", 0x9U)),
+               "__LINKEDIT initprot skips the invalid-bits test");
+
+        auto bytes = valid_image();
+        put_u32(bytes, 32 + 60, 0xdU);
+        expect(static_cast<bool>(macosarm::macho::parse(bytes)), "__TEXT initprot skips the invalid-bits test");
+    }
+
+    {
         auto bytes = valid_image();
         put_u64(bytes, 32 + 72 + 8, 0x400);
         const auto result = macosarm::macho::parse(bytes);
