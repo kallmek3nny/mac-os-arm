@@ -243,7 +243,8 @@ ParseResult parse(std::span<const std::byte> bytes) {
             }
             // dyld rejects a segment whose initprot sets bits outside VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE.
             // dyld instead holds __TEXT and __LINKEDIT to exact r-x and r-- protections on newer binaries, so the
-            // invalid-bits test skips those two names. This parser does not enforce the exact-protection rule yet.
+            // invalid-bits test skips those two names. The exact-protection rule runs once every load command is
+            // parsed, because it depends on LC_BUILD_VERSION platforms that may follow the segments.
             constexpr std::uint32_t kVmProtAll = 0x7;
             if ((segment.initial_protection & ~kVmProtAll) != 0 && segment.name != "__TEXT" &&
                 segment.name != "__LINKEDIT") {
@@ -569,6 +570,59 @@ ParseResult parse(std::span<const std::byte> bytes) {
 
     if (cursor != commands_end) {
         return fail(ErrorCode::malformed_load_commands, "load-command count does not consume declared command region");
+    }
+    // dyld holds __TEXT to exactly r-x and __LINKEDIT to exactly r-- once any LC_BUILD_VERSION platform opts the image
+    // into those format rules, following its enforceFormat thresholds. macOS opts in to both from the 10.15 SDK. iOS,
+    // tvOS, Mac Catalyst and watchOS always opt in for __TEXT, and opt in for __LINKEDIT from the iOS/tvOS 13 and
+    // watchOS 9 SDKs. Any other nonzero platform opts in to both. Platform 0 carries no platform information, and an
+    // image without LC_BUILD_VERSION skips both rules. LC_VERSION_MIN_* is not parsed yet, so an image that names its
+    // platform only through it also skips the rules here, even where dyld would apply them.
+    {
+        constexpr std::uint32_t kPlatformMacOs = 1;
+        constexpr std::uint32_t kPlatformIos = 2;
+        constexpr std::uint32_t kPlatformTvOs = 3;
+        constexpr std::uint32_t kPlatformWatchOs = 4;
+        constexpr std::uint32_t kPlatformMacCatalyst = 6;
+        constexpr std::uint32_t kVmProtRead = 0x1;
+        constexpr std::uint32_t kVmProtExecute = 0x4;
+        bool exact_text_protection = false;
+        bool exact_linkedit_protection = false;
+        for (const BuildVersion& build : result.image.build_versions) {
+            switch (build.platform) {
+            case 0:
+                break;
+            case kPlatformMacOs:
+                if (build.sdk >= 0x000a0f00U) {
+                    exact_text_protection = true;
+                    exact_linkedit_protection = true;
+                }
+                break;
+            case kPlatformIos:
+            case kPlatformTvOs:
+            case kPlatformMacCatalyst:
+                exact_text_protection = true;
+                exact_linkedit_protection = exact_linkedit_protection || build.sdk >= 0x000d0000U;
+                break;
+            case kPlatformWatchOs:
+                exact_text_protection = true;
+                exact_linkedit_protection = exact_linkedit_protection || build.sdk >= 0x00090000U;
+                break;
+            default:
+                exact_text_protection = true;
+                exact_linkedit_protection = true;
+                break;
+            }
+        }
+        for (const Segment& segment : result.image.segments) {
+            if (exact_text_protection && segment.name == "__TEXT" &&
+                segment.initial_protection != (kVmProtRead | kVmProtExecute)) {
+                return fail(ErrorCode::malformed_segment, "__TEXT segment initprot is not r-x");
+            }
+            if (exact_linkedit_protection && segment.name == "__LINKEDIT" &&
+                segment.initial_protection != kVmProtRead) {
+                return fail(ErrorCode::malformed_segment, "__LINKEDIT segment initprot is not r--");
+            }
+        }
     }
     // LC_DYSYMTAB only partitions the LC_SYMTAB nlist array, so it needs that
     // table, and its local, external and undefined ranges must stay inside the

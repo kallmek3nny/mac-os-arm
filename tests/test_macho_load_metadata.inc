@@ -331,6 +331,134 @@ int macho_load_metadata_main() {
                        "a section_64 whose addr + size wraps 64 bits is rejected");
     }
 
+    {
+        // dyld holds __TEXT to exactly r-x and __LINKEDIT to exactly r-- once an LC_BUILD_VERSION platform opts the
+        // image into those format rules. Each case names the metadata image's only segment, sets its initprot and
+        // rewrites the platform, minimum OS and SDK of its LC_BUILD_VERSION. maxprot is rwx, so only initprot varies.
+        constexpr std::uint32_t kR = 0x1;
+        constexpr std::uint32_t kRw = 0x3;
+        constexpr std::uint32_t kRx = 0x5;
+        constexpr std::uint32_t kRwx = 0x7;
+        constexpr std::uint32_t kMacOs = 1;
+        constexpr std::uint32_t kIos = 2;
+        constexpr std::uint32_t kTvOs = 3;
+        constexpr std::uint32_t kWatchOs = 4;
+        constexpr std::uint32_t kMacCatalyst = 6;
+        constexpr std::uint32_t kVisionOs = 11;
+        constexpr std::uint32_t kMacOsSdk = 0x001b0100U;
+        const std::string text_error = "__TEXT segment initprot is not r-x";
+        const std::string linkedit_error = "__LINKEDIT segment initprot is not r--";
+        const auto protection_image = [](const std::string& name, std::uint32_t initial_protection,
+                                         std::uint32_t platform, std::uint32_t sdk) {
+            Bytes bytes = load_metadata_image();
+            for (std::size_t i = 0; i < name.size(); ++i) {
+                bytes.at(32 + 8 + i) = static_cast<std::byte>(name[i]);
+            }
+            meta_put_u32(bytes, 32 + 56, 0x7U);
+            meta_put_u32(bytes, 32 + 60, initial_protection);
+            meta_put_u32(bytes, kMetaBuild + 8, platform);
+            meta_put_u32(bytes, kMetaBuild + 12, sdk);
+            meta_put_u32(bytes, kMetaBuild + 16, sdk);
+            return bytes;
+        };
+        const auto expect_protection = [](const Bytes& bytes, const std::string& error, const std::string& label) {
+            const auto result = m::parse(bytes);
+            const bool matched = error.empty() ? static_cast<bool>(result)
+                                               : (!result && result.error == m::ErrorCode::malformed_segment &&
+                                                  result.message == error);
+            meta_expect(matched, label + " (got " + std::string(m::error_name(result.error)) + ")");
+        };
+
+        // macOS opts in to both rules from the 10.15 SDK, so the metadata image's macOS 27.1 SDK applies them.
+        expect_protection(protection_image("__TEXT", kRx, kMacOs, kMacOsSdk), "",
+                          "macOS 27 SDK __TEXT r-x parses");
+        expect_protection(protection_image("__TEXT", kRwx, kMacOs, kMacOsSdk), text_error,
+                          "macOS 27 SDK __TEXT rwx is rejected");
+        // 0xd adds a bit past VM_PROT_EXECUTE that the invalid-bits test skips for __TEXT; the exact rule rejects it.
+        expect_protection(protection_image("__TEXT", 0xdU, kMacOs, kMacOsSdk), text_error,
+                          "macOS 27 SDK __TEXT r-x plus an invalid bit is rejected");
+        expect_protection(protection_image("__LINKEDIT", kR, kMacOs, kMacOsSdk), "",
+                          "macOS 27 SDK __LINKEDIT r-- parses");
+        expect_protection(protection_image("__LINKEDIT", kRw, kMacOs, kMacOsSdk), linkedit_error,
+                          "macOS 27 SDK __LINKEDIT rw- is rejected");
+        expect_protection(protection_image("__LINKEDIT", 0x9U, kMacOs, kMacOsSdk), linkedit_error,
+                          "macOS 27 SDK __LINKEDIT r-- plus an invalid bit is rejected");
+        // Only the exact segment names are held to these protections.
+        expect_protection(protection_image("__DATA", kRwx, kMacOs, kMacOsSdk), "",
+                          "macOS 27 SDK __DATA rwx parses");
+        expect_protection(protection_image("__TEXT_EXEC", kRwx, kMacOs, kMacOsSdk), "",
+                          "macOS 27 SDK __TEXT_EXEC rwx parses");
+
+        // Older macOS SDKs skip both rules.
+        expect_protection(protection_image("__TEXT", kRwx, kMacOs, 0x000a0e00U), "",
+                          "macOS 10.14 SDK __TEXT rwx parses");
+        expect_protection(protection_image("__LINKEDIT", kRw, kMacOs, 0x000a0e00U), "",
+                          "macOS 10.14 SDK __LINKEDIT rw- parses");
+        expect_protection(protection_image("__TEXT", kRwx, kMacOs, 0x000a0f00U), text_error,
+                          "macOS 10.15 SDK __TEXT rwx is rejected");
+        expect_protection(protection_image("__LINKEDIT", kRw, kMacOs, 0x000a0f00U), linkedit_error,
+                          "macOS 10.15 SDK __LINKEDIT rw- is rejected");
+        // iOS and tvOS always hold __TEXT to r-x, and hold __LINKEDIT to r-- from the 13 SDK.
+        expect_protection(protection_image("__TEXT", kRwx, kIos, 0x000c0000U), text_error,
+                          "iOS 12 SDK __TEXT rwx is rejected");
+        expect_protection(protection_image("__LINKEDIT", kRw, kIos, 0x000c0000U), "",
+                          "iOS 12 SDK __LINKEDIT rw- parses");
+        expect_protection(protection_image("__LINKEDIT", kRw, kIos, 0x000d0000U), linkedit_error,
+                          "iOS 13 SDK __LINKEDIT rw- is rejected");
+        expect_protection(protection_image("__TEXT", kRwx, kTvOs, 0x000c0000U), text_error,
+                          "tvOS 12 SDK __TEXT rwx is rejected");
+        expect_protection(protection_image("__LINKEDIT", kRw, kTvOs, 0x000c0000U), "",
+                          "tvOS 12 SDK __LINKEDIT rw- parses");
+        expect_protection(protection_image("__LINKEDIT", kRw, kTvOs, 0x000d0000U), linkedit_error,
+                          "tvOS 13 SDK __LINKEDIT rw- is rejected");
+        // watchOS always holds __TEXT to r-x, and holds __LINKEDIT to r-- from the 9 SDK.
+        expect_protection(protection_image("__TEXT", kRwx, kWatchOs, 0x00080000U), text_error,
+                          "watchOS 8 SDK __TEXT rwx is rejected");
+        expect_protection(protection_image("__LINKEDIT", kRw, kWatchOs, 0x00080000U), "",
+                          "watchOS 8 SDK __LINKEDIT rw- parses");
+        expect_protection(protection_image("__LINKEDIT", kRw, kWatchOs, 0x00090000U), linkedit_error,
+                          "watchOS 9 SDK __LINKEDIT rw- is rejected");
+        // Any other nonzero platform applies both rules, while platform 0 carries no platform information.
+        expect_protection(protection_image("__TEXT", kRwx, kVisionOs, 0x00010000U), text_error,
+                          "visionOS 1 SDK __TEXT rwx is rejected");
+        expect_protection(protection_image("__LINKEDIT", kRw, kVisionOs, 0x00010000U), linkedit_error,
+                          "visionOS 1 SDK __LINKEDIT rw- is rejected");
+        expect_protection(protection_image("__TEXT", kRwx, 0U, kMacOsSdk), "",
+                          "platform 0 __TEXT rwx parses");
+        expect_protection(protection_image("__LINKEDIT", kRw, 0U, kMacOsSdk), "",
+                          "platform 0 __LINKEDIT rw- parses");
+        {
+            // Without LC_BUILD_VERSION neither rule applies. LC_SYMSEG (0x3) replaces that command and is skipped.
+            Bytes text = protection_image("__TEXT", kRwx, kMacOs, kMacOsSdk);
+            meta_put_u32(text, kMetaBuild, 0x3U);
+            expect_protection(text, "", "__TEXT rwx without LC_BUILD_VERSION parses");
+            Bytes linkedit = protection_image("__LINKEDIT", kRw, kMacOs, kMacOsSdk);
+            meta_put_u32(linkedit, kMetaBuild, 0x3U);
+            expect_protection(linkedit, "", "__LINKEDIT rw- without LC_BUILD_VERSION parses");
+        }
+
+        // A zippered image carries one LC_BUILD_VERSION per platform, and either one opting in applies a rule. The
+        // first command replaces LC_UUID, ahead of the metadata image's own LC_BUILD_VERSION.
+        const auto zippered = [&](const std::string& name, std::uint32_t initial_protection, std::uint32_t first,
+                                  std::uint32_t first_sdk, std::uint32_t second, std::uint32_t second_sdk) {
+            Bytes bytes = protection_image(name, initial_protection, second, second_sdk);
+            meta_command(bytes, kMetaUuid, m::kLcBuildVersion, 24, first, first_sdk);
+            meta_put_u32(bytes, kMetaUuid + 16, first_sdk);
+            meta_put_u32(bytes, kMetaUuid + 20, 0);
+            return bytes;
+        };
+        expect_protection(zippered("__TEXT", kRwx, kMacCatalyst, 0x000d0000U, kMacOs, 0x000a0e00U), text_error,
+                          "zippered Catalyst 13 and macOS 10.14 SDKs reject __TEXT rwx");
+        expect_protection(zippered("__LINKEDIT", kRw, kMacCatalyst, 0x000d0000U, kMacOs, 0x000a0e00U),
+                          linkedit_error, "zippered Catalyst 13 and macOS 10.14 SDKs reject __LINKEDIT rw-");
+        expect_protection(zippered("__LINKEDIT", kRw, kMacOs, kMacOsSdk, kMacCatalyst, 0x000c0000U), linkedit_error,
+                          "a later Catalyst 12 SDK keeps the macOS 27 SDK __LINKEDIT rule");
+        expect_protection(zippered("__TEXT", kRwx, kMacOs, 0x000a0e00U, kMacCatalyst, 0x000c0000U), text_error,
+                          "zippered macOS 10.14 and Catalyst 12 SDKs reject __TEXT rwx");
+        expect_protection(zippered("__LINKEDIT", kRw, kMacOs, 0x000a0e00U, kMacCatalyst, 0x000c0000U), "",
+                          "zippered macOS 10.14 and Catalyst 12 SDKs accept __LINKEDIT rw-");
+    }
+
     if (meta_failures != 0) {
         std::cerr << meta_failures << " Mach-O load-command metadata test(s) failed\n";
         return EXIT_FAILURE;
