@@ -198,6 +198,17 @@ int macho_load_metadata_main() {
     expect_error([](Bytes& b) { meta_put_u32(b, kMetaStarts, m::kLcCodeSignature); }, m::ErrorCode::duplicate_load_command,
                  "a second LC_CODE_SIGNATURE is rejected");
 
+    // LC_DYSYMTAB partitions index the LC_SYMTAB nlist array, so they need that table and must fit inside its
+    // nsyms. The valid image already ends the undefined partition exactly at nsyms; LC_SYMSEG (0x3) is skipped.
+    expect_error([](Bytes& b) { meta_put_u32(b, kMetaSymtab, 0x3U); },
+                 m::ErrorCode::malformed_dynamic_symbol_table, "LC_DYSYMTAB without LC_SYMTAB is rejected");
+    expect_error([](Bytes& b) { meta_put_u32(b, kMetaDysymtab + 12, 3); },
+                 m::ErrorCode::malformed_dynamic_symbol_table, "LC_DYSYMTAB local symbols past nsyms are rejected");
+    expect_error([](Bytes& b) { meta_put_u32(b, kMetaDysymtab + 28, 1); },
+                 m::ErrorCode::malformed_dynamic_symbol_table, "LC_DYSYMTAB undefined symbols past nsyms are rejected");
+    expect_error([](Bytes& b) { meta_put_u32(b, kMetaDysymtab + 16, 0xffffffffU); },
+                 m::ErrorCode::malformed_dynamic_symbol_table, "LC_DYSYMTAB iextdefsym wrapping 32 bits is rejected");
+
     {
         // Zippered images carry one LC_BUILD_VERSION per platform, so only a repeated platform is a duplicate.
         Bytes bytes = load_metadata_image();

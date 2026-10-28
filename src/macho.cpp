@@ -483,6 +483,25 @@ ParseResult parse(std::span<const std::byte> bytes) {
     if (cursor != commands_end) {
         return fail(ErrorCode::malformed_load_commands, "load-command count does not consume declared command region");
     }
+    // LC_DYSYMTAB only partitions the LC_SYMTAB nlist array, so it needs that
+    // table, and its local, external and undefined ranges must stay inside the
+    // declared symbol count.
+    if (result.image.dynamic_symbol_table.present) {
+        if (!result.image.symbol_table.present) {
+            return fail(ErrorCode::malformed_dynamic_symbol_table, "LC_DYSYMTAB requires LC_SYMTAB");
+        }
+        const DynamicSymbolTable& dynamic = result.image.dynamic_symbol_table;
+        const std::uint64_t symbol_count = result.image.symbol_table.symbol_count;
+        const auto partition_fits = [symbol_count](std::uint32_t index, std::uint32_t count) {
+            return static_cast<std::uint64_t>(index) + static_cast<std::uint64_t>(count) <= symbol_count;
+        };
+        if (!partition_fits(dynamic.local_symbol_index, dynamic.local_symbol_count) ||
+            !partition_fits(dynamic.external_symbol_index, dynamic.external_symbol_count) ||
+            !partition_fits(dynamic.undefined_symbol_index, dynamic.undefined_symbol_count)) {
+            return fail(ErrorCode::malformed_dynamic_symbol_table,
+                        "LC_DYSYMTAB symbol partition exceeds LC_SYMTAB symbol count");
+        }
+    }
     if (result.image.file_type == kMhDylib && !result.image.has_dylib_identity) {
         return fail(ErrorCode::missing_dylib_identity, "MH_DYLIB image is missing LC_ID_DYLIB");
     }
