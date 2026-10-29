@@ -561,6 +561,131 @@ int macho_load_metadata_main() {
                           linkedit_error, "LC_VERSION_MIN_WATCHOS 9 SDK __LINKEDIT rw- is rejected");
     }
 
+    // LC_DYLD_INFO and LC_DYLD_INFO_ONLY carry one 48-byte dyld_info_command: cmd, cmdsize and the (offset, size)
+    // pairs of the rebase, bind, weak-bind and lazy-bind opcode streams and the export trie. Each layout writes it
+    // over 48 bytes of existing commands, so sizeofcmds stays 320 and only ncmds changes. The streams sit in
+    // 0x3c0-0x400, which the replaced LC_CODE_SIGNATURE no longer claims, and the export trie ends exactly at the
+    // end of the image. The zero-size weak-bind stream keeps an offset past the image because dyld never walks an
+    // empty stream.
+    {
+        const auto put_dyld_info = [](Bytes& b, std::size_t at, std::uint32_t command) {
+            constexpr std::uint32_t streams[10] = {0x3c0, 8, 0x3c8, 0x10, 0xfffffff0U, 0, 0x3d8, 8, 0x3e0, 0x20};
+            meta_put_u32(b, at, command);
+            meta_put_u32(b, at + 4, 48);
+            for (std::size_t i = 0; i < 10; ++i) {
+                meta_put_u32(b, at + 8 + i * 4, streams[i]);
+            }
+        };
+        // One command over LC_SOURCE_VERSION, LC_CODE_SIGNATURE and LC_FUNCTION_STARTS leaves eight load commands.
+        const auto dyld_info_image = [&](std::uint32_t command) {
+            Bytes b = load_metadata_image();
+            meta_put_u32(b, 16, 8U);
+            put_dyld_info(b, kMetaSource, command);
+            return b;
+        };
+        const auto range_is = [](const m::FileRange& range, std::uint64_t offset, std::uint64_t size, bool present) {
+            return range.offset == offset && range.size == size && range.present == present;
+        };
+
+        meta_expect(!m::parse(load_metadata_image()).image.dyld_info.present,
+                    "an image without LC_DYLD_INFO reports no dyld info");
+        {
+            const auto parsed = m::parse(dyld_info_image(m::kLcDyldInfoOnly));
+            const auto& info = parsed.image.dyld_info;
+            meta_expect(static_cast<bool>(parsed) && info.present && info.command == m::kLcDyldInfoOnly &&
+                            range_is(info.rebase, 0x3c0, 8, true) && range_is(info.bind, 0x3c8, 0x10, true) &&
+                            range_is(info.lazy_bind, 0x3d8, 8, true) &&
+                            range_is(info.export_trie, 0x3e0, 0x20, true),
+                        "LC_DYLD_INFO_ONLY command and stream ranges are preserved (got " +
+                            std::string(m::error_name(parsed.error)) + ")");
+            meta_expect(range_is(info.weak_bind, 0xfffffff0U, 0, false),
+                        "a zero-size LC_DYLD_INFO stream keeps its raw offset and is not present");
+        }
+        {
+            const auto plain = m::parse(dyld_info_image(m::kLcDyldInfo));
+            meta_expect(static_cast<bool>(plain) && plain.image.dyld_info.present &&
+                            plain.image.dyld_info.command == m::kLcDyldInfo,
+                        "LC_DYLD_INFO parses and stays distinct from LC_DYLD_INFO_ONLY (got " +
+                            std::string(m::error_name(plain.error)) + ")");
+        }
+
+        // Each case mutates the LC_DYLD_INFO_ONLY layout and must stop with that rule's own error and message.
+        const auto expect_rejected = [&](auto mutate, m::ErrorCode expected, const std::string& message,
+                                         const std::string& label) {
+            Bytes bytes = dyld_info_image(m::kLcDyldInfoOnly);
+            mutate(bytes);
+            const auto result = m::parse(bytes);
+            const std::string reported(result.message);
+            meta_expect(!result && result.error == expected && reported.find(message) != std::string::npos,
+                        label + " (got " + std::string(m::error_name(result.error)) + ": " + reported + ")");
+        };
+        const auto malformed = m::ErrorCode::malformed_linkedit_data;
+        const std::string size_error = "LC_DYLD_INFO cmdsize is not 48";
+        const std::string range_error = "LC_DYLD_INFO stream range exceeds image size";
+        const std::string both_error = "image contains both LC_DYLD_INFO_ONLY and LC_DYLD_CHAINED_FIXUPS";
+
+        // dyld requires cmdsize == sizeof(dyld_info_command); both wrong sizes still end inside sizeofcmds.
+        expect_rejected([](Bytes& b) { meta_put_u32(b, kMetaSource + 4, 40); }, malformed, size_error,
+                        "LC_DYLD_INFO cmdsize below dyld_info_command is rejected");
+        expect_rejected([](Bytes& b) { meta_put_u32(b, kMetaSource + 4, 56); }, malformed, size_error,
+                        "LC_DYLD_INFO cmdsize above dyld_info_command is rejected");
+
+        // The pairs follow cmd and cmdsize: rebase at +8, bind +16, weak bind +24, lazy bind +32, export trie +40.
+        expect_rejected([](Bytes& b) { meta_put_u32(b, kMetaSource + 20, 0x100); }, malformed, range_error,
+                        "LC_DYLD_INFO bind stream past the image is rejected");
+        expect_rejected([](Bytes& b) { meta_put_u32(b, kMetaSource + 44, 0x21); }, malformed, range_error,
+                        "LC_DYLD_INFO export trie one byte past the image is rejected");
+        expect_rejected([](Bytes& b) { meta_put_u32(b, kMetaSource + 8, 0xfffffff8U); }, malformed, range_error,
+                        "LC_DYLD_INFO rebase offset wrapping 32 bits is rejected");
+        expect_rejected([](Bytes& b) { meta_put_u32(b, kMetaSource + 28, 1); }, malformed, range_error,
+                        "a nonzero LC_DYLD_INFO weak-bind stream at its raw offset past the image is rejected");
+
+        // Two commands over LC_BUILD_VERSION through LC_DATA_IN_CODE leave seven load commands.
+        expect_rejected(
+            [&](Bytes& b) {
+                meta_put_u32(b, 16, 7U);
+                put_dyld_info(b, kMetaBuild, m::kLcDyldInfo);
+                put_dyld_info(b, kMetaSignature, m::kLcDyldInfoOnly);
+            },
+            m::ErrorCode::duplicate_load_command, "multiple LC_DYLD_INFO commands",
+            "LC_DYLD_INFO then LC_DYLD_INFO_ONLY is rejected as a duplicate");
+
+        // LC_DYLD_INFO_ONLY opcodes beside LC_DYLD_CHAINED_FIXUPS encode the fixups twice, whichever command
+        // comes first and even when every opcode stream is empty. The chained-fixups payload reuses the
+        // LC_DATA_IN_CODE range.
+        const auto add_fixups = [](Bytes& b) {
+            meta_command(b, kMetaDataInCode, m::kLcDyldChainedFixups, 16, 0x3b0, 8);
+        };
+        expect_rejected(add_fixups, malformed, both_error,
+                        "LC_DYLD_INFO_ONLY then LC_DYLD_CHAINED_FIXUPS is rejected");
+        // LC_DYLD_CHAINED_FIXUPS over LC_SOURCE_VERSION, then LC_DYLD_INFO_ONLY over the three commands after it.
+        expect_rejected(
+            [&](Bytes& b) {
+                meta_command(b, kMetaSource, m::kLcDyldChainedFixups, 16, 0x3b0, 8);
+                put_dyld_info(b, kMetaSignature, m::kLcDyldInfoOnly);
+            },
+            malformed, both_error, "LC_DYLD_CHAINED_FIXUPS then LC_DYLD_INFO_ONLY is rejected");
+        expect_rejected(
+            [&](Bytes& b) {
+                add_fixups(b);
+                for (std::size_t field = 12; field < 48; field += 8) {
+                    meta_put_u32(b, kMetaSource + field, 0);
+                }
+            },
+            malformed, both_error, "LC_DYLD_INFO_ONLY with only empty streams beside chained fixups is rejected");
+
+        // dyld's check counts only LC_DYLD_INFO_ONLY, so a plain LC_DYLD_INFO may sit beside chained fixups.
+        {
+            Bytes legacy = dyld_info_image(m::kLcDyldInfo);
+            add_fixups(legacy);
+            const auto beside = m::parse(legacy);
+            meta_expect(static_cast<bool>(beside) && beside.image.dyld_info.command == m::kLcDyldInfo &&
+                            range_is(beside.image.chained_fixups, 0x3b0, 8, true),
+                        "LC_DYLD_INFO beside LC_DYLD_CHAINED_FIXUPS parses (got " +
+                            std::string(m::error_name(beside.error)) + ")");
+        }
+    }
+
     if (meta_failures != 0) {
         std::cerr << meta_failures << " Mach-O load-command metadata test(s) failed\n";
         return EXIT_FAILURE;

@@ -30,6 +30,8 @@ constexpr std::uint32_t kLcRpath = 0x1cU | kLcReqDyld;
 constexpr std::uint32_t kLcCodeSignature = 0x1d;
 constexpr std::uint32_t kLcReexportDylib = 0x1fU | kLcReqDyld;
 constexpr std::uint32_t kLcLazyLoadDylib = 0x20;
+constexpr std::uint32_t kLcDyldInfo = 0x22;
+constexpr std::uint32_t kLcDyldInfoOnly = 0x22U | kLcReqDyld;
 constexpr std::uint32_t kLcLoadUpwardDylib = 0x23U | kLcReqDyld;
 constexpr std::uint32_t kLcVersionMinMacosx = 0x24;
 constexpr std::uint32_t kLcVersionMinIphoneos = 0x25;
@@ -123,6 +125,20 @@ struct VersionMin {
     std::uint32_t sdk{};
 };
 
+// One LC_DYLD_INFO or LC_DYLD_INFO_ONLY command: the rebase, bind, weak-bind and lazy-bind opcode streams and the
+// export trie that predate LC_DYLD_CHAINED_FIXUPS and LC_DYLD_EXPORTS_TRIE. command keeps the raw load command, so
+// LC_DYLD_INFO_ONLY stays distinguishable. Each stream keeps its raw file offset and size and is present only when
+// its size is nonzero, matching the streams dyld walks.
+struct DyldInfo {
+    std::uint32_t command{};
+    FileRange rebase;
+    FileRange bind;
+    FileRange weak_bind;
+    FileRange lazy_bind;
+    FileRange export_trie;
+    bool present{};
+};
+
 struct Image {
     std::int32_t cpu_type{};
     std::int32_t cpu_subtype{};
@@ -138,6 +154,7 @@ struct Image {
     std::vector<DylibDependency> dependencies;
     FileRange exports_trie;
     FileRange chained_fixups;
+    DyldInfo dyld_info;
     std::vector<Segment> segments;
     SymbolTable symbol_table;
     DynamicSymbolTable dynamic_symbol_table;

@@ -530,6 +530,38 @@ ParseResult parse(std::span<const std::byte> bytes) {
                 return fail(ErrorCode::malformed_source_version, "truncated LC_SOURCE_VERSION");
             }
             result.image.has_source_version = true;
+        } else if (command == kLcDyldInfo || command == kLcDyldInfoOnly) {
+            // dyld_info_command is cmd, cmdsize and five (offset, size) pairs: rebase, bind, weak bind, lazy bind and
+            // export trie. dyld's load-command structure check rejects any cmdsize other than sizeof(dyld_info_command)
+            // and rejects a second LC_DYLD_INFO or LC_DYLD_INFO_ONLY. dyld only walks a stream whose size is nonzero,
+            // so only those streams must fit inside the image; a zero-size stream keeps its raw offset unchecked.
+            constexpr std::size_t kDyldInfoCommandSize = 48;
+            if (command_size != kDyldInfoCommandSize) {
+                return fail(ErrorCode::malformed_linkedit_data, "LC_DYLD_INFO cmdsize is not 48");
+            }
+            if (result.image.dyld_info.present) {
+                return fail(ErrorCode::duplicate_load_command, "multiple LC_DYLD_INFO commands are not supported");
+            }
+            DyldInfo& info = result.image.dyld_info;
+            info.command = command;
+            FileRange* const streams[] = {&info.rebase, &info.bind, &info.weak_bind, &info.lazy_bind, &info.export_trie};
+            std::size_t field = 8;
+            for (FileRange* stream : streams) {
+                std::uint32_t stream_offset = 0;
+                std::uint32_t stream_size = 0;
+                if (!reader.read_u32(cursor + field, stream_offset) ||
+                    !reader.read_u32(cursor + field + 4, stream_size)) {
+                    return fail(ErrorCode::malformed_linkedit_data, "truncated LC_DYLD_INFO");
+                }
+                if (stream_size != 0 && !linkedit_range_valid(bytes.size(), stream_offset, stream_size)) {
+                    return fail(ErrorCode::malformed_linkedit_data, "LC_DYLD_INFO stream range exceeds image size");
+                }
+                stream->offset = stream_offset;
+                stream->size = stream_size;
+                stream->present = stream_size != 0;
+                field += 8;
+            }
+            info.present = true;
         } else if (command == kLcDyldExportsTrie || command == kLcDyldChainedFixups || command == kLcCodeSignature ||
                    command == kLcFunctionStarts || command == kLcDataInCode) {
             if (command_size < kLinkeditDataCommandSize) {
@@ -685,6 +717,14 @@ ParseResult parse(std::span<const std::byte> bytes) {
                 return fail(ErrorCode::malformed_segment, "__LINKEDIT segment initprot is not r--");
             }
         }
+    }
+    // dyld's linkedit check rejects an image whose fixups are encoded both as LC_DYLD_INFO_ONLY opcodes and as
+    // LC_DYLD_CHAINED_FIXUPS, whichever command comes first and even when either payload is empty. A plain
+    // LC_DYLD_INFO does not count, so it may sit beside chained fixups.
+    if (result.image.dyld_info.present && result.image.dyld_info.command == kLcDyldInfoOnly &&
+        result.image.chained_fixups.present) {
+        return fail(ErrorCode::malformed_linkedit_data,
+                    "image contains both LC_DYLD_INFO_ONLY and LC_DYLD_CHAINED_FIXUPS");
     }
     // LC_DYSYMTAB only partitions the LC_SYMTAB nlist array, so it needs that
     // table, and its local, external and undefined ranges must stay inside the
