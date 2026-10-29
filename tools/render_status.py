@@ -18,10 +18,10 @@ ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "docs/status.json"
 SVG = ROOT / "docs/assets/status.svg"
 REPORT = ROOT / "docs/PROGRESS.md"
-PASS = "#2e9645"
-PENDING = "#35404c"
-TEXT = "#eff5fb"
-MUTED = "#aab8c8"
+PASS = "#65dfad"
+PENDING = "#91a1b8"
+TEXT = "#edf3fc"
+MUTED = "#9eafc6"
 
 
 def junit_names(path):
@@ -83,37 +83,35 @@ def text(x, y, value, size=14, fill=TEXT, weight=400, extra=""):
             f'fill="{fill}" font-weight="{weight}" {extra}>{escape(str(value))}</text>')
 
 
-def rect(x, y, width, height, fill):
+def rect(x, y, width, height, fill, radius=0, stroke="none"):
     return (f'<rect x="{x:.2f}" y="{y:.2f}" width="{width:.2f}" '
-            f'height="{height:.2f}" fill="{fill}"/>')
+            f'height="{height:.2f}" rx="{radius}" fill="{fill}" stroke="{stroke}"/>')
 
 
-def tile_group(x, y, width, height, label, cells):
-    """One labeled region, one individually identified tile per real item."""
-    pieces = [rect(x, y, width, height, "#16212b")]
+def tile_group(x, y, width, height, label, cells, columns):
+    """Keep headings and individual evidence tiles readable in a consistent card."""
+    pieces = [rect(x, y, width, height, "#101b2a", 12, "#243249")]
     passed = sum(cell["verified"] for cell in cells)
-    pieces.append(text(x + 8, y + 20, label, 14, weight=600))
-    pieces.append(text(x + width - 8, y + 20, f"{passed}/{len(cells)}", 12,
-                       MUTED, extra='text-anchor="end"'))
-    inner_w, inner_h = width - 8, height - 32
-    def grid_score(columns):
-        rows = math.ceil(len(cells) / columns)
-        aspect = (inner_w / columns) / (inner_h / rows)
-        empty = (columns * rows - len(cells)) / len(cells)
-        return abs(math.log(aspect)) + 3 * empty
-
-    columns = min(range(1, len(cells) + 1), key=grid_score)
+    pieces.append(text(x + 14, y + 29, label, 17, weight=600))
+    complete = passed == len(cells)
+    pieces.append(rect(x + width - 66, y + 12, 52, 24,
+                       "#16352f" if complete else "#1d2a3e", 6))
+    pieces.append(text(x + width - 40, y + 29, f"{passed}/{len(cells)}", 13,
+                       PASS if complete else MUTED, weight=600, extra='text-anchor="middle"'))
     rows = math.ceil(len(cells) / columns)
-    cell_w, cell_h = inner_w / columns, inner_h / rows
+    gap = 6
+    cell_w = (width - 28 - gap * (columns - 1)) / columns
+    cell_h = (height - 62 - gap * (rows - 1)) / rows
     for index, cell in enumerate(cells):
-        cx = x + 4 + index % columns * cell_w
-        cy = y + 28 + index // columns * cell_h
+        cx = x + 14 + index % columns * (cell_w + gap)
+        cy = y + 48 + index // columns * (cell_h + gap)
         pieces.append(f'<g id="{escape(cell["id"])}"><title>{escape(cell["detail"])}</title>')
-        pieces.append(rect(cx + 1, cy + 1, cell_w - 2, cell_h - 2,
-                           PASS if cell["verified"] else PENDING))
-        pieces.append(text(cx + cell_w / 2, cy + cell_h / 2 + 4,
-                           cell["label"], 12, "#07140b" if cell["verified"] else TEXT,
-                           weight=600, extra='text-anchor="middle"'))
+        pieces.append(rect(cx, cy, cell_w, cell_h,
+                           "#153b32" if cell["verified"] else "#1a273a", 5,
+                           "#2b6853" if cell["verified"] else "#35445c"))
+        pieces.append(text(cx + cell_w / 2, cy + cell_h / 2 + 5,
+                           cell["label"], 14, PASS if cell["verified"] else PENDING,
+                           weight=600, extra='text-anchor="middle" font-family="Consolas, monospace"'))
         pieces.append('</g>')
     return "\n".join(pieces)
 
@@ -124,76 +122,81 @@ def render_svg(data):
     description = (f"{done} of {total} curated capability checks verified in bounded fixtures "
                    f"({pct:.1f} percent). {count} of {count} registered JIT-enabled CTest "
                    "suites passed. This is not an overall macOS compatibility percentage.")
+    counts = Counter(test_group(name) for name in data["tests"])
     pieces = [
-        '<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="656" '
-        'viewBox="0 0 1100 656" role="img" aria-labelledby="title description">',
+        '<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1112" '
+        'viewBox="0 0 1200 1112" role="img" aria-labelledby="title description">',
         '<title id="title">mac-os-arm status</title>',
         f'<desc id="description">{escape(description)}</desc>',
+        '<defs><linearGradient id="background" x2="0.8" y2="1">'
+        '<stop stop-color="#111e31"/><stop offset="1" stop-color="#0b121e"/>'
+        '</linearGradient></defs>',
         '<g font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif">',
-        rect(0, 0, 1100, 656, "#0c1118"),
-        text(28, 44, "mac-os-arm", 28, weight=650),
-        text(197, 44, "/ Status", 28, MUTED),
-        text(1072, 40, f"VERIFIED  {data['verified_date']}", 12, MUTED,
+        rect(0.5, 0.5, 1199, 1111, "url(#background)", 20, "#29374d"),
+        text(44, 40, "RUNTIME / PROJECT STATUS", 12, MUTED, weight=600,
+             extra='letter-spacing="2"'),
+        rect(44, 63, 48, 48, "#17382f", 12, "#2b6853"),
+        text(68, 94, ">_", 22, PASS, weight=600,
+             extra='text-anchor="middle" font-family="Consolas, monospace"'),
+        text(110, 98, "mac-os-arm", 38, weight=700, extra='letter-spacing="-1"'),
+        rect(920, 24, 236, 30, "#302b23", 15, "#514435"),
+        text(1038, 44, "EXPERIMENTAL RUNTIME", 12, "#e6be7b", weight=600,
+             extra='text-anchor="middle" letter-spacing="0.8"'),
+        text(1156, 97, f"VERIFIED  {data['verified_date']}", 13, MUTED,
              extra='text-anchor="end" letter-spacing="1.2"'),
-        text(28, 70, "ARM64 / ARM64e userspace runtime  |  through phase 82", 14, MUTED),
-        rect(28, 86, 1044, 1, "#2b3643"),
-        rect(28, 104, 164, 30, "#35404c"),
-        text(40, 124, "Capability checklist", 14, weight=600),
-        rect(192, 104, 76, 30, "#b78914"),
-        text(230, 124, f"{pct:.1f}%", 14, "#10150b", weight=650, extra='text-anchor="middle"'),
-        rect(280, 104, 106, 30, "#35404c"),
-        text(292, 124, "Test suites", 14, weight=600),
-        rect(386, 104, 82, 30, PASS),
-        text(427, 124, "100.0%", 14, "#07140b", weight=650, extra='text-anchor="middle"'),
-        text(1072, 124, "EXPERIMENTAL / FIXTURE-BASED EVIDENCE", 12, MUTED,
-             extra='text-anchor="end" letter-spacing="0.6"'),
-        text(28, 171, "Scoped capabilities", 18, weight=600),
-        text(28, 194, f"{done} / {total} verified in fixtures  |  {total - done} pending", 14, MUTED),
-        text(568, 171, "Verification suites", 18, weight=600),
-        text(568, 194, f"{count} / {count} passed  |  full JIT-enabled test inventory", 14, MUTED),
+        text(44, 138, "ARM64 / ARM64e userspace runtime for x86_64 hosts", 17, MUTED),
+        rect(44, 166, 544, 156, "#10252a", 14, "#275044"),
+        text(68, 196, "CAPABILITY CHECKLIST", 13, PASS, weight=600, extra='letter-spacing="1.2"'),
+        text(564, 196, f"{total - done} PENDING", 12, MUTED, extra='text-anchor="end"'),
+        text(68, 274, f"{pct:g}%", 64, weight=700, extra='letter-spacing="-2"'),
+        text(246, 235, f"{done} of {total} checks verified", 21, weight=600),
+        text(246, 262, "Bounded fixture / model evidence", 15, MUTED),
+        rect(68, 299, 496, 7, "#263b43", 3.5),
+        rect(68, 299, 496 * done / total, 7, PASS, 3.5),
+        rect(612, 166, 544, 156, "#142135", 14, "#2b3f5b"),
+        text(636, 196, "TEST SUITES", 13, "#9bbcff", weight=600, extra='letter-spacing="1.2"'),
+        text(1132, 196, "FULL JIT BUILD", 12, MUTED, extra='text-anchor="end"'),
+        text(636, 274, f"{count}/{count}", 60, weight=700, extra='letter-spacing="-2"'),
+        text(840, 235, "All suites passed", 21, weight=600),
+        text(840, 262, f"{counts['Core contracts']} core / {counts['Translated execution']} JIT / {counts['CLI fixtures']} CLI", 15, MUTED),
+        rect(636, 299, 496, 7, PASS, 3.5),
+        text(44, 368, "Capability map", 23, weight=600),
+        text(44, 392, f"{total} explicit checks, grouped by subsystem", 15, MUTED),
+        text(660, 368, "Verification suites", 23, weight=600),
+        text(660, 392, "One numbered tile per registered CTest suite", 15, MUTED),
     ]
-    # A slice-and-dice treemap: each region's area follows its checklist count.
-    y = 208.0
-    for offset in range(0, len(data["groups"]), 2):
-        row = data["groups"][offset:offset + 2]
-        weight = sum(len(group["checks"]) for group in row)
-        height = 340 * weight / total
-        x = 28.0
-        for group in row:
-            width = 504 * len(group["checks"]) / weight
-            cells = [{"id": f"check-{check['id']}", "label": check["id"],
-                      "verified": check["status"] == "verified",
-                      "detail": f"{check['id']}: {check['label']} [{check['status']}]"}
-                     for check in group["checks"]]
-            pieces.append(tile_group(x, y, width - 3, height - 3, group["short"], cells))
-            x += width
-        y += height
-    groups = [("Core contracts", "Core contracts"),
-              ("Translated execution", "JIT")]
-    counts = Counter(test_group(name) for name in data["tests"])
-    top_count = sum(counts[key] for key, _ in groups)
-    top_height = 340 * top_count / count
-    x = 568.0
-    for key, label in groups:
-        width = 504 * counts[key] / top_count
+    # Equal-size cards keep pending application and graphics checks visible too.
+    for index, group in enumerate(data["groups"]):
+        cells = [{"id": f"check-{check['id']}", "label": check["id"],
+                  "verified": check["status"] == "verified",
+                  "detail": f"{check['id']}: {check['label']} [{check['status']}]"}
+                 for check in group["checks"]]
+        columns = len(cells) if len(cells) <= 6 else math.ceil(len(cells) / 2)
+        pieces.append(tile_group(44 + index % 2 * 304, 412 + index // 2 * 128,
+                                 288, 114, group["short"], cells, columns))
+    for key, label, y, height, columns in [
+        ("Core contracts", "Core contracts", 412, 182, 7),
+        ("Translated execution", "Translated execution / JIT", 608, 114, 5),
+        ("CLI fixtures", "CLI fixtures", 736, 174, 8),
+    ]:
         cells = [{"id": f"suite-{index + 1}", "label": f"{index + 1:02d}",
                   "verified": True, "detail": f"PASS: {name}"}
                  for index, name in enumerate(data["tests"]) if test_group(name) == key]
-        pieces.append(tile_group(x, 208, width - 3, top_height - 3, label, cells))
-        x += width
-    cells = [{"id": f"suite-{index + 1}", "label": f"{index + 1:02d}",
-              "verified": True, "detail": f"PASS: {name}"}
-             for index, name in enumerate(data["tests"]) if test_group(name) == "CLI fixtures"]
-    pieces.append(tile_group(568, 208 + top_height, 501, 340 - top_height - 3,
-                             "CLI fixtures", cells))
+        pieces.append(tile_group(660, y, 496, height, label, cells, columns))
     pieces.extend([
-        rect(28, 572, 12, 12, PASS),
-        text(48, 583, "Verified fixture / model", 13, MUTED),
-        rect(246, 572, 12, 12, PENDING),
-        text(266, 583, "Pending demonstration", 13, MUTED),
-        text(568, 583, "One tile = one listed check or one registered CTest suite", 13, MUTED),
-        text(28, 615, "Checklist coverage, not overall macOS compatibility. Stock apps and graphics remain undemonstrated.", 14),
-        text(28, 639, f"Source {data['source_revision'][:7]}  |  {data['core_test_count']} core suites; {count} with JIT  |  Evidence and definitions: docs/PROGRESS.md", 12, MUTED),
+        rect(44, 940, 12, 12, PASS, 3),
+        text(66, 952, "Verified fixture / model", 15, MUTED),
+        rect(314, 940, 12, 12, PENDING, 3),
+        text(336, 952, "Pending demonstration", 15, MUTED),
+        text(1156, 952, "Tile IDs match the linked evidence report", 14, MUTED,
+             extra='text-anchor="end"'),
+        rect(44, 976, 1112, 76, "#172130", 10, "#303e51"),
+        text(64, 1005, "Stock apps and graphics remain undemonstrated.", 17, weight=600),
+        text(64, 1031, "Percentages refer to the curated checklist; overall macOS compatibility remains unmeasured.", 15, MUTED),
+        text(44, 1085, f"TESTED SOURCE  {data['source_revision'][:7]}", 12, MUTED,
+             extra='letter-spacing="1"'),
+        text(1156, 1085, "Definitions and evidence: docs/PROGRESS.md", 13, MUTED,
+             extra='text-anchor="end"'),
         '</g></svg>',
     ])
     return "\n".join(pieces) + "\n"
@@ -216,15 +219,17 @@ def render_report(data):
         "## What the percentage means", "",
         "The denominator is the explicit, curated checklist below. Every check has equal weight. "
         "Green means the narrowly worded behavior is implemented and exercised by the linked fixture/model tests. "
-        "It does not mark a subsystem complete. Gray means the observable demonstration has not been recorded.", "",
+        "It does not mark a subsystem complete. Slate means the observable demonstration has not been recorded. "
+        "Each capability has one tile; card area does not represent its scope or engineering effort.", "",
         "**This is not a percentage of macOS, Apple APIs, ARM instructions, engineering effort, or real-app compatibility.** "
-        "There is no complete inventory for those. Checks differ in difficulty, may share a test suite, and may be revised "
+        "The separately collected Apple SDK/XNU reference inventory is not this checklist's denominator. "
+        "Checks differ in difficulty, may share a test suite, and may be revised "
         "as the roadmap changes. A suite may contain many assertions; each suite is counted once on the right-hand map. "
         "The graphics work in the separate mac-os repository does not count toward this runtime.", "",
         "This snapshot adds a progress inventory; its pending entries are explicit future acceptance targets, not a claim "
         "that a complete macOS compatibility plan exists. See [runtime status and limitations](STATUS.md) for context.", "",
-        f"The [source revision's GitHub CI]({data['ci_url']}) passed Ubuntu/macOS core jobs and the then-filtered Linux JIT job. "
-        "The workflow now runs the entire JIT-enabled CTest inventory, including CLI fixtures. "
+        f"The [tested runtime revision's GitHub CI]({data['ci_url']}) covers Ubuntu/macOS core jobs and the complete Linux JIT job, "
+        "including CLI fixtures. "
         "The green test map records the dated full local run above; it is not a live GitHub CI badge.", "",
         "## Capability checklist", "",
     ]

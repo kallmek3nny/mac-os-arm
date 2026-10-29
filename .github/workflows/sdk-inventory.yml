@@ -3,7 +3,7 @@ name: sdk-inventory
 on:
   workflow_dispatch:
   push:
-    branches: [codex/authoritative-coverage]
+    branches: [main, codex/authoritative-coverage]
     paths:
       - .github/workflows/sdk-inventory.yml
       - tools/inventory_sdk.py

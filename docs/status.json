@@ -1,9 +1,9 @@
 {
-  "verified_date": "2026-10-26",
-  "source_revision": "9fc67572c602c205fc2b8c196b2d0336aae1e361",
+  "verified_date": "2026-10-29",
+  "source_revision": "baf0027e14dde4aa69c763b7e84ac67a9d941291",
   "platform": "Windows x86_64, GCC 16.1, Release",
   "core_test_count": 21,
-  "ci_url": "https://github.com/kallmek3nny/mac-os-arm/actions/runs/40256796551",
+  "ci_url": "https://github.com/kallmek3nny/mac-os-arm/actions/runs/40856326008",
   "tests": [
     "macho-parser",
     "guest-address-space",

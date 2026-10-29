@@ -4,19 +4,19 @@
 
 ![mac-os-arm capability and verification status](assets/status.svg)
 
-Snapshot: **2026-10-26**, runtime source [`9fc6757`](https://github.com/kallmek3nny/mac-os-arm/commit/9fc67572c602c205fc2b8c196b2d0336aae1e361). Local verification: Windows x86_64, GCC 16.1, Release. The status-only change does not alter runtime source.
+Snapshot: **2026-10-29**, runtime source [`baf0027`](https://github.com/kallmek3nny/mac-os-arm/commit/baf0027e14dde4aa69c763b7e84ac67a9d941291). Local verification: Windows x86_64, GCC 16.1, Release. The status-only change does not alter runtime source.
 
 **34/50 scoped capability checks (68.0%)** have fixture/model evidence; **16 remain pending**. **49/49 registered CTest suites passed** in the full JIT-enabled build, which includes the 21 core suites. The separate core build also passed 21/21.
 
 ## What the percentage means
 
-The denominator is the explicit, curated checklist below. Every check has equal weight. Green means the narrowly worded behavior is implemented and exercised by the linked fixture/model tests. It does not mark a subsystem complete. Gray means the observable demonstration has not been recorded.
+The denominator is the explicit, curated checklist below. Every check has equal weight. Green means the narrowly worded behavior is implemented and exercised by the linked fixture/model tests. It does not mark a subsystem complete. Slate means the observable demonstration has not been recorded. Each capability has one tile; card area does not represent its scope or engineering effort.
 
-**This is not a percentage of macOS, Apple APIs, ARM instructions, engineering effort, or real-app compatibility.** There is no complete inventory for those. Checks differ in difficulty, may share a test suite, and may be revised as the roadmap changes. A suite may contain many assertions; each suite is counted once on the right-hand map. The graphics work in the separate mac-os repository does not count toward this runtime.
+**This is not a percentage of macOS, Apple APIs, ARM instructions, engineering effort, or real-app compatibility.** The separately collected Apple SDK/XNU reference inventory is not this checklist's denominator. Checks differ in difficulty, may share a test suite, and may be revised as the roadmap changes. A suite may contain many assertions; each suite is counted once on the right-hand map. The graphics work in the separate mac-os repository does not count toward this runtime.
 
 This snapshot adds a progress inventory; its pending entries are explicit future acceptance targets, not a claim that a complete macOS compatibility plan exists. See [runtime status and limitations](STATUS.md) for context.
 
-The [source revision's GitHub CI](https://github.com/kallmek3nny/mac-os-arm/actions/runs/40256796551) passed Ubuntu/macOS core jobs and the then-filtered Linux JIT job. The workflow now runs the entire JIT-enabled CTest inventory, including CLI fixtures. The green test map records the dated full local run above; it is not a live GitHub CI badge.
+The [tested runtime revision's GitHub CI](https://github.com/kallmek3nny/mac-os-arm/actions/runs/40856326008) covers Ubuntu/macOS core jobs and the complete Linux JIT job, including CLI fixtures. The green test map records the dated full local run above; it is not a live GitHub CI badge.
 
 ## Capability checklist
 
