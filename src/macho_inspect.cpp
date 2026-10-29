@@ -40,6 +40,32 @@ void print_load_metadata(const macosarm::macho::Image& image) {
         print_version(build.sdk);
         std::cout << " tools=" << build.tools.size() << '\n';
     }
+    // LC_VERSION_MIN_* names its platform through the load command itself and packs both versions like
+    // LC_BUILD_VERSION. The original LC_VERSION_MIN_MACOSX had no sdk field, so old macOS images report sdk=0.0.0.
+    for (const auto& version_min : image.version_mins) {
+        const char* platform = "unknown";
+        switch (version_min.command) {
+        case macosarm::macho::kLcVersionMinMacosx:
+            platform = "macos";
+            break;
+        case macosarm::macho::kLcVersionMinIphoneos:
+            platform = "ios";
+            break;
+        case macosarm::macho::kLcVersionMinTvos:
+            platform = "tvos";
+            break;
+        case macosarm::macho::kLcVersionMinWatchos:
+            platform = "watchos";
+            break;
+        default:
+            break;
+        }
+        std::cout << "version_min platform=" << platform << " minos=";
+        print_version(version_min.version);
+        std::cout << " sdk=";
+        print_version(version_min.sdk);
+        std::cout << '\n';
+    }
     if (image.has_source_version) {
         // LC_SOURCE_VERSION packs A.B.C.D.E as 24.10.10.10.10 bits.
         const std::uint64_t version = image.source_version;

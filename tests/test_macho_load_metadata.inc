@@ -457,6 +457,108 @@ int macho_load_metadata_main() {
                           "zippered macOS 10.14 and Catalyst 12 SDKs reject __TEXT rwx");
         expect_protection(zippered("__LINKEDIT", kRw, kMacOs, 0x000a0e00U, kMacCatalyst, 0x000c0000U), "",
                           "zippered macOS 10.14 and Catalyst 12 SDKs accept __LINKEDIT rw-");
+
+        // On ARM64 each LC_VERSION_MIN_* names its device platform and opts the image in like an LC_BUILD_VERSION
+        // naming that platform. Each case skips the metadata image's LC_BUILD_VERSION as LC_SYMSEG (0x3) and writes
+        // one 16-byte version_min_command (cmd, cmdsize, version, sdk) over its LC_SOURCE_VERSION.
+        const auto version_min_image = [&](const std::string& name, std::uint32_t initial_protection,
+                                           std::uint32_t command, std::uint32_t version, std::uint32_t sdk) {
+            Bytes bytes = protection_image(name, initial_protection, kMacOs, kMacOsSdk);
+            meta_put_u32(bytes, kMetaBuild, 0x3U);
+            meta_command(bytes, kMetaSource, command, 16, version, sdk);
+            return bytes;
+        };
+        {
+            const auto parsed = m::parse(version_min_image("__TEXT", kRx, m::kLcVersionMinIphoneos, 0x000c0100U,
+                                                           0x000d0200U));
+            const auto& mins = parsed.image.version_mins;
+            meta_expect(static_cast<bool>(parsed) && parsed.image.build_versions.empty() &&
+                            !parsed.image.has_source_version && mins.size() == 1 &&
+                            mins[0].command == m::kLcVersionMinIphoneos && mins[0].version == 0x000c0100U &&
+                            mins[0].sdk == 0x000d0200U,
+                        "LC_VERSION_MIN_IPHONEOS command, version and sdk are preserved (got " +
+                            std::string(m::error_name(parsed.error)) + ")");
+
+            // A second LC_VERSION_MIN_* over LC_FUNCTION_STARTS may name another platform, but dyld's
+            // PlatformAndVersions::zip joins a platform only with itself or macOS with Mac Catalyst, which no
+            // LC_VERSION_MIN_* names. Two of them naming distinct platforms are incompatible in either order.
+            const auto expect_incompatible = [](const Bytes& bytes, const std::string& label) {
+                const auto result = m::parse(bytes);
+                meta_expect(!result && result.error == m::ErrorCode::incompatible_platforms,
+                            label + " (got " + std::string(m::error_name(result.error)) + ")");
+            };
+            Bytes pair = version_min_image("__TEXT", kRx, m::kLcVersionMinIphoneos, 0x000c0000U, 0x000d0000U);
+            meta_command(pair, kMetaStarts, m::kLcVersionMinMacosx, 16, 0x000a0e00U, 0U);
+            expect_incompatible(pair, "LC_VERSION_MIN_IPHONEOS then LC_VERSION_MIN_MACOSX is rejected");
+            Bytes reversed = version_min_image("__TEXT", kRx, m::kLcVersionMinMacosx, 0x000a0e00U, 0U);
+            meta_command(reversed, kMetaStarts, m::kLcVersionMinIphoneos, 16, 0x000c0000U, 0x000d0000U);
+            expect_incompatible(reversed, "LC_VERSION_MIN_MACOSX then LC_VERSION_MIN_IPHONEOS is rejected");
+
+            // LC_BUILD_VERSION pairs follow the same rule, so Mac Catalyst fails beside any platform but macOS. The
+            // platform check runs before the format rules, so __TEXT rwx, which the iOS rule also rejects, still
+            // reports the incompatible pair.
+            expect_incompatible(zippered("__TEXT", kRx, kIos, 0x000d0000U, kMacOs, kMacOsSdk),
+                                "LC_BUILD_VERSION iOS with macOS is rejected");
+            expect_incompatible(zippered("__TEXT", kRx, kTvOs, 0x000d0000U, kIos, 0x000d0000U),
+                                "LC_BUILD_VERSION tvOS with iOS is rejected");
+            expect_incompatible(zippered("__TEXT", kRx, kMacCatalyst, 0x000d0000U, kVisionOs, 0x00010000U),
+                                "LC_BUILD_VERSION Mac Catalyst with visionOS is rejected");
+            expect_incompatible(zippered("__TEXT", kRwx, kIos, 0x000d0000U, kMacOs, kMacOsSdk),
+                                "an incompatible LC_BUILD_VERSION pair is reported before the __TEXT rule");
+
+            // Repeating a platform fails earlier, while the load commands are still being parsed.
+            meta_put_u32(pair, kMetaStarts, m::kLcVersionMinIphoneos);
+            const auto repeated = m::parse(pair);
+            meta_expect(!repeated && repeated.error == m::ErrorCode::duplicate_load_command,
+                        "a second LC_VERSION_MIN_IPHONEOS is rejected (got " +
+                            std::string(m::error_name(repeated.error)) + ")");
+
+            // cmdsize 8 still covers load_command but not the version and sdk fields.
+            Bytes truncated = version_min_image("__TEXT", kRx, m::kLcVersionMinWatchos, 0x00080000U, 0x00090000U);
+            meta_put_u32(truncated, kMetaSource + 4, 8);
+            const auto short_command = m::parse(truncated);
+            meta_expect(!short_command && short_command.error == m::ErrorCode::malformed_version_min,
+                        "LC_VERSION_MIN_* cmdsize below version_min_command is rejected (got " +
+                            std::string(m::error_name(short_command.error)) + ")");
+
+            // dyld requires cmdsize == sizeof(version_min_command), so a 32-byte command whose extra bytes cover the
+            // next load-command slot is rejected while the parser is still on the version_min_command.
+            Bytes oversized = version_min_image("__TEXT", kRx, m::kLcVersionMinWatchos, 0x00080000U, 0x00090000U);
+            meta_put_u32(oversized, kMetaSource + 4, 32);
+            const auto long_command = m::parse(oversized);
+            meta_expect(!long_command && long_command.error == m::ErrorCode::malformed_version_min,
+                        "LC_VERSION_MIN_* cmdsize above version_min_command is rejected (got " +
+                            std::string(m::error_name(long_command.error)) + ")");
+        }
+
+        // An old LC_VERSION_MIN_MACOSX with sdk 0 predates that field, so its minimum OS stands in for the SDK.
+        expect_protection(version_min_image("__TEXT", kRwx, m::kLcVersionMinMacosx, 0x000a0e00U, 0x000a0f00U),
+                          text_error, "LC_VERSION_MIN_MACOSX 10.15 SDK __TEXT rwx is rejected");
+        expect_protection(version_min_image("__LINKEDIT", kRw, m::kLcVersionMinMacosx, 0x000a0e00U, 0x000a0f00U),
+                          linkedit_error, "LC_VERSION_MIN_MACOSX 10.15 SDK __LINKEDIT rw- is rejected");
+        expect_protection(version_min_image("__TEXT", kRwx, m::kLcVersionMinMacosx, 0x000a0e00U, 0x000a0e00U), "",
+                          "LC_VERSION_MIN_MACOSX 10.14 SDK __TEXT rwx parses");
+        expect_protection(version_min_image("__TEXT", kRwx, m::kLcVersionMinMacosx, 0x000a0f00U, 0U), text_error,
+                          "LC_VERSION_MIN_MACOSX 10.15 minimum OS without an SDK rejects __TEXT rwx");
+        expect_protection(version_min_image("__LINKEDIT", kRw, m::kLcVersionMinMacosx, 0x000a0e00U, 0U), "",
+                          "LC_VERSION_MIN_MACOSX 10.14 minimum OS without an SDK accepts __LINKEDIT rw-");
+        // iOS, tvOS and watchOS keep the LC_BUILD_VERSION thresholds above.
+        expect_protection(version_min_image("__TEXT", kRwx, m::kLcVersionMinIphoneos, 0x000c0000U, 0x000c0000U),
+                          text_error, "LC_VERSION_MIN_IPHONEOS 12 SDK __TEXT rwx is rejected");
+        expect_protection(version_min_image("__LINKEDIT", kRw, m::kLcVersionMinIphoneos, 0x000c0000U, 0x000c0000U),
+                          "", "LC_VERSION_MIN_IPHONEOS 12 SDK __LINKEDIT rw- parses");
+        expect_protection(version_min_image("__LINKEDIT", kRw, m::kLcVersionMinIphoneos, 0x000c0000U, 0x000d0000U),
+                          linkedit_error, "LC_VERSION_MIN_IPHONEOS 13 SDK __LINKEDIT rw- is rejected");
+        expect_protection(version_min_image("__TEXT", kRwx, m::kLcVersionMinTvos, 0x000c0000U, 0x000c0000U),
+                          text_error, "LC_VERSION_MIN_TVOS 12 SDK __TEXT rwx is rejected");
+        expect_protection(version_min_image("__LINKEDIT", kRw, m::kLcVersionMinTvos, 0x000c0000U, 0x000d0000U),
+                          linkedit_error, "LC_VERSION_MIN_TVOS 13 SDK __LINKEDIT rw- is rejected");
+        expect_protection(version_min_image("__TEXT", kRwx, m::kLcVersionMinWatchos, 0x00080000U, 0x00080000U),
+                          text_error, "LC_VERSION_MIN_WATCHOS 8 SDK __TEXT rwx is rejected");
+        expect_protection(version_min_image("__LINKEDIT", kRw, m::kLcVersionMinWatchos, 0x00080000U, 0x00080000U),
+                          "", "LC_VERSION_MIN_WATCHOS 8 SDK __LINKEDIT rw- parses");
+        expect_protection(version_min_image("__LINKEDIT", kRw, m::kLcVersionMinWatchos, 0x00080000U, 0x00090000U),
+                          linkedit_error, "LC_VERSION_MIN_WATCHOS 9 SDK __LINKEDIT rw- is rejected");
     }
 
     if (meta_failures != 0) {

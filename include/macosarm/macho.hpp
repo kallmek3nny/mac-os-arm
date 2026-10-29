@@ -31,10 +31,14 @@ constexpr std::uint32_t kLcCodeSignature = 0x1d;
 constexpr std::uint32_t kLcReexportDylib = 0x1fU | kLcReqDyld;
 constexpr std::uint32_t kLcLazyLoadDylib = 0x20;
 constexpr std::uint32_t kLcLoadUpwardDylib = 0x23U | kLcReqDyld;
+constexpr std::uint32_t kLcVersionMinMacosx = 0x24;
+constexpr std::uint32_t kLcVersionMinIphoneos = 0x25;
 constexpr std::uint32_t kLcFunctionStarts = 0x26;
 constexpr std::uint32_t kLcMain = 0x80000028U;
 constexpr std::uint32_t kLcDataInCode = 0x29;
 constexpr std::uint32_t kLcSourceVersion = 0x2a;
+constexpr std::uint32_t kLcVersionMinTvos = 0x2f;
+constexpr std::uint32_t kLcVersionMinWatchos = 0x30;
 constexpr std::uint32_t kLcBuildVersion = 0x32;
 constexpr std::uint32_t kLcDyldExportsTrie = 0x33U | kLcReqDyld;
 constexpr std::uint32_t kLcDyldChainedFixups = 0x34U | kLcReqDyld;
@@ -110,6 +114,15 @@ struct BuildVersion {
     std::vector<BuildTool> tools;
 };
 
+// One LC_VERSION_MIN_MACOSX, LC_VERSION_MIN_IPHONEOS, LC_VERSION_MIN_TVOS or LC_VERSION_MIN_WATCHOS command, in
+// load-command order. command keeps the raw load command, which names the platform. sdk keeps the raw field: the
+// original LC_VERSION_MIN_MACOSX had no sdk field, so old macOS images leave it 0.
+struct VersionMin {
+    std::uint32_t command{};
+    std::uint32_t version{};
+    std::uint32_t sdk{};
+};
+
 struct Image {
     std::int32_t cpu_type{};
     std::int32_t cpu_subtype{};
@@ -131,6 +144,7 @@ struct Image {
     std::array<std::uint8_t, 16> uuid{};
     bool has_uuid{};
     std::vector<BuildVersion> build_versions;
+    std::vector<VersionMin> version_mins;
     std::uint64_t source_version{};
     bool has_source_version{};
     FileRange code_signature;
@@ -163,6 +177,8 @@ enum class ErrorCode {
     malformed_build_version,
     malformed_source_version,
     duplicate_load_command,
+    malformed_version_min,
+    incompatible_platforms,
 };
 
 struct ParseResult {

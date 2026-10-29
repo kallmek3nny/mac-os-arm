@@ -497,6 +497,27 @@ ParseResult parse(std::span<const std::byte> bytes) {
                 build.tools.push_back(tool_version);
             }
             result.image.build_versions.push_back(std::move(build));
+        } else if (command == kLcVersionMinMacosx || command == kLcVersionMinIphoneos ||
+                   command == kLcVersionMinTvos || command == kLcVersionMinWatchos) {
+            // version_min_command is cmd, cmdsize, version and sdk. dyld treats only x86 images as old simulator
+            // binaries, so on ARM64 each of these commands names its device platform. dyld's load-command structure
+            // check rejects any cmdsize other than sizeof(version_min_command), so a larger command cannot carry
+            // trailing bytes past the sdk field.
+            constexpr std::size_t kVersionMinCommandSize = 16;
+            if (command_size != kVersionMinCommandSize) {
+                return fail(ErrorCode::malformed_version_min, "LC_VERSION_MIN_* cmdsize is not 16");
+            }
+            VersionMin version_min;
+            version_min.command = command;
+            if (!reader.read_u32(cursor + 8, version_min.version) || !reader.read_u32(cursor + 12, version_min.sdk)) {
+                return fail(ErrorCode::malformed_version_min, "truncated LC_VERSION_MIN_*");
+            }
+            for (const auto& existing : result.image.version_mins) {
+                if (existing.command == command) {
+                    return fail(ErrorCode::duplicate_load_command, "multiple LC_VERSION_MIN_* commands name one platform");
+                }
+            }
+            result.image.version_mins.push_back(version_min);
         } else if (command == kLcSourceVersion) {
             constexpr std::size_t kSourceVersionCommandSize = 16;
             if (command_size < kSourceVersionCommandSize) {
@@ -571,12 +592,13 @@ ParseResult parse(std::span<const std::byte> bytes) {
     if (cursor != commands_end) {
         return fail(ErrorCode::malformed_load_commands, "load-command count does not consume declared command region");
     }
-    // dyld holds __TEXT to exactly r-x and __LINKEDIT to exactly r-- once any LC_BUILD_VERSION platform opts the image
-    // into those format rules, following its enforceFormat thresholds. macOS opts in to both from the 10.15 SDK. iOS,
+    // dyld holds __TEXT to exactly r-x and __LINKEDIT to exactly r-- once any platform the image names opts it into
+    // those format rules, following its enforceFormat thresholds. macOS opts in to both from the 10.15 SDK. iOS,
     // tvOS, Mac Catalyst and watchOS always opt in for __TEXT, and opt in for __LINKEDIT from the iOS/tvOS 13 and
-    // watchOS 9 SDKs. Any other nonzero platform opts in to both. Platform 0 carries no platform information, and an
-    // image without LC_BUILD_VERSION skips both rules. LC_VERSION_MIN_* is not parsed yet, so an image that names its
-    // platform only through it also skips the rules here, even where dyld would apply them.
+    // watchOS 9 SDKs. Any other nonzero platform opts in to both, while platform 0 carries no platform information.
+    // As in dyld's forEachSupportedPlatform, each LC_VERSION_MIN_* names its device platform on ARM64, and an
+    // LC_VERSION_MIN_MACOSX whose sdk field is 0 predates that field, so its minimum OS stands in for the SDK. An
+    // image that names no platform through LC_BUILD_VERSION or LC_VERSION_MIN_* skips both rules.
     {
         constexpr std::uint32_t kPlatformMacOs = 1;
         constexpr std::uint32_t kPlatformIos = 2;
@@ -587,12 +609,28 @@ ParseResult parse(std::span<const std::byte> bytes) {
         constexpr std::uint32_t kVmProtExecute = 0x4;
         bool exact_text_protection = false;
         bool exact_linkedit_protection = false;
-        for (const BuildVersion& build : result.image.build_versions) {
-            switch (build.platform) {
+        // dyld's validSemanticsPlatform zips every platform the image names into one. Naming a platform again keeps
+        // it, and macOS with Mac Catalyst zips into one zippered image, but any other pair of distinct platforms is
+        // incompatible, so the image fails before any format rule applies. Platform 0 carries no platform
+        // information and never conflicts. PLATFORM_ZIPPERED, which dyld zips with macOS or Mac Catalyst only when
+        // it comes first, is treated here like any other unknown platform, so the outcome does not depend on
+        // load-command order.
+        std::uint32_t zipped_platform = 0;
+        bool platforms_incompatible = false;
+        const auto apply_platform = [&](std::uint32_t platform, std::uint32_t sdk) {
+            if (platform != 0 && platform != zipped_platform) {
+                if (zipped_platform == 0) {
+                    zipped_platform = platform;
+                } else if ((zipped_platform != kPlatformMacOs && zipped_platform != kPlatformMacCatalyst) ||
+                           (platform != kPlatformMacOs && platform != kPlatformMacCatalyst)) {
+                    platforms_incompatible = true;
+                }
+            }
+            switch (platform) {
             case 0:
                 break;
             case kPlatformMacOs:
-                if (build.sdk >= 0x000a0f00U) {
+                if (sdk >= 0x000a0f00U) {
                     exact_text_protection = true;
                     exact_linkedit_protection = true;
                 }
@@ -601,17 +639,41 @@ ParseResult parse(std::span<const std::byte> bytes) {
             case kPlatformTvOs:
             case kPlatformMacCatalyst:
                 exact_text_protection = true;
-                exact_linkedit_protection = exact_linkedit_protection || build.sdk >= 0x000d0000U;
+                exact_linkedit_protection = exact_linkedit_protection || sdk >= 0x000d0000U;
                 break;
             case kPlatformWatchOs:
                 exact_text_protection = true;
-                exact_linkedit_protection = exact_linkedit_protection || build.sdk >= 0x00090000U;
+                exact_linkedit_protection = exact_linkedit_protection || sdk >= 0x00090000U;
                 break;
             default:
                 exact_text_protection = true;
                 exact_linkedit_protection = true;
                 break;
             }
+        };
+        for (const BuildVersion& build : result.image.build_versions) {
+            apply_platform(build.platform, build.sdk);
+        }
+        for (const VersionMin& version_min : result.image.version_mins) {
+            switch (version_min.command) {
+            case kLcVersionMinMacosx:
+                apply_platform(kPlatformMacOs, version_min.sdk != 0 ? version_min.sdk : version_min.version);
+                break;
+            case kLcVersionMinIphoneos:
+                apply_platform(kPlatformIos, version_min.sdk);
+                break;
+            case kLcVersionMinTvos:
+                apply_platform(kPlatformTvOs, version_min.sdk);
+                break;
+            case kLcVersionMinWatchos:
+                apply_platform(kPlatformWatchOs, version_min.sdk);
+                break;
+            default:
+                break;
+            }
+        }
+        if (platforms_incompatible) {
+            return fail(ErrorCode::incompatible_platforms, "image names incompatible platforms");
         }
         for (const Segment& segment : result.image.segments) {
             if (exact_text_protection && segment.name == "__TEXT" &&
@@ -676,6 +738,8 @@ std::string_view error_name(ErrorCode error) noexcept {
     case ErrorCode::malformed_build_version: return "malformed_build_version";
     case ErrorCode::malformed_source_version: return "malformed_source_version";
     case ErrorCode::duplicate_load_command: return "duplicate_load_command";
+    case ErrorCode::malformed_version_min: return "malformed_version_min";
+    case ErrorCode::incompatible_platforms: return "incompatible_platforms";
     }
     return "unknown";
 }
